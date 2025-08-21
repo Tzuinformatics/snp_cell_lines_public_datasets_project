@@ -1,0 +1,17 @@
+```{r}
+
+# Load required libraries
+library(readr)  # for read_csv and read_tsv
+library(dplyr)  # for data manipulation
+# Read SNP and expression metadata
+snp_meta <- read_csv("ARID5B_SJCLOUD_20240807.csv")
+
+# Read log2-FPKM normalized expression matrix
+fpkm_matrix <- read_tsv("merged.Log2-FPKM_UQ.txt")
+
+# Preview
+glimpse(snp_meta)
+glimpse(fpkm_matrix)
+
+```
+

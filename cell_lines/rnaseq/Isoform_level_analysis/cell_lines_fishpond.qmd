@@ -1,0 +1,278 @@
+```{r}
+library(SummarizedExperiment)
+library(qs)
+library(RColorBrewer)
+library(isoformic)
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+library(tximeta)
+library(fishpond)
+library(SummarizedExperiment)
+library(tidyverse)
+```
+
+# Metadata
+```{r}
+library(tidyverse)
+library(tximeta)
+
+# Set base directory where all sample folders live
+base_dir <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Clarissa/rnaseq_bulk_Aug4_2025/Isoform_level_analysis/salmon_swish_inptu_isoforms"
+
+# List all 1st-level directories (each one is a sample with quant.sf)
+sample_dirs <- list.dirs(base_dir, full.names = TRUE, recursive = FALSE)
+
+# Build sample metadata with required column names: "names" and "files"
+sample_metadata <- tibble(
+  names = basename(sample_dirs),  # Required by tximeta
+  files = file.path(sample_dirs, "quant.sf")  # Required by tximeta
+) %>%
+  mutate(
+    cell_line = case_when(
+      str_detect(names, "NALM6") ~ "NALM6",
+      str_detect(names, "REH") ~ "REH",
+      str_detect(names, "Jurkat") ~ "Jurkat",
+      str_detect(names, "MOLM13") ~ "MOLM13",
+      TRUE ~ NA_character_
+    ),
+    genotype = case_when(
+      str_detect(names, "_TT_") ~ "TT",
+      str_detect(names, "_TC_") ~ "TC",
+      str_detect(names, "_CC_") ~ "CC",
+      TRUE ~ NA_character_
+    ),
+    clone = str_extract(names, "Clone[0-9]+") %>%
+      str_remove("Clone") %>%
+      as.integer(),
+    replicate = 1L,
+    sample_id = paste(cell_line, genotype, clone, sep = "_")
+  )
+
+
+
+```
+
+```{r}
+library(tximeta)
+
+# Define paths to your reference files
+index_dir <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Clarissa/rnaseq_bulk_Aug4_2025/Isoform_level_analysis/reference_transcriptomes/salmon_index_human_gencode_v48"
+fasta_path <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Clarissa/rnaseq_bulk_Aug4_2025/Isoform_level_analysis/reference_transcriptomes/gencode.v48.transcripts.fa.gz"
+gff3_path  <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Clarissa/rnaseq_bulk_Aug4_2025/Isoform_level_analysis/reference_transcriptomes/gencode.v48.annotation.gff3.gz"
+
+# Where to save the linkedTxome JSON
+json_file <- file.path(index_dir, "gencode_v48_linkedTxome.json")
+
+# Create the linkedTxome
+makeLinkedTxome(
+    indexDir = index_dir,
+    source = "GENCODE",
+    organism = "Homo sapiens",
+    release = "48",
+    genome = "GRCh38",
+    fasta = fasta_path,
+    gtf = gff3_path,     # GFF3 is fine here, tximeta accepts either
+    write = TRUE,
+    jsonFile = json_file
+)
+
+# Load it into the cache so tximeta can recognize your Salmon quantifications
+loadLinkedTxome(json_file)
+
+```
+
+
+```{r}
+se <- tximeta(sample_metadata)
+gse <- summarizeToGene(se)
+```
+```{r}
+# Subset to NALM6 samples
+nalm6_only <- colData(se)$cell_line == "NALM6"
+y <- se  # Just to follow fishpond naming convention
+y_nalm6 <- y[, nalm6_only]
+
+# Keep only TT and CC genotypes
+keep_tt_cc <- colData(y_nalm6)$genotype %in% c("TT", "CC")
+y_nalm6 <- y_nalm6[, keep_tt_cc]
+
+# Re-factor genotype with explicit order
+colData(y_nalm6)$genotype <- factor(colData(y_nalm6)$genotype, levels = c("TT", "CC"))
+
+# Filter low-count features
+y_nalm6 <- labelKeep(y_nalm6)
+y_nalm6 <- y_nalm6[mcols(y_nalm6)$keep, ]
+
+# Run Swish at transcript level
+set.seed(2025)
+y_nalm6 <- swish(y_nalm6, x = "genotype")
+
+# Quick check of significant isoforms
+table(mcols(y_nalm6)$qvalue < 0.05)
+
+```
+```{r}
+library(dplyr)
+library(tibble)
+library(readr)
+
+# --- 1. DET Table from Swish results (already run)
+det_table <- as.data.frame(mcols(y_nalm6)) %>%
+  rownames_to_column(var = "transcript_id") %>%
+  dplyr::select(
+    transcript_id,
+    log2FoldChange = log2FC,
+    pvalue,
+    qvalue
+  )
+
+write_csv(det_table, "isoformic_input/NALM6_TT_vs_CC_transcript_DET.csv")
+
+# --- 2. TPM Matrix (abundance scaled from Salmon)
+tpm_matrix <- assay(y_nalm6, "abundance")
+tpm_df <- as.data.frame(tpm_matrix) %>%
+  rownames_to_column(var = "transcript_id")
+
+write_csv(tpm_df, "isoformic_input/NALM6_TT_vs_CC_TPM_matrix.csv")
+
+# --- 3. tx2gene table
+tx2gene_df <- as.data.frame(rowData(y_nalm6)) %>%
+  rownames_to_column(var = "transcript_id") %>%
+  dplyr::select(transcript_id, gene_id)
+
+write_csv(tx2gene_df, "isoformic_input/NALM6_tx2gene.csv")
+
+# --- 4. Group metadata (colData: genotype, sample_id)
+group_metadata <- as.data.frame(colData(y_nalm6)) %>%
+  rownames_to_column(var = "sample") %>%
+  dplyr::select(sample, genotype, sample_id)
+
+write_csv(group_metadata, "isoformic_input/NALM6_group_metadata.csv")
+
+```
+
+# Isoformics
+```{r}
+library(isoformic)
+library(readr)
+library(dplyr)
+
+# Define paths
+det_path   <- "./isoformic_input/NALM6_TT_vs_CC_transcript_DET.csv"
+tpm_path   <- "./isoformic_input/NALM6_TT_vs_CC_TPM_matrix.csv"
+tx2gene_path <- "./isoformic_input/NALM6_tx2gene.csv"
+sample_path  <- "./isoformic_input/NALM6_group_metadata.csv"
+
+# Load files
+det_table     <- read_csv(det_path)
+tpm_matrix    <- read_csv(tpm_path)
+tx2gene_table <- read_csv(tx2gene_path)
+sample_info   <- read_csv(sample_path)
+```
+
+```{r}
+# Only run if you have internet and biomaRt installed
+library(biomaRt)
+
+# Set up biomart
+mart <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+
+# Retrieve transcript-to-gene mapping
+tx2gene_table <- getBM(
+  attributes = c("ensembl_transcript_id_version", "ensembl_gene_id", "external_gene_name", "transcript_biotype"),
+  mart = mart
+) |>
+  dplyr::rename(
+    transcript_id = ensembl_transcript_id_version,
+    gene_id = ensembl_gene_id,
+    gene_name = external_gene_name,
+    transcript_type = transcript_biotype
+  )
+
+```
+
+```{r}
+# Step 1: Add transcript_name (required by isoformic internal functions)
+det_table <- det_table |>
+    dplyr::mutate(transcript_name = transcript_id)
+
+# Step 2: Trim tx2gene_table to needed columns and make sure no duplicates
+tx2gene_trimmed <- tx2gene_table |>
+    dplyr::select(transcript_id, gene_id, gene_name, transcript_type) |>
+    dplyr::distinct()
+
+# Step 3: Join DET table with gene/transcript info
+det_table_annotated <- det_table |>
+    dplyr::left_join(tx2gene_trimmed, by = "transcript_id")
+
+# Sanity check
+cat("✅ Annotated DET table loaded.\n")
+cat("ℹ️  Rows:", nrow(det_table_annotated), "\n")
+cat("📌 Unique genes:", length(unique(det_table_annotated$gene_id)), "\n")
+cat("📌 Unique transcripts:", length(unique(det_table_annotated$transcript_id)), "\n")
+
+# Step 4: Create gene-level DEG table (collapsed from transcripts)
+deg_table <- det_table_annotated |>
+    dplyr::group_by(gene_id, gene_name) |>
+    dplyr::summarise(
+        log2FC = stats::median(log2FoldChange, na.rm = TRUE),
+        pvalue = min(pvalue, na.rm = TRUE),
+        .groups = "drop"
+    )
+
+cat("✅ DEG table created.\n")
+cat("📌 Genes:", nrow(deg_table), "\n")
+
+# Step 5: Rename only DET table for isoformic
+# Step 5: Prepare DET table with proper names expected by isoformic
+det_table_ready <- det_table_annotated |>
+  dplyr::mutate(
+    transcript_name = transcript_id,     # still needed
+    log2FC = log2FoldChange              # make sure log2FC column exists
+  )
+
+
+# Step 6: Join DET and DEG tables
+deg_det_table <- isoformic::join_DEG_DET(
+    DEG_tab       = deg_table,
+    DET_final_tab = det_table_ready,
+    logfc_cut     = 1,
+    pval_cut      = 0.05
+)
+
+cat("✅ DEG/DET table created.\n")
+cat("📌 Total rows (transcripts):", nrow(deg_det_table), "\n")
+cat("📌 Unique genes:", length(unique(deg_det_table$gene_id)), "\n")
+cat("📌 Unique transcripts:", length(unique(deg_det_table$id)), "\n")
+
+```
+
+```{r}
+fixed_tx_biotypes <- c(
+  "gene", "protein_coding", "retained_intron",
+  "protein_coding_CDS_not_defined", "nonsense_mediated_decay",
+  "lncRNA", "processed_pseudogene",
+  "transcribed_unprocessed_pseudogene",
+  "unprocessed_pseudogene", "non_stop_decay",
+  "transcribed_unitary_pseudogene",
+  "pseudogene", "unitary_pseudogene", "processed_transcript"
+)
+
+tx_type_color_names <- c(
+  "#fb8072", "#a6d854", "#8da0cb", "#fc8d62",
+  "#66c2a5", "#e78ac3", "#ffd92f", "#e5c494",
+  "#d9d9d9", "#d9d9d9", "#d9d9d9", "#ffffb3",
+  "#d9d9d9", "#d9d9d9"
+)
+
+names(tx_type_color_names) <- fixed_tx_biotypes
+
+tx_type_color_names
+```
+```{r}
+plot_log2FC(deg_det_table, "IKZF1")
+```
+
+

@@ -1,0 +1,1206 @@
+```{r}
+## Use install.packages() to install these packages:
+suppressMessages(library(tidyverse))
+suppressMessages(library(janitor))
+suppressMessages(library(plotly))
+suppressMessages(library(ggrepel))
+suppressMessages(library(purrr))
+suppressMessages(library(dplyr))
+
+## Use BiocManager::install() to install these packages:
+suppressMessages(library(DESeq2))
+suppressMessages(library(GeneTonic))
+suppressMessages(library(pcaExplorer))
+suppressMessages(library(topGO))
+suppressMessages(library(tidybulk))
+suppressMessages(library(AnnotationDbi))
+suppressMessages(library(org.Hs.eg.db))
+suppressMessages(library(SummarizedExperiment))
+suppressMessages(library(dittoSeq))
+suppressMessages(library(msigdbr))
+suppressMessages(library(fgsea))
+
+library(tidybulk)
+library(ggplot2)
+library(ggrepel)
+library(SummarizedExperiment)
+library(dplyr)
+```
+
+```{r}
+# Load required libraries
+library(tidyverse)
+
+# Define base directory containing sample folders
+base_dir <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Clarissa/snp_cell_lines_public_datasets_project/cell_lines/rnaseq/Gene_expresion_analysis/quant_sf_gene_exp_level_files"
+
+# Get full paths to sample directories
+sample_dirs <- list.dirs(base_dir, recursive = FALSE, full.names = TRUE)
+
+# Extract sample folder names
+sample_names <- basename(sample_dirs)
+
+# Construct metadata dataframe
+sample_metadata <- tibble(
+  sample = sample_names,
+  path = file.path(sample_dirs, "quant.sf")
+) %>%
+  # Derive structured metadata
+  mutate(
+    cell_line = case_when(
+      str_detect(sample, "^NALM6") ~ "NALM6",
+      str_detect(sample, "^REH") ~ "REH",
+      str_detect(sample, "^Jurkat") ~ "Jurkat",
+      str_detect(sample, "^MOLM13") ~ "MOLM13",
+      TRUE ~ NA_character_
+    ),
+    genotype = case_when(
+      str_detect(sample, "TT") ~ "TT",
+      str_detect(sample, "TC") ~ "TC",
+      str_detect(sample, "CC") ~ "CC",
+      TRUE ~ "WT"
+    ),
+    clone = str_extract(sample, "Clone[0-9]+") %>% str_remove("Clone") %>% as.integer(),
+    replicate = 1,
+    # Combine into full sample ID (e.g. REH_TT_1)
+    sample_id_full = paste(cell_line, genotype, ifelse(is.na(clone), "NA", clone), sep = "_")
+  )
+
+# Set rownames to match combined sample ID
+rownames(sample_metadata) <- sample_metadata$sample_id_full
+```
+
+# 🧬 2. Load the gene annotation (GTF → tx2gene)
+
+```{r}
+library(rtracklayer)
+library(tidyverse)
+
+# Load GTF annotation
+gtf <- import("/Users/cojulian/Desktop/Tzu_projects/Matt/reference_genomces/Homo_sapiens.GRCh38.113.gtf.gz")
+gtf_df <- as.data.frame(gtf)
+
+# Create transcript-to-gene mapping
+tx2gene_df <- gtf_df %>%
+  dplyr::select(transcript_id, gene_id, gene_name) %>%
+  dplyr::distinct(transcript_id, gene_id, gene_name) %>%
+  drop_na()
+
+```
+
+# 📁 3. Use your existing metadata (sample_metadata)
+
+```{r}
+# Assume sample_metadata already exists with these columns:
+# sample, path, cell_line, genotype, clone, replicate, sample_id_full
+
+# For compatibility with next steps
+human_coldata <- sample_metadata %>%
+  mutate(files = path) %>%
+  select(sample_id_full, files, everything()) %>%
+  rename(Sample = sample_id_full)
+
+# Set Sample as rownames (optional)
+rownames(human_coldata) <- human_coldata$Sample
+
+```
+
+```{r}
+# Read first quant.sf file and map transcripts to genes
+tmp <- read.delim(human_coldata$files[1]) %>%
+  inner_join(tx2gene_df, by = c("Name" = "transcript_id")) %>%
+  group_by(gene_id) %>%
+  summarise(NumReads = as.integer(sum(NumReads)))
+
+# Prepare matrix dimensions
+num.row <- nrow(tmp)
+num.col <- nrow(human_coldata)
+
+# Initialize empty gene-level count matrix
+sf.df <- data.frame(matrix(0, nrow = num.row, ncol = num.col))
+colnames(sf.df) <- human_coldata$Sample
+rownames(sf.df) <- tmp$gene_id
+
+```
+
+```{r}
+for (i in seq_along(human_coldata$files)) {
+  cat("Reading:", human_coldata$files[i], "\n")
+  
+  sf.df[, i] <- read.delim(human_coldata$files[i]) %>%
+    inner_join(tx2gene_df, by = c("Name" = "transcript_id")) %>%
+    group_by(gene_id) %>%
+    summarise(NumReads = as.integer(sum(NumReads))) %>%
+    pull(NumReads)
+}
+```
+
+```{r}
+# Convert to matrix for downstream use (DESeq2, edgeR, etc.)
+Salmon.matrix <- as.matrix(sf.df)
+
+# Confirm sample IDs match
+all(colnames(Salmon.matrix) %in% rownames(human_coldata))  # Should return TRUE
+```
+
+```{r}
+# 🧮 Set filtering thresholds
+expression_threshold <- 10
+min_clones_expressed <- 2
+
+# 📍 Convert count matrix to long format
+Salmon_long <- as.data.frame(Salmon.matrix) %>%
+  tibble::rownames_to_column("gene_id") %>%
+  tidyr::pivot_longer(-gene_id, names_to = "Sample", values_to = "expression")
+
+# 🔗 Join with metadata using Sample column (no need for rownames)
+Salmon_long <- Salmon_long %>%
+  dplyr::left_join(
+    human_coldata %>%
+      dplyr::select(Sample, cell_line, genotype, clone, replicate),
+    by = "Sample"
+  ) %>%
+  dplyr::mutate(group = paste(cell_line, genotype, sep = "_"))
+
+# 🧮 Count how many clones per group express each gene > threshold
+gene_group_counts <- Salmon_long %>%
+  dplyr::group_by(gene_id, group) %>%
+  dplyr::summarise(n_expressed_clones = sum(expression > expression_threshold), .groups = "drop")
+
+# ✅ Count number of clones per group
+group_sizes <- human_coldata %>%
+  dplyr::mutate(group = paste(cell_line, genotype, sep = "_")) %>%
+  dplyr::count(group, name = "n_clones")
+
+# ✅ Final filter: keep genes expressed in ≥ min_clones_expressed in at least one group
+genes_to_keep <- gene_group_counts %>%
+  dplyr::left_join(group_sizes, by = "group") %>%
+  dplyr::filter(n_expressed_clones >= pmin(n_clones, min_clones_expressed)) %>%
+  dplyr::distinct(gene_id)
+
+# ✂️ Filter original matrix
+sf.df.data <- Salmon.matrix %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("gene_id") %>%
+  dplyr::filter(gene_id %in% genes_to_keep$gene_id) %>%
+  tibble::column_to_rownames("gene_id")
+
+# ✅ Inspect result
+cat("\nFinal filtered matrix dimensions:\n")
+print(dim(sf.df.data))
+
+cat("\nPreview filtered matrix:\n")
+print(head(sf.df.data[, 1:5]))
+
+
+
+```
+
+# QC of before and after
+
+```{r}
+# 📊 1. Compare expression distribution before vs after filtering
+
+# Unfiltered matrix to long format
+Salmon_long_dist_unfiltered <- as.data.frame(Salmon.matrix) %>%
+  rownames_to_column("gene_id") %>%
+  pivot_longer(-gene_id, names_to = "Sample", values_to = "expression") %>%
+  mutate(stage = "Unfiltered")
+
+# Filtered matrix to long format
+Salmon_long_dist_filtered <- sf.df.data %>%
+  rownames_to_column("gene_id") %>%
+  pivot_longer(-gene_id, names_to = "Sample", values_to = "expression") %>%
+  mutate(stage = "Filtered")
+
+# Combine and log-transform expression
+combined_expression <- bind_rows(Salmon_long_dist_unfiltered, Salmon_long_dist_filtered) %>%
+  mutate(log_expression = log2(expression + 1))
+
+# Density plot
+ggplot(combined_expression, aes(x = log_expression, fill = stage)) +
+  geom_density(alpha = 0.4) +
+  labs(
+    title = "Log2(Expression) Distribution Before vs After Filtering",
+    x = "log2(Expression + 1)",
+    y = "Density",
+    fill = "Stage"
+  ) +
+  theme_minimal()
+
+# Boxplot
+ggplot(combined_expression, aes(x = stage, y = log_expression, fill = stage)) +
+  geom_boxplot(outlier.size = 0.5, alpha = 0.7) +
+  labs(
+    title = "Boxplot of Log2(Expression) Before vs After Filtering",
+    x = "",
+    y = "log2(Expression + 1)"
+  ) +
+  theme_minimal()
+
+# Summary
+cat("Number of genes before filtering:", nrow(Salmon.matrix), "\n")
+cat("Number of genes after filtering:", nrow(sf.df.data), "\n")
+cat("Percentage retained:", round(nrow(sf.df.data) / nrow(Salmon.matrix) * 100, 2), "%\n")
+
+```
+
+# Save FPKM
+```{r}
+# 🧬 1. Extract gene lengths from GTF (sum of exon widths per gene)
+gene_lengths <- gtf_df %>%
+  filter(type == "exon") %>%
+  group_by(gene_id) %>%
+  summarise(gene_length_kb = sum(width) / 1000, .groups = "drop")  # convert to kilobases
+
+# 🧮 2. Get library sizes (total counts per sample in millions)
+lib_sizes <- colSums(sf.df.data) / 1e6  # convert to millions
+# 📊 3. Compute FPKM
+fpkm_matrix <- sweep(sf.df.data, 2, lib_sizes, "/") %>%  # divide by library size
+  as.data.frame() %>%
+  tibble::rownames_to_column("gene_id") %>%
+  left_join(gene_lengths, by = "gene_id") %>%
+  mutate(across(-c(gene_id, gene_length_kb), ~ .x / gene_length_kb))  # divide by gene length
+
+# 🧾 4. Add gene symbols
+fpkm_matrix_annotated <- fpkm_matrix %>%
+  left_join(tx2gene_df %>% select(gene_id, gene_name) %>% distinct(gene_id, .keep_all = TRUE), by = "gene_id") %>%
+  relocate(gene_name, .after = gene_id)  # move gene_name next to gene_id
+
+# 🧹 5. Clean up and save
+fpkm_matrix_clean <- fpkm_matrix_annotated %>%
+  select(-gene_length_kb) %>%
+  distinct(gene_name, .keep_all = TRUE) %>%  # remove duplicates if any
+  column_to_rownames("gene_name")  # use gene symbols as rownames
+
+# 💾 6. Save to CSV
+write.csv(fpkm_matrix_clean, file = "fpkm_matrix_with_symbols.csv", row.names = TRUE)
+
+```
+
+
+# 🧬 PCA — using your metadata (cell_line, genotype)
+
+```{r}
+# 1. Filter metadata to match filtered expression matrix
+filtered_coldata <- human_coldata[colnames(sf.df.data), ]
+
+# 2. Create SummarizedExperiment
+se <- SummarizedExperiment(
+  assays = list(counts = as.matrix(sf.df.data)),
+  colData = filtered_coldata
+)
+
+# 3. Tidybulk pipeline: abundance filter → normalize → PCA
+pca_result <- se %>%
+  tidybulk::keep_abundant() %>%
+  tidybulk::scale_abundance() %>%
+  tidybulk::reduce_dimensions(method = "PCA", .dims = 15)
+
+# 4. PCA plot: color by genotype, shape by cell_line
+pca_result %>%
+  tidybulk::pivot_sample() %>%
+  ggplot(aes(
+    x = PC1,
+    y = PC2,
+    color = genotype,
+    shape = cell_line,
+    label = Sample  # Optional: or use paste(cell_line, genotype, clone)
+  )) +
+  geom_point(size = 3) +
+  ggrepel::geom_text_repel(max.overlaps = 5, size = 3, show.legend = FALSE) +
+  theme_minimal() +
+  labs(
+    title = "PCA of Filtered Gene Expression Data",
+    subtitle = "Colored by Genotype, Shaped by Cell Line",
+    x = "Principal Component 1",
+    y = "Principal Component 2"
+  )
+
+## No MT genes
+# Add gene_id as a column
+sf.df.data_symbols <- sf.df.data %>%
+    tibble::rownames_to_column("gene_id")
+
+# Join with tx2gene_df to get gene_name
+sf.df.data_symbols <- sf.df.data_symbols %>%
+    left_join(
+        tx2gene_df %>%
+            select(gene_id, gene_name) %>%
+            distinct(gene_id, .keep_all = TRUE),
+        by = "gene_id"
+    ) %>%
+    relocate(gene_name, .after = gene_id)
+
+
+# 1. Identify and remove mitochondrial genes
+mt_genes <- sf.df.data_symbols %>%
+  dplyr::filter(grepl("^MT-", gene_name)) %>%
+  pull(gene_id)
+
+sf.df.data_nomt <- sf.df.data_symbols %>%
+  dplyr::filter(!gene_id %in% mt_genes)
+
+# 2. Set gene_id as rownames
+expr_nomt <- sf.df.data_nomt %>%
+  tibble::column_to_rownames("gene_id") %>%
+  dplyr::select(-gene_name)
+
+# 3. Filter metadata to match expression matrix
+filtered_coldata_nomt <- human_coldata[colnames(expr_nomt), ]
+
+# 4. Create SummarizedExperiment
+se_nomt <- SummarizedExperiment(
+  assays = list(counts = as.matrix(expr_nomt)),
+  rowData = sf.df.data_nomt %>% select(gene_id, gene_name) %>% tibble::column_to_rownames("gene_id"),
+  colData = filtered_coldata_nomt
+)
+
+# 5. Tidybulk pipeline: abundance filter → normalize → PCA
+pca_nomt <- se_nomt %>%
+  tidybulk::keep_abundant() %>%
+  tidybulk::scale_abundance() %>%
+  tidybulk::reduce_dimensions(method = "PCA", .dims = 15)
+
+# 6. PCA plot: color by genotype, shape by cell_line
+pca_nomt %>%
+  tidybulk::pivot_sample() %>%
+  ggplot(aes(
+    x = PC1,
+    y = PC2,
+    color = genotype,
+    shape = cell_line,
+    label = Sample
+  )) +
+  geom_point(size = 3) +
+  ggrepel::geom_text_repel(max.overlaps = 5, size = 3, show.legend = FALSE) +
+  theme_minimal() +
+  labs(
+    title = "PCA of Gene Expression (MT Genes Removed)",
+    subtitle = "Colored by Genotype, Shaped by Cell Line",
+    x = "Principal Component 1",
+    y = "Principal Component 2"
+  )
+
+
+
+```
+### PCA for NALM6
+
+```{r}
+library(tidyverse)
+library(tidybulk)
+library(ggrepel)
+
+# 1. Filter metadata for NALM6 samples
+nalm6_coldata <- human_coldata %>%
+  filter(cell_line == "NALM6")
+
+# 2. Filter expression matrix to match NALM6 samples
+nalm6_expr <- sf.df.data_nomt[, c("gene_id", nalm6_coldata$Sample)]
+
+# 3. Reshape expression matrix to tidy format
+nalm6_expr_tidy <- nalm6_expr %>%
+  pivot_longer(
+    cols = -gene_id,
+    names_to = "Sample",
+    values_to = "abundance"
+  ) %>%
+  rename(gene = gene_id)
+
+# 4. Merge with metadata
+nalm6_tidy <- nalm6_expr_tidy %>%
+  left_join(nalm6_coldata, by = c("Sample" = "Sample"))
+
+# 5. Tidybulk pipeline: explicitly define tidybulk columns
+pca_nalm6 <- nalm6_tidy %>%
+  tidybulk(
+    .sample = Sample,
+    .transcript = gene,
+    .abundance = abundance
+  ) %>%
+  keep_abundant() %>%
+  scale_abundance() %>%
+  reduce_dimensions(method = "PCA", .dims = 8)
+
+# 6. PCA plot: color by genotype, shape by clone
+pca_nalm6 %>%
+  pivot_sample() %>%
+  ggplot(aes(
+    x = PC1,
+    y = PC2,
+    color = genotype,
+    shape = as.factor(clone),
+    label = Sample
+  )) +
+  geom_point(size = 3) +
+  ggrepel::geom_text_repel(max.overlaps = 5, size = 3, show.legend = FALSE) +
+  theme_minimal() +
+  labs(
+    title = "PCA of NALM6 Gene Expression",
+    subtitle = "Colored by Genotype, Shaped by Clone",
+    x = "Principal Component 1",
+    y = "Principal Component 2"
+  )
+
+
+# What is driving pc1?
+# --- What is driving PC1? ---
+
+# 1. Extract scaled expression matrix from tidybulk object
+scaled_expr <- pca_nalm6 %>%
+  select(gene, Sample, abundance_scaled) %>%
+  pivot_wider(names_from = Sample, values_from = abundance_scaled) %>%
+  column_to_rownames("gene")
+
+# 2. Run PCA manually
+pca_manual <- prcomp(t(scaled_expr), center = TRUE, scale. = FALSE)
+
+# 3. Extract loadings (gene contributions to PCs)
+loadings_df <- as.data.frame(pca_manual$rotation) %>%
+  rownames_to_column("gene_id")
+
+# 4. Get top genes driving PC1
+top_pc1_genes <- loadings_df %>%
+  arrange(desc(abs(PC1))) %>%
+  slice_head(n = 20)
+
+# 5. Annotate with gene symbols
+top_pc1_genes_annotated <- top_pc1_genes %>%
+  left_join(sf.df.data_symbols %>% select(gene_id, gene_name), by = "gene_id")
+
+# 6. View results
+print(top_pc1_genes_annotated)
+
+# --- Remove mitochondrial genes ---
+
+# 1. Identify mitochondrial genes
+mt_genes <- sf.df.data_symbols %>%
+  filter(str_detect(gene_name, "^MT-")) %>%
+  pull(gene_id)
+
+# 2. Filter out mitochondrial genes
+sf.df.data_nomt <- sf.df.data_symbols %>%
+  filter(!gene_id %in% mt_genes)
+
+# 3. Prepare expression matrix without MT genes
+expr_nomt <- sf.df.data_nomt %>%
+  column_to_rownames("gene_id") %>%
+  select(-gene_name)
+
+# 4. Filter metadata to match expression matrix
+filtered_coldata_nomt <- human_coldata[colnames(expr_nomt), ]
+
+# 5. Create tidybulk object
+tidy_nomt <- expr_nomt %>%
+  rownames_to_column("gene") %>%
+  pivot_longer(cols = -gene, names_to = "Sample", values_to = "abundance") %>%
+  left_join(filtered_coldata_nomt, by = c("Sample" = "Sample")) %>%
+  tidybulk(
+    .sample = Sample,
+    .transcript = gene,
+    .abundance = abundance
+  )
+
+# 6. Tidybulk pipeline: abundance filter → normalize → PCA
+pca_nomt <- tidy_nomt %>%
+  keep_abundant() %>%
+  scale_abundance() %>%
+  reduce_dimensions(method = "PCA", .dims = 15)
+
+# 7. PCA plot: color by genotype, shape by cell_line
+pca_nomt %>%
+  pivot_sample() %>%
+  ggplot(aes(
+    x = PC1,
+    y = PC2,
+    color = genotype,
+    shape = cell_line,
+    label = Sample
+  )) +
+  geom_point(size = 3) +
+  ggrepel::geom_text_repel(max.overlaps = 5, size = 3, show.legend = FALSE) +
+  theme_minimal() +
+  labs(
+    title = "PCA of Gene Expression (MT Genes Removed)",
+    subtitle = "Colored by Genotype, Shaped by Cell Line",
+    x = "Principal Component 1",
+    y = "Principal Component 2"
+  )
+
+
+
+```
+
+
+
+# ✅ Updated QC Suite 
+## Build SummarizedExperiment with filtered matrix + metadata
+```{r}
+# Build SE object
+sf.df.se <- SummarizedExperiment(
+  assays = list(counts = as.matrix(sf.df.data)),
+  colData = human_coldata[colnames(sf.df.data), ]  # Ensure matching sample order
+)
+
+# Create detailed sample names
+sf.df.se$detailed_name <- paste(sf.df.se$cell_line, sf.df.se$genotype, sf.df.se$clone, sep = "_")
+```
+
+
+```{r}
+# Calculate library sizes
+library_sizes <- colSums(assay(sf.df.se))
+
+# Plot
+ggplot(
+  data.frame(Sample = sf.df.se$detailed_name, LibrarySize = library_sizes),
+  aes(x = Sample, y = LibrarySize)
+) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  scale_y_continuous(labels = scales::comma) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, size = 10),
+    axis.title.x = element_text(size = 13),
+    axis.title.y = element_text(size = 13),
+    plot.title = element_text(size = 15, face = "bold")
+  ) +
+  labs(
+    title = "Library Size Distribution",
+    x = "Sample (cell_line_genotype_clone)",
+    y = "Library Size (Raw Counts)"
+  )
+
+```
+
+
+
+```{r}
+# Log-transform
+log_counts <- log2(assay(sf.df.se) + 1)
+
+# Melt for ggplot
+log_counts_long <- reshape2::melt(log_counts)
+colnames(log_counts_long) <- c("Gene", "Sample", "LogExpression")
+
+# Add cell_line/genotype/clone to annotate by color
+log_counts_long <- log_counts_long %>%
+  mutate(Group = sf.df.se$detailed_name[match(Sample, colnames(log_counts))])
+
+# Plot
+ggplot(log_counts_long, aes(x = LogExpression, color = Group)) +
+  geom_density(size = 1, alpha = 0.7) +
+  theme_minimal() +
+  labs(
+    title = "Log2 Gene Expression Distribution by Sample",
+    x = "Log2(Counts + 1)",
+    y = "Density"
+  ) +
+  theme(
+    axis.title = element_text(size = 13),
+    plot.title = element_text(size = 15, face = "bold"),
+    legend.title = element_blank(),
+    legend.text = element_text(size = 9)
+  )
+
+```
+
+# Doing DE, only one comparison
+
+```{r}
+# DESeq2 Analysis: NALM6 TT vs CC
+
+# 1. Filter metadata to only NALM6 TT and CC clones
+meta_data <- sample_metadata %>%
+  dplyr::filter(cell_line == "NALM6", genotype %in% c("TT", "CC")) %>%
+  dplyr::mutate(genotype = factor(genotype, levels = c("CC", "TT")))  # Reference = CC
+
+# 2. Inspect sample IDs and count matrix columns
+print("Sample IDs in metadata:")
+print(meta_data$sample_id_full)
+
+print("Column names in count matrix:")
+print(colnames(sf.df.data))
+
+# 3. Check for missing samples
+missing_samples <- setdiff(meta_data$sample_id_full, colnames(sf.df.data))
+if (length(missing_samples) > 0) {
+  warning("Missing samples in count matrix: ", paste(missing_samples, collapse = ", "))
+}
+
+# 4. Subset count matrix to match metadata
+filtered_bulk_matrix <- sf.df.data[, meta_data$sample_id_full]
+
+# 5. Check dimensions
+print(paste("Filtered matrix dimensions:", paste(dim(filtered_bulk_matrix), collapse = " x ")))
+print(paste("Metadata dimensions:", paste(dim(meta_data), collapse = " x ")))
+
+# 6. Create DESeq2 object
+dds <- DESeqDataSetFromMatrix(
+  countData = as.matrix(filtered_bulk_matrix),
+  colData = meta_data,
+  design = ~ genotype
+)
+
+# 7. Run DE analysis
+dds <- DESeq(dds)
+
+# 8. Extract results: TT vs CC
+res <- results(dds, contrast = c("genotype", "TT", "CC"), alpha = 0.05) 
+
+# 9. Convert results to dataframe
+de_results_tt_vs_cc <-  as.data.frame(res) %>%
+    tibble::rownames_to_column("gene_id") %>%
+    left_join(
+        tx2gene_df %>%
+            select(gene_id, gene_name) %>%
+            distinct(gene_id, .keep_all = TRUE),
+        by = "gene_id"
+    ) %>%
+    mutate(FoldChange = 2^log2FoldChange) %>%
+    mutate(significance = case_when(
+        FoldChange >= 1.5 & padj <= 0.05 ~ "up",
+        FoldChange <= (1 / 1.5) & padj <= 0.05 ~ "down",
+        TRUE ~ "ns"
+    ))
+
+
+
+
+# 10. Inspect result summary
+summary(res)
+
+```
+
+```{r}
+# Annotate with gene names (tx2gene_df assumed loaded)
+volcano_data <- de_results_tt_vs_cc %>%
+  # Join with gene name annotations
+  left_join(tx2gene_df %>% select(gene_id, gene_name), by = "gene_id") %>%
+  
+  # Resolve gene_name conflict and create GeneSymbol
+  mutate(GeneSymbol = ifelse(is.na(gene_name.y), gene_id, gene_name.y)) %>%
+  
+  # Remove duplicate gene entries
+  distinct(gene_id, .keep_all = TRUE) %>%
+  
+  # Select relevant columns
+  select(GeneSymbol, log2FoldChange, padj) %>%
+  
+  # Calculate FoldChange
+  mutate(FoldChange = 2^log2FoldChange) %>%
+  
+  # Classify genes by significance and direction
+  mutate(GeneType = case_when(
+    FoldChange >= 1.5 & padj <= 0.05 ~ "up",
+    FoldChange <= (1/1.5) & padj <= 0.05 ~ "down",
+    TRUE ~ "ns"
+  ))
+
+
+# Define style
+cols <- c("up" = "#ffad73", "down" = "#26b3ff", "ns" = "grey")
+sizes <- c("up" = 2, "down" = 2, "ns" = 1)
+alphas <- c("up" = 1, "down" = 1, "ns" = 0.5)
+
+# Plot
+volcano_plot <- ggplot(volcano_data, aes(
+  x = log2(FoldChange),
+  y = -log10(padj),
+  fill = GeneType,
+  size = GeneType,
+  alpha = GeneType
+)) +
+  geom_point(shape = 21, colour = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  geom_vline(xintercept = c(log2(1 / 1.5), log2(1.5)), linetype = "dashed") +
+  scale_fill_manual(values = cols) +
+  scale_size_manual(values = sizes) +
+  scale_alpha_manual(values = alphas) +
+  ggrepel::geom_text_repel(
+    data = filter(volcano_data, GeneType != "ns"),
+    aes(label = GeneSymbol),
+    size = 5,
+    color = "darkblue",
+    max.overlaps = 10,
+    min.segment.length = Inf
+  ) +
+  labs(
+    title = "Volcano Plot: NALM6 TT vs CC (padj ≤ 0.05, FC ≥ 1.5)",
+    x = "log2(Fold Change)",
+    y = "-log10(Adjusted P-value)"
+  ) +
+  theme_minimal(base_family = "Arial") +
+  theme(
+    panel.background = element_rect(fill = "white"),
+    plot.background = element_rect(fill = "white"),
+    legend.position = "bottom",
+    plot.title = element_text(size = 20, face = "bold"),
+    axis.title = element_text(size = 18),
+    axis.text = element_text(size = 14),
+    legend.text = element_text(size = 14),
+    legend.title = element_text(size = 16)
+  )
+
+# Show the plot
+print(volcano_plot)
+```
+
+# All around NALM6
+
+## Loop to run DEG NALM6 ONLY
+
+```{r}
+# 📂 1. Create output folder
+out_dir <- "deg_results_NALM6"
+if (!dir.exists(out_dir)) dir.create(out_dir)
+
+# 🧬 2. Function to run DESeq2 for a given comparison with FPKM
+run_deg <- function(count_matrix, metadata, ref_genotype, test_genotype, out_prefix) {
+  
+  # 📂 Filter metadata for NALM6 and selected genotypes
+  meta_data <- metadata %>%
+    filter(cell_line == "NALM6", genotype %in% c(ref_genotype, test_genotype)) %>%
+    mutate(genotype = factor(genotype, levels = c(ref_genotype, test_genotype)))  # reference first
+  
+  # 📊 Subset count matrix
+  filtered_counts <- count_matrix[, meta_data$sample_id_full]
+  
+  # 🧬 Get gene lengths from GTF (sum of exon widths per gene)
+  gene_lengths <- gtf_df %>%
+    filter(type == "exon") %>%
+    group_by(gene_id) %>%
+    summarise(gene_length_kb = sum(width) / 1000, .groups = "drop")  # kilobases
+  
+  # 📊 Get library sizes (total counts per sample in millions)
+  lib_sizes <- colSums(filtered_counts) / 1e6
+  
+  # 🧮 Compute FPKM
+  fpkm_matrix <- sweep(filtered_counts, 2, lib_sizes, "/") %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column("gene_id") %>%
+    left_join(gene_lengths, by = "gene_id") %>%
+    mutate(across(-c(gene_id, gene_length_kb), ~ .x / gene_length_kb))
+  
+  # 📈 Compute group-specific average FPKM
+  fpkm_long <- fpkm_matrix %>%
+    pivot_longer(-c(gene_id, gene_length_kb), names_to = "Sample", values_to = "fpkm") %>%
+    left_join(meta_data %>% select(Sample = sample_id_full, genotype), by = "Sample")
+  
+  avg_fpkm_grouped <- fpkm_long %>%
+    group_by(gene_id, genotype) %>%
+    summarise(avg_fpkm = mean(fpkm, na.rm = TRUE), .groups = "drop") %>%
+    pivot_wider(names_from = genotype, values_from = avg_fpkm, names_prefix = "fpkm_")
+  
+  # 🧪 DESeq2 analysis
+  dds <- DESeqDataSetFromMatrix(
+    countData = as.matrix(filtered_counts),
+    colData = meta_data,
+    design = ~ genotype
+  )
+  dds <- DESeq(dds)
+  res <- results(dds, contrast = c("genotype", test_genotype, ref_genotype), alpha = 0.05)
+  
+  # 🧾 Format results
+  deg_df <- as.data.frame(res) %>%
+    tibble::rownames_to_column("gene_id") %>%
+    left_join(tx2gene_df %>% select(gene_id, gene_name) %>% distinct(gene_id, .keep_all = TRUE), by = "gene_id") %>%
+    mutate(FoldChange = 2^log2FoldChange) %>%
+    mutate(significance = case_when(
+      FoldChange >= 1.5 & padj <= 0.05 ~ "up",
+      FoldChange <= (1 / 1.5) & padj <= 0.05 ~ "down",
+      TRUE ~ "ns"
+    )) %>%
+    left_join(avg_fpkm_grouped, by = "gene_id")  # ⬅️ Add group-specific FPKM
+  
+  # 💾 Save results
+  write.csv(deg_df, file = file.path(out_dir, paste0(out_prefix, ".csv")), row.names = FALSE)
+  
+  # Return the DEG dataframe invisibly
+  invisible(deg_df)
+}
+
+
+# 🚀 3. Run for the 3 desired comparisons
+deg_tt_vs_tc <- run_deg(sf.df.data, sample_metadata, "TC", "TT", "DEG_gen_exp_NALM6_TT_vs_TC")
+deg_tc_vs_cc <- run_deg(sf.df.data, sample_metadata, "CC", "TC", "DEG_gen_exp_NALM6_TC_vs_CC")
+deg_tt_vs_cc <- run_deg(sf.df.data, sample_metadata, "CC", "TT", "DEG_gen_exp_NALM6_TT_vs_CC")
+
+```
+
+```{r}
+library(pheatmap)
+
+# 1. Extract top 10 upregulated genes by fpkm_TT
+top_genes <- deg_tt_vs_cc %>%
+    filter(significance == "down") %>%
+    arrange(fpkm_TT) %>%
+    slice_head(n = 25) %>%
+    pull(gene_id)
+
+# 2. Define NALM6 sample order: TT, TC, CC
+nalm6_ordered <- c("NALM6_TT_1", "NALM6_TT_2", "NALM6_TT_3",
+                   "NALM6_TC_1", "NALM6_TC_2", "NALM6_TC_3",
+                   "NALM6_CC_1", "NALM6_CC_2", "NALM6_CC_3")
+
+# 3. Subset FPKM matrix for selected genes and samples
+heatmap_data <- fpkm_matrix_annotated %>%
+    filter(gene_id %in% top_genes) %>%
+    select(gene_name, all_of(nalm6_ordered)) %>%
+    column_to_rownames("gene_name")
+
+# 4. Log-transform for visualization
+heatmap_matrix <- log2(heatmap_data + 1)
+
+# 5. Plot heatmap without column clustering
+pheatmap(heatmap_matrix,
+         cluster_rows = TRUE,
+         cluster_cols = FALSE,
+         scale = "row",
+         main = "Top 25 Downregulated Genes in TT vs CC (NALM6)",
+         fontsize_row = 10)
+
+```
+
+## SPEARMAN CORRELATION of C dosage for NALM6
+
+
+```{r}
+# Add gene_id as a column
+sf.df.data_symbols <- sf.df.data %>%
+    tibble::rownames_to_column("gene_id")
+
+# Join with tx2gene_df to get gene_name
+sf.df.data_symbols <- sf.df.data_symbols %>%
+    left_join(
+        tx2gene_df %>%
+            select(gene_id, gene_name) %>%
+            distinct(gene_id, .keep_all = TRUE),
+        by = "gene_id"
+    ) %>%
+    relocate(gene_name, .after = gene_id)
+
+
+
+# Keep only NALM6 columns
+nalm6_expr_matrix <- sf.df.data_symbols %>%
+  select(gene_id, gene_name, starts_with("NALM6_"))
+
+# 1. Extract counts matrix
+nalm6_counts <- nalm6_expr_matrix %>%
+  select(-gene_id, -gene_name) %>%
+  as.matrix()
+rownames(nalm6_counts) <- nalm6_expr_matrix$gene_id
+
+# 2. Create sample metadata
+nalm6_sample_metadata <- tibble(
+  Sample = colnames(nalm6_counts)
+) %>%
+  mutate(original_sample = Sample) %>%  # preserve original name for joining
+  separate(Sample, into = c("cell_line", "genotype", "replicate"), sep = "_") %>%
+  mutate(genotype = factor(genotype, levels = c("TT", "TC", "CC")))
+
+# 3. Create DESeq2 object
+dds_nalm6 <- DESeqDataSetFromMatrix(
+  countData = nalm6_counts,
+  colData = nalm6_sample_metadata,
+  design = ~1
+)
+
+# 4. Apply variance-stabilizing transformation
+vst_nalm6 <- vst(dds_nalm6, blind = TRUE)
+
+# 5. Extract transformed matrix
+vst_matrix <- assay(vst_nalm6)
+
+# 6. Add gene_id and gene_name
+vst_df <- as.data.frame(vst_matrix) %>%
+  tibble::rownames_to_column("gene_id") %>%
+  left_join(nalm6_expr_matrix %>% select(gene_id, gene_name) %>% distinct(), by = "gene_id")
+
+# 7. Reshape to long format and join metadata
+vst_long <- vst_df %>%
+  pivot_longer(cols = starts_with("NALM6_"), names_to = "Sample", values_to = "expression") %>%
+  left_join(nalm6_sample_metadata, by = c("Sample" = "original_sample")) %>%
+  mutate(dosage = case_when(
+    genotype == "TT" ~ 0,
+    genotype == "TC" ~ 1,
+    genotype == "CC" ~ 2
+  ))
+
+# 🧮 Compute mean VST expression per genotype
+mean_expr_per_genotype <- vst_long %>%
+  group_by(gene_id, gene_name, genotype) %>%
+  summarise(mean_expr = mean(expression), .groups = "drop") %>%
+  pivot_wider(names_from = genotype, values_from = mean_expr,
+              names_prefix = "mean_vst_expr_")
+
+# 🔁 Compute Spearman correlation
+dose_response_summary <- vst_long %>%
+  group_by(gene_id, gene_name) %>%
+  summarise(
+    spearman_rho = cor(expression, dosage, method = "spearman"),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    trend_direction = case_when(
+      spearman_rho >= 0.5 ~ "↑ (increased with C dosage)",
+      spearman_rho <= -0.5 ~ "↓ (decreased with C dosage)",
+      TRUE ~ "– (weak/no trend)"
+    )
+  ) %>%
+  left_join(mean_expr_per_genotype, by = c("gene_id", "gene_name")) %>%
+  arrange(desc(abs(spearman_rho)))
+
+
+
+```
+
+### For REH Spearman
+
+```{r}
+# Add gene_id as a column
+sf.df.data_symbols <- sf.df.data %>%
+  tibble::rownames_to_column("gene_id")
+
+# Join with tx2gene_df to get gene_name
+sf.df.data_symbols <- sf.df.data_symbols %>%
+  left_join(
+    tx2gene_df %>%
+      select(gene_id, gene_name) %>%
+      distinct(gene_id, .keep_all = TRUE),
+    by = "gene_id"
+  ) %>%
+  relocate(gene_name, .after = gene_id)
+
+# 🎯 Subset only REH columns
+reh_expr_matrix <- sf.df.data_symbols %>%
+  select(gene_id, gene_name, starts_with("REH_"))
+
+# 1. Extract counts matrix
+reh_counts <- reh_expr_matrix %>%
+  select(-gene_id, -gene_name) %>%
+  as.matrix()
+rownames(reh_counts) <- reh_expr_matrix$gene_id
+
+# 2. Create sample metadata
+reh_sample_metadata <- tibble(
+  Sample = colnames(reh_counts)
+) %>%
+  mutate(original_sample = Sample) %>%
+  separate(Sample, into = c("cell_line", "genotype", "replicate"), sep = "_") %>%
+  mutate(genotype = factor(genotype, levels = c("TT", "TC", "CC")))
+
+# 3. Create DESeq2 object
+dds_reh <- DESeqDataSetFromMatrix(
+  countData = reh_counts,
+  colData = reh_sample_metadata,
+  design = ~1
+)
+
+# 4. Apply variance-stabilizing transformation
+vst_reh <- vst(dds_reh, blind = TRUE)
+
+# 5. Extract transformed matrix
+vst_matrix_reh <- assay(vst_reh)
+
+# 6. Add gene_id and gene_name
+vst_df_reh <- as.data.frame(vst_matrix_reh) %>%
+  tibble::rownames_to_column("gene_id") %>%
+  left_join(reh_expr_matrix %>% select(gene_id, gene_name) %>% distinct(), by = "gene_id")
+
+# 7. Reshape to long format and join metadata
+vst_long_reh <- vst_df_reh %>%
+  pivot_longer(cols = starts_with("REH_"), names_to = "Sample", values_to = "expression") %>%
+  left_join(reh_sample_metadata, by = c("Sample" = "original_sample")) %>%
+  mutate(dosage = case_when(
+    genotype == "TT" ~ 0,
+    genotype == "TC" ~ 1,
+    genotype == "CC" ~ 2
+  ))
+
+# 🧮 Compute mean VST expression per genotype
+mean_expr_reh <- vst_long_reh %>%
+  group_by(gene_id, gene_name, genotype) %>%
+  summarise(mean_expr = mean(expression), .groups = "drop") %>%
+  pivot_wider(names_from = genotype, values_from = mean_expr,
+              names_prefix = "mean_vst_expr_")
+
+# 🔁 Compute Spearman correlation
+dose_response_summary_reh <- vst_long_reh %>%
+  group_by(gene_id, gene_name) %>%
+  summarise(
+    spearman_rho = cor(expression, dosage, method = "spearman"),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    trend_direction = case_when(
+      spearman_rho >= 0.5 ~ "↑ (increased with C dosage)",
+      spearman_rho <= -0.5 ~ "↓ (decreased with C dosage)",
+      TRUE ~ "– (weak/no trend)"
+    )
+  ) %>%
+  left_join(mean_expr_reh, by = c("gene_id", "gene_name")) %>%
+  arrange(desc(abs(spearman_rho)))
+
+# 🔍 Inspect results
+dose_response_summary_reh %>% print(n = 10)
+
+write_csv(dose_response_summary_reh,"/Users/cojulian/Desktop/Tzu_projects/Matt/Clarissa/snp_cell_lines_public_datasets_project/cell_lines/atacseq/Clarissas_bulk_ATAC_Aug_2025/both_rna_atac_reh_sig/reh_dose_response_summary_rnaseq.csv")
+
+```
+
+# Matt's requiest of Aug 18
+First, identify TT vs CC DEGs using log2FC and p-value cutoffs; then, keep only those with meaningful FPKM in at least one genotype; finally, among those, retain genes where TC shows expression between TT and CC — indicating a graded, dosage-like effect.
+
+## NALM6
+```{r}
+# Step 1: Keep genes with |log2FC| > 1 and pvalue < 0.05
+de_genes_filtered <- de_results_tt_vs_cc %>%
+  dplyr::filter(!is.na(pvalue)) %>%
+  dplyr::filter(abs(log2FoldChange) > 1, pvalue < 0.05)
+
+# Step 2: Extract and compute group means for TT and CC samples
+fpkm_means <- fpkm_matrix_clean %>%
+  dplyr::select(
+    gene_id,
+    starts_with("NALM6_TT_"),
+    starts_with("NALM6_CC_")
+  ) %>%
+  rowwise() %>%
+  mutate(
+    mean_TT = mean(c_across(starts_with("NALM6_TT_")), na.rm = TRUE),
+    mean_CC = mean(c_across(starts_with("NALM6_CC_")), na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  dplyr::select(gene_id, mean_TT, mean_CC)
+
+# Step 3: Merge with DE gene list and apply FPKM filter
+de_genes_with_means <- de_genes_filtered %>%
+  dplyr::left_join(fpkm_means, by = "gene_id") %>%
+  dplyr::filter(mean_TT > 1 | mean_CC > 1)
+
+# Step 4: Add TC group mean
+fpkm_means_tc <- fpkm_matrix_clean %>%
+  dplyr::select(
+    gene_id,
+    starts_with("NALM6_TC_")
+  ) %>%
+  rowwise() %>%
+  mutate(mean_TC = mean(c_across(starts_with("NALM6_TC_")), na.rm = TRUE)) %>%
+  ungroup() %>%
+  dplyr::select(gene_id, mean_TC)
+
+# Join with previous table
+final_genes <- de_genes_with_means %>%
+  left_join(fpkm_means_tc, by = "gene_id") %>%
+  # Step 5: Keep genes where TC falls between TT and CC
+  dplyr::filter(
+    (mean_TC > mean_TT & mean_TC < mean_CC) |
+    (mean_TC < mean_TT & mean_TC > mean_CC)
+  ) %>% 
+  dplyr::select(-significance)
+
+# Check how many genes passed all filters
+cat("✅ Genes passing all filters:", nrow(final_genes), "\n")
+
+readr::write_csv(final_genes, "/Users/cojulian/Desktop/Tzu_projects/Matt/Clarissa/snp_cell_lines_public_datasets_project/cell_lines/atacseq/Clarissas_bulk_ATAC_Aug_2025/both_rna_atac_nalm6_sig/filtered_DE_genes_TT_vs_CC_expression_screened.csv")
+```
+
+## REH
+
+```{r}
+# 📦 Load required libraries
+library(DESeq2)
+library(tidyverse)
+
+# 1. Subset REH metadata for TT vs CC
+meta_reh_tt_cc <- sample_metadata %>%
+  filter(cell_line == "REH", genotype %in% c("TT", "CC")) %>%
+  mutate(genotype = factor(genotype, levels = c("CC", "TT")))  # Reference = CC
+
+# 2. Check and align sample IDs
+reh_ids <- meta_reh_tt_cc$sample_id_full
+missing_reh <- setdiff(reh_ids, colnames(sf.df.data))
+if (length(missing_reh) > 0) warning("❗ Missing samples: ", paste(missing_reh, collapse = ", "))
+
+# 3. Subset count matrix
+counts_reh_tt_cc <- sf.df.data[, reh_ids, drop = FALSE]
+
+# 4. Build DESeq2 object
+dds_reh <- DESeqDataSetFromMatrix(
+  countData = as.matrix(counts_reh_tt_cc),
+  colData = meta_reh_tt_cc,
+  design = ~ genotype
+)
+
+# 5. Run DESeq2
+dds_reh <- DESeq(dds_reh)
+
+# 6. Extract DE results (TT vs CC)
+res_reh <- results(dds_reh, contrast = c("genotype", "TT", "CC"), alpha = 0.05)
+
+# 7. Convert to dataframe and annotate
+de_results_reh_tt_vs_cc <- as.data.frame(res_reh) %>%
+  rownames_to_column("gene_id") %>%
+  left_join(
+    tx2gene_df %>% dplyr::select(gene_id, gene_name) %>% distinct(gene_id, .keep_all = TRUE),
+    by = "gene_id"
+  ) %>%
+  mutate(
+    FoldChange = 2^log2FoldChange,
+    significance = case_when(
+      FoldChange >= 1.5 & padj <= 0.05 ~ "up",
+      FoldChange <= (1 / 1.5) & padj <= 0.05 ~ "down",
+      TRUE ~ "ns"
+    )
+  )
+
+# 8. Step 1: Filter DE genes by effect size and p-value
+de_genes_filtered_reh <- de_results_reh_tt_vs_cc %>%
+  filter(!is.na(pvalue)) %>%
+  filter(abs(log2FoldChange) > 1, pvalue < 0.05)
+
+# 9. Step 2: Compute mean expression (FPKM-like) for TT and CC
+fpkm_means_reh <- fpkm_matrix_clean %>%
+  select(gene_id, starts_with("REH_TT_"), starts_with("REH_CC_")) %>%
+  rowwise() %>%
+  mutate(
+    mean_TT = mean(c_across(starts_with("REH_TT_")), na.rm = TRUE),
+    mean_CC = mean(c_across(starts_with("REH_CC_")), na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  dplyr::select(gene_id, mean_TT, mean_CC)
+
+# 10. Step 3: Merge with DE gene list and filter by mean expression
+de_genes_with_means_reh <- de_genes_filtered_reh %>%
+  left_join(fpkm_means_reh, by = "gene_id") %>%
+  dplyr::filter(mean_TT > 1 | mean_CC > 1)
+
+# 11. Step 4: Add mean TC expression
+fpkm_means_tc_reh <- fpkm_matrix_clean %>%
+  select(gene_id, starts_with("REH_TC_")) %>%
+  rowwise() %>%
+  mutate(mean_TC = mean(c_across(starts_with("REH_TC_")), na.rm = TRUE)) %>%
+  ungroup() %>%
+  dplyr::select(gene_id, mean_TC)
+
+# 12. Step 5: Final filter (TC between TT and CC)
+final_genes_reh <- de_genes_with_means_reh %>%
+  left_join(fpkm_means_tc_reh, by = "gene_id") %>%
+  filter((mean_TC > mean_TT & mean_TC < mean_CC) |
+         (mean_TC < mean_TT & mean_TC > mean_CC)) %>%
+  dplyr::select(-significance)
+
+# ✅ Output summary
+cat("✅ Genes passing all filters (REH TT vs CC):", nrow(final_genes_reh), "\n")
+
+# 💾 Save to CSV
+readr::write_csv(
+  final_genes_reh,
+  "/Users/cojulian/Desktop/Tzu_projects/Matt/Clarissa/snp_cell_lines_public_datasets_project/cell_lines/atacseq/Clarissas_bulk_ATAC_Aug_2025/both_rna_atac_reh_sig/filtered_DE_genes_REH_TT_vs_CC_expression_screened.csv"
+)
+
+```
+
