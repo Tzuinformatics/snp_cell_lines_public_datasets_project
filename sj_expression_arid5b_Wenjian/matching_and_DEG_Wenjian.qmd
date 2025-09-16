@@ -1,0 +1,921 @@
+```{r}
+# Load required libraries
+library(tidyverse)
+
+# Load genotype and expression data
+genotypes <- read_csv("Genotypes_gu_arid5b_rs7090445.csv", col_names = TRUE)
+expression <- read_csv("gu_arid5b_exp.csv", col_names = TRUE) %>%
+  rename_with(~ str_remove(., "_.*")) 
+
+# Clean genotype data
+genotypes_clean <- genotypes %>%
+  select(rs7090445, ancestry, COMPBIOID) %>%
+  rename(genotype = rs7090445, sample_id = COMPBIOID) %>%
+  mutate(genotype_label = case_when(
+    genotype == 0 ~ "CC",
+    genotype == 1 ~ "CT",
+    genotype == 2 ~ "TT",
+    TRUE ~ NA_character_
+  ))
+
+```
+# Matching
+
+```{r}
+library(dplyr)
+library(tibble)
+
+# Transpose expression data to long format
+expression_long <- expression %>%
+    mutate(gene = sub("\\..*", "", gene)) %>% 
+    pivot_longer(-gene, names_to = "sample_id", values_to = "expression")
+
+# Join with genotype metadata
+expression_annotated <- expression_long %>%
+    left_join(genotypes_clean, by = "sample_id") %>%
+  mutate(ensembl_id = sub("\\..*", "", gene))
+
+library(biomaRt)
+
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+
+gene_map <- getBM(
+  attributes = c("ensembl_gene_id", "hgnc_symbol", "gene_biotype"),
+  filters = "ensembl_gene_id",
+  values = unique(expression_annotated$ensembl_id),
+  mart = ensembl
+)
+
+expression_annotated <- expression_annotated %>%
+  left_join(gene_map, by = c("ensembl_id" = "ensembl_gene_id"))
+
+
+
+```
+
+# PCA
+
+```{r}
+library(tidyverse)
+library(tidybulk)
+library(ggrepel)
+
+## 1. Reshape expression to long format
+expression_long <- expression %>%
+    mutate(gene = sub("\\..*", "", gene)) %>% 
+    pivot_longer(-gene, names_to = "sample_id", values_to = "expression")
+
+## 2. Join with metadata
+expr_annotated <- expression_long %>%
+    left_join(genotypes_clean, by = "sample_id")
+
+## 3. Convert to tidybulk object
+tb <- expr_annotated %>%
+    tidybulk(
+        .sample = sample_id,
+        .transcript = gene,
+        .abundance = expression
+    )
+
+## 4. Abundance filtering, scaling, PCA
+tb_pca <- tb %>%
+    keep_abundant(
+        factor_of_interest = sample_id,
+        minimum_counts = 10,
+        minimum_proportion = 0.7
+    ) %>%
+    scale_abundance() %>%
+    reduce_dimensions(
+        method = "PCA",
+        .dims = 10,
+        top = 5000,
+        transform = log1p,
+        scale = TRUE
+    )
+
+## 5. Plot PCA
+tb_pca %>%
+    pivot_sample() %>%
+    ggplot(aes(
+        x = PC1, y = PC2,
+        color = genotype_label,
+        shape = ancestry,
+        label = sample_id
+    )) +
+    geom_point(size = 3) +
+    ggrepel::geom_text_repel(max.overlaps = 5, size = 2, show.legend = FALSE) +
+    theme_minimal() +
+    labs(
+        title = "PCA of Transcriptome Expression (tidybulk)",
+        subtitle = "Colored by rs7090445 genotype, shaped by ancestry",
+        x = "Principal Component 1",
+        y = "Principal Component 2"
+    )
+
+```
+
+
+# T-SNE
+```{r}
+# ---- t-SNE analysis ----
+library(Rtsne)
+library(ggplot2)
+library(ggrepel)
+
+## 1. Prepare expression matrix (genes x samples → samples x genes)
+# Keep top variable genes to reduce noise
+expr_matrix <- expression %>%
+  column_to_rownames("gene") %>%
+  as.matrix()
+
+# Variance filter: top 5000 most variable genes
+var_genes <- order(apply(expr_matrix, 1, var), decreasing = TRUE)[1:5000]
+expr_top <- expr_matrix[var_genes, ]
+
+# Transpose so samples are rows
+expr_top_t <- t(expr_top)
+
+## 2. Run t-SNE
+set.seed(123)
+tsne_res <- Rtsne(expr_top_t, dims = 2, perplexity = 30, verbose = TRUE)
+
+# Add to metadata
+tsne_df <- data.frame(
+  sample_id = rownames(expr_top_t),
+  tSNE1 = tsne_res$Y[,1],
+  tSNE2 = tsne_res$Y[,2]
+) %>%
+  left_join(genotypes_clean, by = "sample_id")
+
+## 3. Plot t-SNE colored by genotype, shaped by ancestry
+ggplot(tsne_df, aes(x = tSNE1, y = tSNE2,
+                    color = genotype_label,
+                    shape = ancestry,
+                    label = sample_id)) +
+  geom_point(size = 3) +
+  ggrepel::geom_text_repel(max.overlaps = 5, size = 2, show.legend = FALSE) +
+  theme_minimal() +
+  labs(
+    title = "t-SNE of Transcriptome Expression",
+    subtitle = "Colored by rs7090445 genotype, shaped by ancestry",
+    x = "t-SNE 1",
+    y = "t-SNE 2"
+  )
+
+## 4. Optional: cluster directly in t-SNE space
+set.seed(123)
+km_tsne <- kmeans(tsne_df %>% select(tSNE1, tSNE2), centers = 4, nstart = 25)
+tsne_df$cluster <- factor(km_tsne$cluster)
+
+ggplot(tsne_df, aes(x = tSNE1, y = tSNE2,
+                    color = cluster,
+                    shape = ancestry)) +
+  geom_point(size = 3) +
+  theme_minimal() +
+  labs(
+    title = "t-SNE clustering of transcriptome expression",
+    subtitle = "Clusters from k-means on t-SNE space"
+  )
+
+# ---- ARID5B expression per t-SNE cluster ----
+
+# Join cluster assignments back to expression_long
+arid5b_expr_tsne <- expression_long %>%
+  filter(gene == "ENSG00000150347") %>%   # ARID5B Ensembl ID
+  left_join(tsne_df %>% select(sample_id, cluster), by = "sample_id")
+
+# Boxplot of ARID5B expression by cluster
+ggplot(arid5b_expr_tsne, aes(x = cluster, y = expression, fill = cluster)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(
+    title = "ARID5B expression across t-SNE–defined clusters",
+    y = "FPKM (ARID5B expression)",
+    x = "t-SNE cluster"
+  )
+
+# ANOVA test: does ARID5B differ across clusters?
+anova(lm(expression ~ cluster, data = arid5b_expr_tsne))
+
+# Optional: Tukey post-hoc comparisons between clusters
+TukeyHSD(aov(expression ~ cluster, data = arid5b_expr_tsne))
+
+
+```
+
+# Heatmap
+
+
+```{r}
+# Use tsne_df which already has cluster assignments
+cluster_samples <- tsne_df %>%
+  select(sample_id, cluster, genotype_label, ancestry) %>%
+  arrange(cluster)
+
+# Save mapping of samples to clusters
+write_csv(cluster_samples, "SJ_samples_per_tSNE_cluster.csv")
+
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(pheatmap)
+
+# ---- 1. Add cluster assignment ----
+expr_long_clusters <- expression_long %>%
+  left_join(tsne_df %>% select(sample_id, cluster), by = "sample_id") %>%
+  left_join(gene_map, by = c("gene" = "ensembl_gene_id")) %>%
+  mutate(
+    gene_symbol = ifelse(is.na(hgnc_symbol) | hgnc_symbol == "", gene, hgnc_symbol)
+  )
+
+# ---- 2. Get top 25 variable genes per cluster ----
+top_genes_per_cluster <- expr_long_clusters %>%
+  group_by(cluster, gene_symbol) %>%
+  summarise(var_within = var(expression, na.rm = TRUE), .groups = "drop") %>%
+  group_by(cluster) %>%
+  slice_max(order_by = var_within, n = 25) %>%
+  ungroup() %>%
+  mutate(gene_cluster = paste0(gene_symbol, "_cluster", cluster))   # ensure uniqueness
+
+# ---- 3. Build expression matrix ----
+heatmap_matrix <- expr_long_clusters %>%
+  inner_join(top_genes_per_cluster, by = c("gene_symbol", "cluster")) %>%
+  mutate(gene_cluster = paste0(gene_symbol, "_cluster", cluster)) %>%
+  select(sample_id, gene_cluster, expression) %>%
+  pivot_wider(names_from = sample_id, values_from = expression) %>%
+  as.data.frame()
+
+# ---- 4. Use gene_cluster as rownames ----
+rownames(heatmap_matrix) <- heatmap_matrix$gene_cluster
+heatmap_matrix <- heatmap_matrix %>% select(-gene_cluster)
+
+# Remove rows with all NA, replace remaining with 0
+heatmap_matrix <- heatmap_matrix[rowSums(is.na(heatmap_matrix)) < ncol(heatmap_matrix), ]
+heatmap_matrix[is.na(heatmap_matrix)] <- 0
+
+# Reorder samples by cluster
+sample_order <- tsne_df %>% arrange(cluster) %>% pull(sample_id)
+heatmap_matrix <- heatmap_matrix[, sample_order]
+
+# ---- 5. Sample annotations ----
+sample_ann <- tsne_df %>%
+  select(sample_id, cluster, genotype_label, ancestry) %>%
+  column_to_rownames("sample_id")
+
+# ---- 6. Plot heatmap ----
+pheatmap(
+  heatmap_matrix,
+  scale = "row",
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  annotation_col = sample_ann,
+  show_rownames = TRUE,
+  show_colnames = FALSE,
+  main = "Top 25 variable genes per t-SNE cluster"
+)
+
+# ---- 7. Save list of genes per cluster ----
+write_csv(top_genes_per_cluster, "Top25_genes_per_cluster_with_symbols.csv")
+
+```
+
+#Hierarchical clustering:
+
+```{r}
+# ---- Libraries ----
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+
+# ---- 1. Prepare expression matrix (genes x samples) ----
+expression_wide <- expression_annotated %>%
+    dplyr::select(sample_id, hgnc_symbol, expression) %>%
+    dplyr::filter(!is.na(hgnc_symbol) & hgnc_symbol != "") %>%
+    dplyr::group_by(hgnc_symbol, sample_id) %>%
+    dplyr::summarise(expression = mean(expression), .groups = "drop") %>%
+    tidyr::pivot_wider(names_from = sample_id, values_from = expression) %>%
+    as.data.frame()   # convert to plain df so rownames work
+
+rownames(expression_wide) <- expression_wide$hgnc_symbol
+expression_wide$hgnc_symbol <- NULL
+
+# ---- 2. Log-transform ----
+expression_log <- log2(as.matrix(expression_wide) + 1)
+
+# ---- 3. Filter by variance (top 5000 most variable genes) ----
+gene_vars <- apply(expression_log, 1, stats::var, na.rm = TRUE)
+gene_vars <- gene_vars[!is.na(gene_vars) & gene_vars > 0]  # drop NAs/zeros
+top_genes <- names(sort(gene_vars, decreasing = TRUE))[1:min(5000, length(gene_vars))]
+
+expression_filtered <- expression_log[top_genes, ]
+
+cat("Genes retained after variance filtering:", nrow(expression_filtered), "\n")
+
+# ---- 4. Transpose: samples x genes ----
+expression_scaled <- scale(t(expression_filtered))
+
+cat("Matrix dimensions (samples x genes):", dim(expression_scaled), "\n")
+
+# ---- 5. Elbow method ----
+set.seed(123)
+wss <- sapply(1:10, function(k) {
+    cat("Running k-means for k =", k, "\n")
+    km <- stats::kmeans(expression_scaled, centers = k, nstart = 25)
+    km$tot.withinss
+})
+
+# ---- 6. Plot elbow curve ----
+elbow_df <- tibble::tibble(k = 1:10, wss = wss)
+
+ggplot2::ggplot(elbow_df, ggplot2::aes(x = k, y = wss)) +
+    ggplot2::geom_line() +
+    ggplot2::geom_point() +
+    ggplot2::theme_minimal() +
+    ggplot2::labs(
+        title = "Elbow Method for Optimal k",
+        x = "Number of clusters (k)",
+        y = "Total within-cluster sum of squares"
+    )
+
+```
+
+
+```{r}
+# Load required libraries
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stats)
+
+# Step 1: Log-transform and filter low-expression genes
+expression_matrix <- expression_wide %>%
+    dplyr::mutate_all(~ log2(. + 1)) %>%
+    dplyr::select_if(~ median(.) > 1)
+
+# Step 2: Z-score normalization across samples
+expression_scaled <- scale(expression_matrix)
+
+# Step 3: Compute distance matrix (Euclidean)
+dist_matrix <- dist(expression_scaled, method = "euclidean")
+
+# Step 4: Perform hierarchical clustering
+hc <- hclust(dist_matrix, method = "ward.D2")
+
+# Step 5: Cut tree into clusters (e.g., k = 3)
+cluster_labels <- cutree(hc, k = 5)
+
+# Step 6: Create cluster assignment table
+sample_clusters <- tibble::tibble(
+    sample_id = rownames(expression_scaled),
+    cluster = cluster_labels
+)
+
+# Optional: View cluster counts
+print(table(sample_clusters$cluster))
+
+```
+
+
+# Dendrogram
+```{r}
+# ---- Dendrogram with colored clusters ----
+library(ggdendro)
+
+# Cut tree into 4 clusters
+clusters_4 <- stats::cutree(hc, k = 5)
+
+# Plot dendrogram
+plot(hc, labels = FALSE, main = "Hierarchical Clustering Dendrogram (k=5)")
+rect.hclust(hc, k = 5, border = 2:5)  # add colored boxes
+
+```
+
+# Barplots and overlay
+```{r}
+# ---- Merge cluster labels with metadata (k = 5) ----
+sample_clusters <- tibble::tibble(
+    sample_id = rownames(expression_scaled),
+    cluster = stats::cutree(hc, k = 5)   # directly use k=5 here
+)
+
+annotated_clusters <- sample_clusters %>%
+    dplyr::left_join(genotypes_clean, by = "sample_id")
+
+# ---- Cluster composition tables ----
+cat("Cluster composition by ancestry:\n")
+print(table(annotated_clusters$cluster, annotated_clusters$ancestry))
+
+cat("\nCluster composition by genotype:\n")
+print(table(annotated_clusters$cluster, annotated_clusters$genotype_label))
+
+# ---- Quick visualizations ----
+library(ggplot2)
+
+# Proportion of ancestry in each cluster
+ggplot(annotated_clusters, aes(x = factor(cluster), fill = ancestry)) +
+    geom_bar(position = "fill") +
+    theme_minimal() +
+    labs(
+        title = "Cluster composition by ancestry (k = 5)",
+        x = "Cluster",
+        y = "Proportion"
+    )
+
+# Proportion of genotype in each cluster
+ggplot(annotated_clusters, aes(x = factor(cluster), fill = genotype_label)) +
+    geom_bar(position = "fill") +
+    theme_minimal() +
+    labs(
+        title = "Cluster composition by genotype (k = 5)",
+        x = "Cluster",
+        y = "Proportion"
+    )
+
+```
+# TSNE Heatmap
+
+```{r}
+# --- Prepare expression matrix (gene x sample) ---
+expression_wide <- expression_annotated %>%
+    dplyr::filter(!is.na(hgnc_symbol) & hgnc_symbol != "") %>%
+    dplyr::group_by(hgnc_symbol, sample_id) %>%
+    dplyr::summarise(expression = mean(expression), .groups = "drop") %>%
+    tidyr::pivot_wider(names_from = sample_id, values_from = expression) %>%
+    as.data.frame()
+
+rownames(expression_wide) <- expression_wide$hgnc_symbol
+expression_wide$hgnc_symbol <- NULL
+
+# --- Subset top variable genes ---
+gene_vars <- apply(expression_wide, 1, var, na.rm = TRUE)
+top_genes <- names(sort(gene_vars, decreasing = TRUE))[1:75]  # top 200 genes
+expr_top <- expression_wide[top_genes, ]
+
+# --- Z-score normalization (row-wise) ---
+expr_z <- t(scale(t(expr_top)))  # z-score per gene across samples
+
+# --- Average by t-SNE cluster ---
+cluster_assignments <- tsne_df %>% dplyr::select(sample_id, cluster)
+expr_cluster <- as.data.frame(expr_z) %>%
+    tibble::rownames_to_column("gene") %>%
+    tidyr::pivot_longer(-gene, names_to = "sample_id", values_to = "zscore") %>%
+    dplyr::left_join(cluster_assignments, by = "sample_id") %>%
+    dplyr::group_by(gene, cluster) %>%
+    dplyr::summarise(mean_z = mean(zscore, na.rm = TRUE), .groups = "drop") %>%
+    tidyr::pivot_wider(names_from = cluster, values_from = mean_z)
+
+# --- Heatmap input ---
+heatmap_matrix <- expr_cluster %>%
+    tibble::column_to_rownames("gene") %>%
+    as.matrix()
+
+# --- Plot heatmap ---
+pheatmap(
+    heatmap_matrix,
+    cluster_rows = TRUE,
+    cluster_cols = TRUE,
+    scale = "none",   # already z-scored
+    main = "Top 75 variable genes (z-score per gene, averaged per t-SNE cluster)"
+)
+
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+# --- Extract ARID5B expression & join cluster info ---
+arid5b_expr <- expression_long %>%
+    dplyr::filter(gene == "ENSG00000150347") %>%    # ARID5B Ensembl ID
+    dplyr::left_join(tsne_df %>% dplyr::select(sample_id, cluster, genotype_label),
+                     by = "sample_id")
+
+# --- Boxplot: ARID5B expression per cluster, colored by genotype ---
+ggplot(arid5b_expr, aes(x = factor(cluster), y = expression,
+                        fill = genotype_label)) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+    geom_jitter(width = 0.2, size = 1.5, alpha = 0.6) +
+    theme_minimal() +
+    labs(
+        title = "ARID5B expression across t-SNE clusters by genotype",
+        x = "t-SNE Cluster",
+        y = "ARID5B Expression (FPKM)",
+        fill = "Genotype"
+    )
+
+```
+
+# Iacobucci's dataset
+
+# 1.1 — Load Iacobucci panel (wide) & expression matrix
+
+```{r}
+# 1.1 — Load Iacobucci panel (wide) & expression matrix ---------------
+# Panel: 7 columns = cell types (wide)
+Iacobucci_cell_types <- readxl::read_xlsx("Iacobucci Cell Type (1).xlsx") 
+
+# Expression: Ensembl rows × samples; keep 'gene' column intact
+expression <- read_csv("gu_arid5b_exp.csv", col_names = TRUE) %>%
+    rename_with(~ str_remove(., "_.*")) %>%
+    mutate(ensembl_id = sub("\\..*", "", gene))  # strip Ensembl version
+```
+# 1.2 — Panel to data.frame, list all gene symbols (no dropping yet)
+
+```{r}
+# 1.2 — Panel to data.frame, list all gene symbols --------------------
+# Keep as plain data.frame; trim stray spaces; DO NOT drop rows here.
+df <- as.data.frame(Iacobucci_cell_types) %>%
+  mutate(across(everything(), ~ trimws(as.character(.))))
+
+# Collect all symbols that appear anywhere in the panel (may include NA/"")
+genes <- df %>%
+  pivot_longer(everything(), names_to = "cell_type", values_to = "gene") %>%
+  filter(!is.na(gene), gene != "") %>%
+  distinct(gene) %>%
+  pull(gene)
+
+cat("Panel unique HGNC (pre-curation):", length(genes), "\n")
+```
+
+# 1.3 — Validate symbols via BioMart (HGNC → basic info)
+
+```{r}
+# 1.3 — Validate symbols via BioMart ----------------------------------
+ensembl <- biomaRt::useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+
+valid_genes <- biomaRt::getBM(
+  attributes = c("hgnc_symbol", "ensembl_gene_id", "gene_biotype", "entrezgene_id"),
+  filters    = "hgnc_symbol",
+  values     = genes,
+  mart       = ensembl
+)
+
+invalid_genes <- setdiff(genes, valid_genes$hgnc_symbol)
+
+cat("Valid HGNC returned by BioMart:", dplyr::n_distinct(valid_genes$hgnc_symbol), "\n")
+cat("Potentially invalid/missing symbols:", length(invalid_genes), "\n")
+if (length(invalid_genes)) {
+  print(invalid_genes)  # peek (won’t spam the console)
+}
+```
+
+# 1.4 — Manual symbol curation (map/replace)
+
+```{r}
+# 1.4 — Manual symbol curation (map/replace), keep NAs -----------------
+# NOTE: We DO NOT na.omit() the wide panel; that would drop entire rows
+# if any single cell is NA. We'll drop NAs later only after pivot_longer.
+gene_updates <- c(
+  "TMEM173"   = "STING1",
+  "C11orf74"  = "IFTAP",
+  "MARC1"     = "MTARC1",
+  "C20orf27"  = "ADISSP",
+  "AC023590.1"= NA,        # remove
+  "AC002454.1"= NA,        # remove
+  "AP000345.2"= NA,        # remove
+  "H1FX"      = "H1-10",
+  "C16orf72"  = "HAPSTR1",
+  "HIST1H2BG" = "H2BC4",
+  "FAM214A"   = "ATOSA",
+  "CLECL1"    = "CLECL1P",
+  "MARCH1"    = "MARCHF1"
+)
+
+df_updated <- df %>%
+  mutate(across(
+    everything(),
+    ~ dplyr::if_else(. %in% names(gene_updates), gene_updates[.], .)
+  )) %>%
+  mutate(across(everything(), ~ na_if(., "")))  # treat empty string as NA
+
+# Quick snapshot: how many NAs per cell type after curation
+na_counts <- colSums(is.na(df_updated))
+cat("NAs per cell type column after curation:\n")
+print(na_counts)
+
+# Peek
+head(df_updated)
+
+```
+
+## 1.5 — 🔍 Panel duplicate check (genes across >1 cell type) -----------
+### Why? Some genes are assigned to more than one cell type in the panel.
+
+```{r}
+panel_dups <- df_updated %>%
+  pivot_longer(everything(), names_to = "cell_type", values_to = "gene") %>%
+  filter(!is.na(gene), gene != "") %>%
+  group_by(gene) %>%
+  summarise(cell_types = paste(unique(cell_type), collapse = ", "),
+            n_cell_types = n_distinct(cell_type),
+            .groups = "drop") %>%
+  filter(n_cell_types > 1) %>%
+  arrange(gene)
+
+# Preview as a compact table
+panel_dups
+```
+
+# 2 — Map expression IDs to HGNC & prep the panel
+## 2.1 — 🧭 Map Ensembl IDs → HGNC symbols
+
+Why? The expression matrix is indexed by Ensembl IDs. We need HGNC symbols so we can match to the panel genes.
+
+```{r}
+# Query Ensembl once for all Ensembl IDs observed in expression
+gene_map <- biomaRt::getBM(
+  attributes = c("ensembl_gene_id", "hgnc_symbol"),
+  filters    = "ensembl_gene_id",
+  values     = unique(expression$ensembl_id),
+  mart       = ensembl
+) %>%
+  dplyr::mutate(hgnc_symbol = dplyr::na_if(hgnc_symbol, "")) %>%
+  dplyr::distinct(ensembl_gene_id, .keep_all = TRUE)
+
+# Attach HGNC to the expression table
+expression_with_symbol <- expression %>%
+  dplyr::left_join(gene_map, by = c("ensembl_id" = "ensembl_gene_id"))
+
+cat("Mapped Ensembl→HGNC for",
+    sum(!is.na(expression_with_symbol$hgnc_symbol)),
+    "rows out of", nrow(expression_with_symbol), "\n")
+```
+
+## 2.2 — 🧬 Build the panel gene list & check coverage
+
+Why? See how many of our curated panel genes are present in the expression matrix.
+
+```{r}
+# 2.2 — Build the panel gene list & check coverage --------------------
+panel_genes <- df_updated %>%
+  tidyr::pivot_longer(everything(), names_to = "cell_type", values_to = "gene") %>%
+  dplyr::filter(!is.na(gene), gene != "") %>%
+  dplyr::distinct(gene) %>%
+  dplyr::pull(gene)
+
+# Which panel genes are present (by HGNC) in the expression table?
+present <- intersect(panel_genes,
+                     unique(stats::na.omit(expression_with_symbol$hgnc_symbol)))
+missing <- setdiff(panel_genes, present)
+
+cat("Panel size (unique HGNC):", length(panel_genes), "\n")
+cat("Present in expression:", length(present), "\n")
+cat("Missing from expression:", length(missing), "\n")
+if (length(missing)) {
+  cat("Missing (first 20):", paste(utils::head(missing, 20), collapse = ", "), "\n")
+}
+
+```
+## 2.3 — 🔁 Handle duplicates (multiple Ensembl rows per HGNC)
+
+Why? Some HGNC symbols appear multiple times (different Ensembl IDs, isoforms, etc.).
+We’ll (A) report duplicates, and (B) produce two flavors for downstream plots:
+
+ * Unique-only (drop duplicated HGNCs entirely) — conservative visualization.
+
+ * Collapsed by symbol (take MAX across Ensembl rows) — robust & keeps all symbols.
+
+```{r}
+# 2.3 — Handle duplicates (report + two flavors) ----------------------
+# Keep only rows that have an HGNC symbol AND belong to the panel
+expression_panel <- expression_with_symbol %>%
+  dplyr::filter(!is.na(hgnc_symbol), hgnc_symbol %in% panel_genes)
+
+# Count duplicated HGNCs (i.e., >1 Ensembl row per symbol)
+dup_summary <- expression_panel %>%
+  dplyr::count(hgnc_symbol, name = "n_ensembl") %>%
+  dplyr::filter(n_ensembl > 1) %>%
+  dplyr::arrange(dplyr::desc(n_ensembl))
+
+dup_symbols <- dup_summary$hgnc_symbol
+
+cat("Duplicated HGNC in panel:", length(dup_symbols), "\n")
+if (nrow(dup_summary)) print(utils::head(dup_summary, 12))
+
+# (A) Unique-only flavor (drop all duplicated HGNCs)
+expression_panel_unique <- expression_panel %>%
+  dplyr::filter(!hgnc_symbol %in% dup_symbols)
+
+# (B) Collapsed-by-symbol flavor (take MAX across rows for each HGNC)
+#     NOTE: change max → mean/sum if you prefer a different aggregator.
+expr_by_symbol <- expression_panel %>%
+  dplyr::select(hgnc_symbol, where(is.numeric)) %>%
+  dplyr::group_by(hgnc_symbol) %>%
+  dplyr::summarise(dplyr::across(where(is.numeric), ~ max(., na.rm = TRUE)),
+                   .groups = "drop")
+
+cat("Unique-only genes:", dplyr::n_distinct(expression_panel_unique$hgnc_symbol), "\n")
+```
+
+#3 — 🔥 Heatmap explorations
+##3.1 — Heatmap of unique HGNC only
+Here we take only panel genes that map uniquely to one Ensembl ID. We log2-transform the counts, drop flat genes, and standardize each gene (row-wise z-score). That means each gene’s values are centered around 0 with SD = 1, so we’re comparing patterns, not absolute abundance.
+```{r}
+# 1. Select numeric columns + HGNC symbol
+heatmap_mat <- expression_panel_unique %>%
+  select(hgnc_symbol, where(is.numeric)) %>%
+  as.data.frame()
+
+# 2. Set rownames and drop symbol column
+rownames(heatmap_mat) <- heatmap_mat$hgnc_symbol
+heatmap_mat$hgnc_symbol <- NULL
+
+# 3. Log2-transform for visualization
+heatmap_mat <- log2(heatmap_mat + 1)
+
+# 4. Drop genes with zero variance (flat rows)
+zero_var_genes <- apply(heatmap_mat, 1, function(x) var(x, na.rm = TRUE) == 0)
+heatmap_mat_filtered <- heatmap_mat[!zero_var_genes, ]
+
+# 5. Row-wise z-score scaling (mean=0, sd=1), clip to [-2,+2]
+heatmap_scaled <- t(scale(t(heatmap_mat_filtered)))
+heatmap_scaled <- pmin(pmax(heatmap_scaled, -2), 2)
+
+# 6. Draw heatmap
+pheatmap(
+  heatmap_scaled,
+  cluster_rows = FALSE,  # keep order as given
+  cluster_cols = TRUE,   # cluster samples
+  show_rownames = TRUE,
+  show_colnames = FALSE,
+  main = "Panel genes (unique HGNC only; duplicates removed)"
+)
+
+```
+## 3.2 — Heatmap of gene × cell type pairs
+
+Now we re-introduce duplicates: if a gene belongs to multiple cell types, it appears multiple times (once per assignment). This lets you see overlap across compartments. Again, we log2, z-score but this time rows are labeled GENE|CELLTYPE. The heatmap highlights shared markers and whether they behave differently depending on their assigned lineage.
+```{r}
+# 1. Expand panel into long form: one row per gene × cell_type
+panel_long <- df_updated %>%
+  pivot_longer(everything(), names_to = "cell_type", values_to = "gene") %>%
+  filter(!is.na(gene), gene != "")
+
+# 2. Collapse Ensembl → HGNC many-to-one with MAX
+expr_by_symbol <- expression_with_symbol %>%
+  select(hgnc_symbol, where(is.numeric)) %>%
+  filter(!is.na(hgnc_symbol)) %>%
+  group_by(hgnc_symbol) %>%
+  summarise(across(where(is.numeric), ~ max(., na.rm = TRUE)), .groups = "drop")
+
+# 3. Keep only panel genes with expression
+panel_long_expr <- panel_long %>%
+  inner_join(expr_by_symbol, by = c("gene" = "hgnc_symbol"))
+
+cat("Panel unique genes:", length(unique(panel_long$gene)), "\n")
+cat("Present:", length(unique(panel_long_expr$gene)), "\n")
+cat("Missing:", length(setdiff(unique(panel_long$gene),
+                               unique(panel_long_expr$gene))), "\n")
+
+# 4. Build heatmap matrix with "GENE|CELLTYPE" as row_id
+heatmap_mat2 <- panel_long_expr %>%
+  mutate(row_id = paste(gene, cell_type, sep = "|")) %>%
+  select(row_id, where(is.numeric)) %>%
+  column_to_rownames("row_id") %>%
+  as.matrix()
+
+# 5. Transform, scale, clip
+heatmap_mat2 <- log2(heatmap_mat2 + 1)
+zero_var2 <- apply(heatmap_mat2, 1, function(x) var(x, na.rm = TRUE) == 0)
+heatmap_scaled2 <- t(scale(t(heatmap_mat2[!zero_var2, , drop = FALSE])))
+heatmap_scaled2 <- pmin(pmax(heatmap_scaled2, -2), 2)
+
+# 6. Row annotations: cell type for each row
+row_annot <- panel_long_expr %>%
+  mutate(row_id = paste(gene, cell_type, sep = "|")) %>%
+  distinct(row_id, cell_type) %>%
+  column_to_rownames("row_id")
+
+# 7. Plot
+pheatmap(
+  heatmap_scaled2,
+  cluster_rows = FALSE,
+  cluster_cols = TRUE,
+  show_rownames = TRUE,
+  show_colnames = FALSE,
+  annotation_row = row_annot["cell_type", drop = FALSE],
+  main = "🔥 Panel genes (HGNC collapsed; gene×cell_type rows preserved)"
+)
+
+```
+
+## 3.3 — Heatmap with rows ordered by cell type
+Here we tidy the view by grouping rows by their cell type (e.g., all HSCMPP genes together, then GMP, etc.) and adding visual gaps between blocks. Genes inside each block are ordered alphabetically. This doesn’t change the data but makes the heatmap more interpretable.
+
+```{r}
+# 3.3 — Heatmap: rows ordered by cell type ----------------------------
+cell_order <- colnames(df_updated)  # use panel’s cell-type order
+
+# Ensure row annotation matches current heatmap rows
+row_annot2 <- row_annot[rownames(heatmap_scaled2), , drop = FALSE]
+row_annot2$cell_type <- factor(row_annot2$cell_type, levels = cell_order)
+
+# Order rows: first by cell type, then alphabetically by gene
+gene_from_row <- sub("\\|.*$", "", rownames(heatmap_scaled2))
+row_order <- order(row_annot2$cell_type, gene_from_row)
+
+hm_ordered <- heatmap_scaled2[row_order, , drop = FALSE]
+row_annot_ordered <- row_annot2[row_order, , drop = FALSE]
+
+# Add gaps between blocks
+group_sizes <- table(row_annot_ordered$cell_type)
+gaps_row <- cumsum(head(as.integer(group_sizes), -1))
+
+# Plot
+pheatmap(
+  hm_ordered,
+  cluster_rows = FALSE,
+  cluster_cols = TRUE,
+  show_rownames = FALSE,
+  show_colnames = FALSE,
+  annotation_row = row_annot_ordered["cell_type", drop = FALSE],
+  gaps_row = gaps_row,
+  main = "Panel genes (grouped by cell type)"
+)
+
+```
+
+## 3.4 — Cell-type module scores
+
+This step collapses all marker genes of a given cell type into a single average profile. For each sample, the average of standardized (z-scored) gene values is computed, yielding one “module score” per cell type per sample. Positive values mean markers for that lineage are higher than expected; negative values mean lower. The resulting heatmap (7 rows × 329 samples) shows which cell type signatures are enriched per sample.
+
+```{r}
+# 3.4 — Cell-type module scores (7 rows × N samples) ------------------
+ct_levels <- colnames(df_updated)
+ct_by_row <- row_annot[rownames(heatmap_scaled2), "cell_type", drop = TRUE]
+ct_by_row <- factor(ct_by_row, levels = ct_levels)
+
+# Compute mean z-score per cell type
+split_idx <- split(seq_len(nrow(heatmap_scaled2)), ct_by_row)
+avg_z_by_ct <- vapply(
+  split_idx,
+  function(idx) colMeans(heatmap_scaled2[idx, , drop = FALSE], na.rm = TRUE),
+  numeric(ncol(heatmap_scaled2))
+)
+avg_z_by_ct <- t(avg_z_by_ct)
+rownames(avg_z_by_ct) <- levels(ct_by_row)
+
+# Plot
+pheatmap(
+  avg_z_by_ct,
+  cluster_rows = FALSE,
+  cluster_cols = TRUE,
+  show_rownames = TRUE,
+  show_colnames = FALSE,
+  main = "Cell-type module scores (mean z per cell type)"
+)
+
+# Quick diagnostics: how many markers per cell type
+print(table(ct_by_row))
+
+
+
+```
+
+### 3.4.1
+Quick diagnostics: marker counts & top cell type per sample ----
+
+```{r}
+# How many markers were used per cell type group
+cat("Markers per cell type:\n")
+print(table(ct_by_row))
+
+# For each sample (column), which cell type has the highest avg z-score?
+top_ct <- apply(avg_z_by_ct, 2, function(v) names(which.max(v)))
+
+cat("\nTop cell type per sample (frequency):\n")
+print(sort(table(top_ct), decreasing = TRUE))
+
+# Add proportions (frequency / total samples)
+top_ct_freq <- sort(table(top_ct), decreasing = TRUE)
+top_ct_prop <- round(100 * top_ct_freq / ncol(avg_z_by_ct), 1)
+
+cat("\nTop cell type per sample (proportions %):\n")
+print(top_ct_prop)
+
+```
+
+
+
+
+# Things as for 
+
+```{r}
+Keep the cell types on the row
+Separate the columns wether they have been classified (brake the columns into 7 separate groups)
+Within each, sort them (order them) based on which ones are the most red 
+Within the reddest B people (and any other group), separate them based on snp genotype and plot their avg expression (3 boxplots)
+```
+
+Repeat the same analysis now for:
+
+```{r}
+Clarissas cell lines, ribo0
+---
+For polyA, check ARID5B expression
+```
+
+

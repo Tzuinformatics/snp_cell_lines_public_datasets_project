@@ -1,0 +1,120 @@
+```{r}
+library(tidyverse)
+library(GenomicRanges)
+library(rtracklayer)
+```
+
+```{r}
+snp_summary <- read.csv("../snp_summary_merged.csv")
+
+data_dict <- read.csv("../../GEO_data_dict_sj24_ATAC_RNA_GSM_SRR_mapping.csv")
+
+fastq_files <- data.frame(
+                                 check.names = FALSE,
+  `fqfiles` = c("24_atac_number_10_SRR13074051_1.fastq.gz", "24_atac_number_10_SRR13074051_2.fastq.gz",
+                                                 "24_atac_number_11_SRR13074052_1.fastq.gz",
+                                                 "24_atac_number_11_SRR13074052_2.fastq.gz",
+                                                 "24_atac_number_12_SRR13074053_1.fastq.gz",
+                                                 "24_atac_number_12_SRR13074053_2.fastq.gz",
+                                                 "24_atac_number_13_SRR13074054_1.fastq.gz",
+                                                 "24_atac_number_13_SRR13074054_2.fastq.gz",
+                                                 "24_atac_number_14_SRR13074055_1.fastq.gz",
+                                                 "24_atac_number_14_SRR13074055_2.fastq.gz",
+                                                 "24_atac_number_15_SRR13074056_1.fastq.gz",
+                                                 "24_atac_number_15_SRR13074056_2.fastq.gz",
+                                                 "24_atac_number_16_SRR13074057_1.fastq.gz",
+                                                 "24_atac_number_16_SRR13074057_2.fastq.gz",
+                                                 "24_atac_number_17_SRR13074058_1.fastq.gz",
+                                                 "24_atac_number_17_SRR13074058_2.fastq.gz",
+                                                 "24_atac_number_18_SRR13074059_1.fastq.gz",
+                                                 "24_atac_number_18_SRR13074059_2.fastq.gz",
+                                                 "24_atac_number_19_SRR13074060_1.fastq.gz",
+                                                 "24_atac_number_19_SRR13074060_2.fastq.gz",
+                                                 "24_atac_number_1_SRR13074042_1.fastq.gz",
+                                                 "24_atac_number_1_SRR13074042_2.fastq.gz",
+                                                 "24_atac_number_20_SRR13074061_1.fastq.gz",
+                                                 "24_atac_number_20_SRR13074061_2.fastq.gz",
+                                                 "24_atac_number_21_SRR13074062_1.fastq.gz",
+                                                 "24_atac_number_21_SRR13074062_2.fastq.gz",
+                                                 "24_atac_number_22_SRR13074063_1.fastq.gz",
+                                                 "24_atac_number_22_SRR13074063_2.fastq.gz",
+                                                 "24_atac_number_23_SRR13074064_1.fastq.gz",
+                                                 "24_atac_number_23_SRR13074064_2.fastq.gz",
+                                                 "24_atac_number_24_SRR13074065_1.fastq.gz",
+                                                 "24_atac_number_24_SRR13074065_2.fastq.gz",
+                                                 "24_atac_number_2_SRR13074043_1.fastq.gz",
+                                                 "24_atac_number_2_SRR13074043_2.fastq.gz",
+                                                 "24_atac_number_3_SRR13074044_1.fastq.gz",
+                                                 "24_atac_number_3_SRR13074044_2.fastq.gz",
+                                                 "24_atac_number_4_SRR13074045_1.fastq.gz",
+                                                 "24_atac_number_4_SRR13074045_2.fastq.gz",
+                                                 "24_atac_number_5_SRR13074046_1.fastq.gz",
+                                                 "24_atac_number_5_SRR13074046_2.fastq.gz",
+                                                 "24_atac_number_6_SRR13074047_1.fastq.gz",
+                                                 "24_atac_number_6_SRR13074047_2.fastq.gz",
+                                                 "24_atac_number_7_SRR13074048_1.fastq.gz",
+                                                 "24_atac_number_7_SRR13074048_2.fastq.gz",
+                                                 "24_atac_number_8_SRR13074049_1.fastq.gz",
+                                                 "24_atac_number_8_SRR13074049_2.fastq.gz",
+                                                 "24_atac_number_9_SRR13074050_1.fastq.gz",
+                                                 "24_atac_number_9_SRR13074050_2.fastq.gz")
+)
+
+
+library(dplyr)
+library(stringr)
+
+# Step 1: Extract SRR IDs from FASTQ filenames
+fastq_files <- fastq_files %>%
+  mutate(SRR_ID = str_extract(fqfiles, "SRR[0-9]+"))
+
+# Step 2: Left join with data_dict using SRR_ID
+fastq_annotated <- fastq_files %>%
+  left_join(data_dict, by = "SRR_ID")
+
+# Step 3: View the result
+head(fastq_annotated)
+
+
+library(dplyr)
+library(stringr)
+
+# Step 1: Extract SRR IDs from FASTQ filenames
+fastq_files <- fastq_files %>%
+  mutate(SRR_ID = str_extract(fqfiles, "SRR[0-9]+"))
+
+# Step 2: Left join with data_dict using SRR_ID
+fastq_annotated <- fastq_files %>%
+  left_join(data_dict, by = "SRR_ID")
+
+# Step 3: View the result
+head(fastq_annotated)
+
+
+library(dplyr)
+library(stringr)
+
+# Step 1: Extract atac_number from snp_summary$Sample
+snp_summary <- snp_summary %>%
+  mutate(atac_number = str_extract(Sample, "24_atac_number_[0-9]+"))
+
+# Step 2: Extract atac_number from fastq_annotated$fqfiles
+fastq_annotated <- fastq_annotated %>%
+  mutate(atac_number = str_extract(fqfiles, "24_atac_number_[0-9]+"))
+
+# Step 3: Get unique mapping of atac_number to Sample_Title
+atac_to_title <- fastq_annotated %>%
+  select(atac_number, Sample_Title) %>%
+  distinct()
+
+# Step 4: Join with snp_summary to update Sample names
+snp_summary_updated <- snp_summary %>%
+  left_join(atac_to_title, by = "atac_number") %>%
+  mutate(Sample = Sample_Title) %>%
+  select(-atac_number, -Sample_Title)
+
+# Step 5: View updated snp_summary
+head(snp_summary_updated)
+
+```
+

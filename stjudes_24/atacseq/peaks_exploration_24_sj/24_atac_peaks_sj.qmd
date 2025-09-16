@@ -1,0 +1,147 @@
+```{r}
+
+library(tidyverse)
+library(GenomicRanges)
+library(rtracklayer)
+
+# Base directory with 24 sample subfolders
+base_dir <- "peaks_to_analyze_in_R"
+sample_dirs <- list.dirs(base_dir, recursive = FALSE)
+
+# List all broadPeak files
+peak_files <- map_chr(sample_dirs, ~ list.files(.x, pattern = "\\.broadPeak$", full.names = TRUE))
+
+# Function to read broadPeak files safely and convert to GRanges
+read_broadpeak_as_granges <- function(file) {
+  tryCatch({
+    df <- read_tsv(file, col_names = FALSE, col_types = cols(
+      X1 = col_character(),  # chrom
+      X2 = col_integer(),    # start
+      X3 = col_integer(),    # end
+      X4 = col_character(),  # name
+      X5 = col_integer(),    # score
+      X6 = col_character(),  # strand
+      X7 = col_double(),     # signalValue
+      X8 = col_double(),     # pValue
+      X9 = col_double()      # qValue
+    ))
+
+    # Replace "." with "*" for strandless peaks
+    df$X6 <- ifelse(df$X6 == ".", "*", df$X6)
+
+    gr <- GRanges(
+      seqnames = df$X1,
+      ranges = IRanges(start = df$X2, end = df$X3),
+      strand = df$X6,
+      name = df$X4,
+      score = df$X5,
+      signalValue = df$X7,
+      pValue = df$X8,
+      qValue = df$X9
+    )
+    gr$sample <- basename(file)
+    message("✅ Successfully parsed: ", basename(file))
+    return(gr)
+  }, error = function(e) {
+    message("❌ Error in file: ", basename(file))
+    message("   → ", e$message)
+    return(NULL)
+  })
+}
+
+# Load all peak files into a list of GRanges
+peak_data <- map(peak_files, read_broadpeak_as_granges)
+
+
+# Add real p-value and q-value columns to each GRanges
+peak_data <- map(peak_data, function(gr) {
+  gr$realP <- 10^(-gr$pValue)
+  gr$realQ <- 10^(-gr$qValue)
+  gr
+})
+
+# Check the first one
+peak_data[[1]]
+
+```
+
+```{r}
+library(GenomeInfoDb)
+
+# Convert all GRanges objects to UCSC seqnames
+peak_data_ucsc <- lapply(peak_data, function(gr) {
+    seqlevelsStyle(gr) <- "UCSC"
+    gr
+})
+
+# Check conversion
+seqlevels(peak_data[[1]])[1:10]
+seqlevels(peak_data_ucsc[[1]])[1:10]
+
+```
+
+```{r}
+library(Gviz)
+library(GenomicRanges)
+library(GenomeInfoDb)
+
+# --- 1. UCSC seqnames style ---
+peak_data_ucsc <- lapply(peak_data, function(gr) {
+    seqlevelsStyle(gr) <- "UCSC"
+    gr
+})
+
+# --- 2. Keep only canonical chromosomes ---
+canonical <- paste0("chr", c(1:22, "X", "Y"))
+peak_data_ucsc <- lapply(peak_data_ucsc, function(gr) {
+    present <- intersect(seqlevels(gr), canonical)
+    keepSeqlevels(gr, present, pruning.mode = "coarse")
+})
+
+# --- 3. Find common region across all samples ---
+common_region <- Reduce(intersect, peak_data_ucsc)
+
+if (length(common_region) == 0) {
+    stop("No region overlaps all 24 samples. Consider relaxing the criterion.")
+}
+
+# Pick first common peak
+region <- common_region[1]
+chr <- as.character(seqnames(region))
+from <- start(region) - 5000
+to   <- end(region) + 5000
+
+message("📍 Chosen region: ", chr, ":", from, "-", to)
+
+# --- 4. Build DataTracks with explicit numeric column ---
+tracks <- lapply(peak_data_ucsc, function(gr) {
+    gr_sub <- gr[seqnames(gr) == chr & start(gr) < to & end(gr) > from]
+    DataTrack(
+        range = gr_sub,
+        genome = "hg38",
+        chromosome = chr,
+        type = "histogram",
+        name = unique(gr$sample),
+        # Explicitly plot signalValue (or use "score" if you prefer)
+        data = gr_sub$signalValue,
+        col.histogram = "darkblue",
+        fill.histogram = "skyblue"
+    )
+})
+
+# --- 5. Plot ---
+axisTrack <- GenomeAxisTrack()
+plotTracks(
+    c(list(axisTrack), tracks),
+    chromosome = chr,
+    from = from,
+    to = to,
+    main = "ATAC-seq peaks across 24 samples"
+)
+
+```
+
+```{r}
+
+```
+

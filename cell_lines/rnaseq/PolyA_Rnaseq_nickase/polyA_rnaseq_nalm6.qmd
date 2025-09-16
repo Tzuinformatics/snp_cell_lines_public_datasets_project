@@ -1,0 +1,614 @@
+```{r}
+# Load required libraries
+suppressMessages(library(tidyverse))
+
+# Define base directory containing sample folders
+base_dir <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Clarissa/snp_cell_lines_public_datasets_project/cell_lines/rnaseq/PolyA_Rnaseq_nickase/polyA_sf_files"
+
+# Get full paths to sample directories (each folder = one clone)
+sample_dirs <- list.dirs(base_dir, recursive = FALSE, full.names = TRUE)
+
+# Extract sample folder names (e.g., NALM6_TT_Clone1)
+sample_names <- basename(sample_dirs)
+
+# Construct metadata dataframe
+sample_metadata <- tibble(
+    sample = sample_names,
+    path   = file.path(sample_dirs, "quant.sf")
+) %>%
+    mutate(
+        cell_line = "NALM6",   # all samples are NALM6
+        genotype  = case_when(
+            str_detect(sample, "TT") ~ "TT",
+            str_detect(sample, "TC") ~ "TC",
+            str_detect(sample, "CC") ~ "CC",
+            TRUE ~ NA_character_
+        ),
+        clone     = str_extract(sample, "Clone[0-9]+") %>%
+            str_remove("Clone") %>%
+            as.integer(),
+        replicate = 1,
+        sample_id_full = paste(cell_line, genotype, ifelse(is.na(clone), "NA", clone), sep = "_")
+    )
+
+# Set rownames to match combined sample ID
+rownames(sample_metadata) <- sample_metadata$sample_id_full
+
+```
+
+
+```{r}
+suppressMessages(library(rtracklayer))
+
+# Import GTF
+gtf <- import("/Users/cojulian/Desktop/Tzu_projects/Matt/reference_genomces/Homo_sapiens.GRCh38.113.gtf.gz")
+gtf_df <- as.data.frame(gtf)
+
+# Build transcript-to-gene mapping
+tx2gene_df <- gtf_df %>%
+  select(transcript_id, gene_id, gene_name) %>%
+  distinct(transcript_id, gene_id, gene_name) %>%
+  drop_na()
+
+```
+
+## 🔹 Chunk 2. Align metadata for downstream analysis
+
+```{r}
+# Prepare colData for SummarizedExperiment / DESeq2
+human_coldata <- sample_metadata %>%
+  mutate(files = path) %>%
+  dplyr::select(sample_id_full, files, everything()) %>%
+  dplyr::rename(Sample = sample_id_full)
+
+rownames(human_coldata) <- human_coldata$Sample
+
+```
+
+
+```{r}
+# Initialize from first file
+tmp <- read.delim(human_coldata$files[1]) %>%
+  inner_join(tx2gene_df, by = c("Name" = "transcript_id")) %>%
+  group_by(gene_id) %>%
+  summarise(NumReads = as.integer(sum(NumReads)))
+
+# Matrix dimensions
+num.row <- nrow(tmp)
+num.col <- nrow(human_coldata)
+
+# Empty count matrix
+sf.df <- data.frame(matrix(0, nrow = num.row, ncol = num.col))
+colnames(sf.df) <- human_coldata$Sample
+rownames(sf.df) <- tmp$gene_id
+
+# Fill matrix
+for (i in seq_along(human_coldata$files)) {
+  cat("Reading:", human_coldata$files[i], "\n")
+  
+  sf.df[, i] <- read.delim(human_coldata$files[i]) %>%
+    inner_join(tx2gene_df, by = c("Name" = "transcript_id")) %>%
+    group_by(gene_id) %>%
+    summarise(NumReads = as.integer(sum(NumReads))) %>%
+    pull(NumReads)
+}
+
+```
+
+```{r}
+# Convert to matrix for downstream use (DESeq2, edgeR, etc.)
+Salmon.matrix <- as.matrix(sf.df)
+
+# Confirm sample IDs match
+all(colnames(Salmon.matrix) %in% rownames(human_coldata))  # Should return TRUE
+```
+# CPM Filtering
+
+CPM (counts per million) rescales raw counts by each library’s total reads, i.e., CPM = (raw_count / library_size) × 10^6, which directly adjusts for sequencing depth. edgeR’s filterByExpr() uses CPM thresholds that are adaptive to library sizes and your design (via group=), keeping genes that are sufficiently expressed in enough samples within groups to be testable in differential analysis. This approach is superior to a fixed raw-count cutoff because it avoids depth bias, reduces multiple-testing burden by removing uninformative, near-zero genes, and respects replication structure (e.g., TT/TC/CC triplicates). In short, CPM-aware filtering is principled, depth-aware, and aligned with best practice for RNA-seq DE pipelines.
+
+
+```{r}
+# ==============================================
+# 🔹 CPM-aware filtering with edgeR::filterByExpr
+# ==============================================
+
+suppressMessages(library(edgeR))
+
+# Build DGEList from Salmon.matrix
+y <- DGEList(counts = Salmon.matrix)
+
+# Define grouping (by genotype)
+grp <- factor(
+  human_coldata$genotype[match(colnames(Salmon.matrix), human_coldata$Sample)],
+  levels = c("TT","TC","CC")
+)
+
+# Apply filterByExpr (CPM-aware, respects design and library size)
+keep <- filterByExpr(y, group = grp)
+
+cat("\n[filterByExpr summary]\n")
+cat("Genes before filtering :", nrow(Salmon.matrix), "\n")
+cat("Genes kept (CPM-aware) :", sum(keep), "\n")
+cat("Percent retained        :", round(100 * sum(keep) / nrow(Salmon.matrix), 2), "%\n")
+
+# Filter raw counts accordingly
+sf.df.data <- Salmon.matrix[keep, ]
+
+# ✅ Inspect result
+cat("\nFinal CPM-filtered matrix dimensions:\n")
+print(dim(sf.df.data))
+
+cat("\nPreview filtered matrix:\n")
+print(head(sf.df.data[, 1:5]))
+
+```
+
+
+```{r}
+# ==============================================
+# Per-sample distributions (pre vs CPM-filtered)
+# ==============================================
+suppressMessages(library(tidyverse))
+
+# Long-form pre-filter (raw)
+pre_long <- as.data.frame(Salmon.matrix) %>%
+  tibble::rownames_to_column("gene_id") %>%
+  pivot_longer(-gene_id, names_to = "Sample", values_to = "counts") %>%
+  mutate(stage = "Unfiltered")
+
+# Long-form post-filter (same raw counts, CPM-filtered gene set)
+post_long <- as.data.frame(sf.df.data) %>%
+  tibble::rownames_to_column("gene_id") %>%
+  pivot_longer(-gene_id, names_to = "Sample", values_to = "counts") %>%
+  mutate(stage = "CPM-filtered")
+
+per_sample <- bind_rows(pre_long, post_long) %>%
+  mutate(log_counts = log2(counts + 1)) %>%
+  left_join(human_coldata %>% dplyr::select(Sample, genotype), by = "Sample")
+
+ggplot(per_sample, aes(x = Sample, y = log_counts, fill = stage)) +
+  geom_violin(scale = "width", trim = TRUE, alpha = 0.8) +
+  facet_grid(. ~ genotype, scales = "free_x", space = "free_x") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  labs(
+    title = "Per-sample distributions (pre vs CPM-aware post-filter)",
+    x = "Sample", y = "log2(counts + 1)", fill = "Stage"
+  )
+
+# ==============================================
+# Post-filter logCPM (edgeR) per sample
+# ==============================================
+suppressMessages(library(edgeR))
+suppressMessages(library(tidyverse))
+
+# Compute logCPM on the CPM-filtered raw-count matrix
+logcpm <- cpm(DGEList(counts = sf.df.data), log = TRUE, prior.count = 1)
+
+logcpm_long <- as.data.frame(logcpm) %>%
+  tibble::rownames_to_column("gene_id") %>%
+  pivot_longer(-gene_id, names_to = "Sample", values_to = "logCPM") %>%
+  left_join(human_coldata %>% dplyr::select(Sample, genotype), by = "Sample")
+
+ggplot(logcpm_long, aes(x = Sample, y = logCPM)) +
+  geom_boxplot(outlier.size = 0.3) +
+  facet_grid(. ~ genotype, scales = "free_x", space = "free_x") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  labs(
+    title = "Post-filter logCPM distributions per sample",
+    x = "Sample", y = "logCPM"
+  )
+
+
+```
+
+
+# Getting FPKM
+```{r}
+# ==============================================
+# 🔹 Compute FPKM and plot ARID5B expression
+# ==============================================
+
+suppressMessages(library(DESeq2))
+suppressMessages(library(rtracklayer))
+suppressMessages(library(GenomicRanges))
+suppressMessages(library(ggplot2))
+suppressMessages(library(dplyr))
+suppressMessages(library(tidyr))
+
+# 1. Build DESeq2 object from filtered counts
+dds <- DESeqDataSetFromMatrix(
+  countData = round(sf.df.data),     # counts must be integers
+  colData   = human_coldata,
+  design    = ~ genotype
+)
+dds <- DESeq(dds)
+
+# 2. Load GTF and compute exon union lengths
+exons <- gtf[gtf$type == "exon"]
+
+# Length per gene_id
+exons_by_gene <- split(exons, exons$gene_id)
+exonic_union  <- GenomicRanges::reduce(exons_by_gene)
+gene_len_bp   <- vapply(exonic_union, function(gr) sum(width(gr)), integer(1))
+
+# Attach basepairs to dds
+rowData(dds)$basepairs <- gene_len_bp[rownames(dds)]
+
+# 3. Compute FPKM
+fpkm_mat <- fpkm(dds, robust = TRUE)
+fpkm_df <- as.data.frame(fpkm_mat) %>%
+  tibble::rownames_to_column("gene_id") %>%
+  mutate(across(-gene_id, ~ round(.x, 3)))
+
+# Preview
+head(fpkm_df, 10)
+
+# 4. Extract ARID5B (ENSG00000150347) expression
+arid5b_expr <- fpkm_df %>%
+  filter(gene_id == "ENSG00000150347") %>%
+  pivot_longer(-gene_id, names_to = "Sample", values_to = "FPKM") %>%
+  left_join(human_coldata, by = "Sample")   # no rownames_to_column needed
+
+# 5. Plot expression across genotypes
+ggplot(arid5b_expr, aes(x = genotype, y = FPKM, color = genotype)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.3) +
+  geom_jitter(width = 0.15, size = 3) +
+  labs(title = "ARID5B Expression (FPKM)",
+       x = "Genotype", y = "FPKM (log scale)") +
+  scale_y_log10() +
+  theme_minimal()
+
+```
+
+# 🔹 PCA for NALM6
+
+```{r}
+# ==============================================
+# PCA for NALM6 samples
+# ==============================================
+suppressMessages(library(tidyverse))
+suppressMessages(library(tidybulk))
+suppressMessages(library(ggrepel))
+
+# 1. Filter metadata for NALM6 samples
+nalm6_coldata <- human_coldata %>%
+  filter(cell_line == "NALM6")
+
+# 2. Filter expression matrix to match NALM6 samples
+nalm6_expr <- sf.df.data[, nalm6_coldata$Sample, drop = FALSE] %>%
+  tibble::rownames_to_column("gene_id")
+
+# 3. Reshape to tidy format
+nalm6_expr_tidy <- nalm6_expr %>%
+  pivot_longer(
+    cols = -gene_id,
+    names_to = "Sample",
+    values_to = "abundance"
+  ) %>%
+  rename(gene = gene_id)
+
+# 4. Merge with metadata
+nalm6_tidy <- nalm6_expr_tidy %>%
+  left_join(nalm6_coldata, by = "Sample")
+
+# 5. Tidybulk PCA
+pca_nalm6 <- nalm6_tidy %>%
+  tidybulk(
+    .sample = Sample,
+    .transcript = gene,
+    .abundance = abundance
+  ) %>%
+  keep_abundant() %>%
+  scale_abundance() %>%
+  reduce_dimensions(method = "PCA", .dims = 8)
+
+# 6. PCA plot: color by genotype, shape by clone
+pca_nalm6 %>%
+  pivot_sample() %>%
+  ggplot(aes(
+    x = PC1, y = PC2,
+    color = genotype,
+    shape = as.factor(clone),
+    label = Sample
+  )) +
+  geom_point(size = 3) +
+  ggrepel::geom_text_repel(max.overlaps = 5, size = 3, show.legend = FALSE) +
+  theme_minimal() +
+  labs(
+    title = "PCA of NALM6 Gene Expression",
+    subtitle = "Colored by Genotype, Shaped by Clone",
+    x = "Principal Component 1",
+    y = "Principal Component 2"
+  )
+
+```
+
+# ✅ Updated QC Suite (SummarizedExperiment + plots)
+
+```{r}
+# ==============================================
+# Build SummarizedExperiment with filtered counts
+# ==============================================
+suppressMessages(library(SummarizedExperiment))
+
+# Ensure colData matches sample order
+sf.df.se <- SummarizedExperiment(
+  assays = list(counts = as.matrix(sf.df.data)),
+  colData = human_coldata[colnames(sf.df.data), ]
+)
+
+# Add detailed sample names
+sf.df.se$detailed_name <- paste(
+  sf.df.se$cell_line,
+  sf.df.se$genotype,
+  sf.df.se$clone,
+  sep = "_"
+)
+
+# ==============================================
+# Library size plot
+# ==============================================
+library_sizes <- colSums(assay(sf.df.se))
+
+ggplot(
+  data.frame(Sample = sf.df.se$detailed_name, LibrarySize = library_sizes),
+  aes(x = Sample, y = LibrarySize)
+) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  scale_y_continuous(labels = scales::comma) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, size = 10),
+    axis.title.x = element_text(size = 13),
+    axis.title.y = element_text(size = 13),
+    plot.title = element_text(size = 15, face = "bold")
+  ) +
+  labs(
+    title = "Library Size Distribution",
+    x = "Sample (cell_line_genotype_clone)",
+    y = "Library Size (Raw Counts)"
+  )
+
+# ==============================================
+# Log2 expression distributions per sample
+# ==============================================
+suppressMessages(library(reshape2))
+
+# Log-transform
+log_counts <- log2(assay(sf.df.se) + 1)
+
+# Melt to long format
+log_counts_long <- reshape2::melt(log_counts)
+colnames(log_counts_long) <- c("Gene", "Sample", "LogExpression")
+
+# Annotate by detailed name
+log_counts_long <- log_counts_long %>%
+  mutate(Group = sf.df.se$detailed_name[match(Sample, colnames(log_counts))])
+
+# Density plot by sample
+ggplot(log_counts_long, aes(x = LogExpression, color = Group)) +
+  geom_density(size = 1, alpha = 0.7) +
+  theme_minimal() +
+  labs(
+    title = "Log2 Gene Expression Distribution by Sample",
+    x = "Log2(Counts + 1)",
+    y = "Density"
+  ) +
+  theme(
+    axis.title = element_text(size = 13),
+    plot.title = element_text(size = 15, face = "bold"),
+    legend.title = element_blank(),
+    legend.text = element_text(size = 9)
+  )
+
+
+```
+# # Doing DE, only one comparison
+
+```{r}
+# ==============================================
+# DESeq2 Analysis: NALM6 TT vs CC
+# ==============================================
+suppressMessages(library(DESeq2))
+suppressMessages(library(dplyr))
+suppressMessages(library(tibble))
+
+# 1. Filter metadata to only NALM6 TT and CC clones
+meta_data <- sample_metadata %>%
+  dplyr::filter(cell_line == "NALM6", genotype %in% c("TT", "CC")) %>%
+  dplyr::mutate(genotype = factor(genotype, levels = c("CC", "TT")))  # CC = reference
+
+# 2. Subset count matrix
+filtered_bulk_matrix <- sf.df.data[, meta_data$sample_id_full]
+
+# 3. Build DESeq2 object
+dds <- DESeqDataSetFromMatrix(
+  countData = as.matrix(filtered_bulk_matrix),
+  colData   = meta_data,
+  design    = ~ genotype
+)
+
+# 4. Run DESeq2
+dds <- DESeq(dds)
+
+# 5. Extract results: TT vs CC
+res <- results(dds, contrast = c("genotype", "TT", "CC"), alpha = 0.05)
+
+# 6. Tidy results
+de_results_tt_vs_cc <- as.data.frame(res) %>%
+  tibble::rownames_to_column("gene_id") %>%
+  left_join(
+    tx2gene_df %>%
+      select(gene_id, gene_name) %>%
+      distinct(gene_id, .keep_all = TRUE),
+    by = "gene_id"
+  ) %>%
+  mutate(FoldChange = 2^log2FoldChange) %>%
+  mutate(significance = case_when(
+    FoldChange >= 1.5 & padj <= 0.05 ~ "up",
+    FoldChange <= (1 / 1.5) & padj <= 0.05 ~ "down",
+    TRUE ~ "ns"
+  ))
+
+# 7. Summarize DE results
+cat("\n[DESeq2 TT vs CC summary]\n")
+summary(res)
+
+```
+
+```{r}
+# ==============================================
+# Volcano plot: TT vs CC
+# ==============================================
+suppressMessages(library(ggplot2))
+suppressMessages(library(ggrepel))
+
+volcano_data <- de_results_tt_vs_cc %>%
+  mutate(GeneSymbol = ifelse(is.na(gene_name), gene_id, gene_name)) %>%
+  distinct(gene_id, .keep_all = TRUE) %>%
+  select(GeneSymbol, log2FoldChange, padj, FoldChange, significance) %>%
+  mutate(GeneType = significance)
+
+# Plot styling
+cols   <- c("up" = "#ffad73", "down" = "#26b3ff", "ns" = "grey80")
+sizes  <- c("up" = 2.5, "down" = 2.5, "ns" = 1.2)
+alphas <- c("up" = 1, "down" = 1, "ns" = 0.6)
+
+ggplot(volcano_data, aes(
+  x = log2(FoldChange),
+  y = -log10(padj),
+  fill = GeneType,
+  size = GeneType,
+  alpha = GeneType
+)) +
+  geom_point(shape = 21, colour = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  geom_vline(xintercept = c(log2(1 / 1.5), log2(1.5)), linetype = "dashed") +
+  scale_fill_manual(values = cols) +
+  scale_size_manual(values = sizes) +
+  scale_alpha_manual(values = alphas) +
+  ggrepel::geom_text_repel(
+    data = filter(volcano_data, GeneType != "ns"),
+    aes(label = GeneSymbol),
+    size = 4,
+    color = "darkblue",
+    max.overlaps = 10,
+    min.segment.length = Inf
+  ) +
+  labs(
+    title = "Volcano Plot: NALM6 TT vs CC (padj ≤ 0.05, FC ≥ 1.5)",
+    x = "log2(Fold Change)",
+    y = "-log10(Adjusted P-value)"
+  ) +
+  theme_minimal(base_family = "Arial") +
+  theme(
+    panel.background = element_rect(fill = "white"),
+    plot.background = element_rect(fill = "white"),
+    legend.position = "bottom",
+    plot.title = element_text(size = 18, face = "bold"),
+    axis.title = element_text(size = 15),
+    axis.text = element_text(size = 12)
+  )
+
+```
+
+## Venn diagram of polyA and ribo0
+```{r}
+# ==============================================
+# Venn diagrams: PolyA vs Ribo-0 DEG comparison
+# ==============================================
+suppressMessages(library(tidyverse))
+suppressMessages(library(ggvenn))
+suppressMessages(library(cowplot))
+
+# 1. Load external DEG results (Ribo-0)
+external_res <- read_csv(
+  "~/Desktop/Tzu_projects/Matt/Clarissa/snp_cell_lines_public_datasets_project/cell_lines/rnaseq/Gene_expresion_analysis/deg_results_NALM6/DEG_gen_exp_NALM6_TT_vs_CC.csv"
+)
+
+# 2. Define UP/DOWN sets from current DESeq2 results (PolyA)
+polyA_up <- de_results_tt_vs_cc %>%
+  filter(significance == "up") %>%
+  pull(gene_id)
+
+polyA_down <- de_results_tt_vs_cc %>%
+  filter(significance == "down") %>%
+  pull(gene_id)
+
+# 3. Define UP/DOWN sets from external results (Ribo-0)
+ribo0_up <- external_res %>%
+  filter(significance == "up") %>%
+  pull(gene_id)
+
+ribo0_down <- external_res %>%
+  filter(significance == "down") %>%
+  pull(gene_id)
+
+# 4. Build lists for ggvenn
+venn_up_list <- list(PolyA = polyA_up, Ribo0 = ribo0_up)
+venn_down_list <- list(PolyA = polyA_down, Ribo0 = ribo0_down)
+
+# 5. Create UP Venn plot
+venn_up_plot <- ggvenn(
+  venn_up_list,
+  fill_color = c("#ffad73", "#26b3ff"),
+  stroke_size = 1.5,
+  set_name_size = 8,
+  text_size = 8
+) +
+  ggtitle("Upregulated Genes: PolyA vs Ribo-0") +
+  theme(
+    plot.title = element_text(size = 20, face = "bold", hjust = 0.5)
+  )
+
+# 6. Create DOWN Venn plot
+venn_down_plot <- ggvenn(
+  venn_down_list,
+  fill_color = c("#ffad73", "#26b3ff"),
+  stroke_size = 1.5,
+  set_name_size = 8,
+  text_size = 8
+) +
+  ggtitle("Downregulated Genes: PolyA vs Ribo-0") +
+  theme(
+    plot.title = element_text(size = 20, face = "bold", hjust = 0.5)
+  )
+
+# 7. Combine plots vertically (no parentheses in labels)
+combined_plot <- plot_grid(
+  venn_up_plot, venn_down_plot,
+  label_size = 24,
+  label_fontface = "bold",
+  ncol = 1,
+  align = "v"
+)
+
+# 8. Display combined plot
+print(combined_plot)
+
+# Find overlapping genes
+overlap_up <- intersect(polyA_up, ribo0_up)
+overlap_down <- intersect(polyA_down, ribo0_down)
+
+# Create data frame with direction
+overlap_df <- tibble(
+    gene_id = c(overlap_up, overlap_down),
+    direction = c(rep("up", length(overlap_up)), rep("down", length(overlap_down)))
+)
+
+# Join with GTF to get gene symbols
+overlap_annotated <- overlap_df %>%
+    left_join(
+        gtf_df %>% select(gene_id, gene_name) %>% distinct(),
+        by = "gene_id"
+    ) %>%
+    select(gene_id, gene_name, direction)
+# Save to CSV
+write_csv(overlap_annotated, "overlapping_genes_both_RNA_technologies.csv")
+
+
+```
+
+
