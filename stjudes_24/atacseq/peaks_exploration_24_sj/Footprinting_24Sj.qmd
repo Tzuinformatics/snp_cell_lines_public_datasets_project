@@ -1,0 +1,80 @@
+```{r}
+# === Load libraries ===
+suppressPackageStartupMessages({
+    library(dplyr)
+    library(ggplot2)
+    library(ggrepel)
+    library(readr)
+    library(tidyverse)
+    library(tidyr)
+})
+
+# === Load bindetect results ===
+bindetect_df <- read.delim("../Footprinting_24_Sj/bindetect_results.txt")
+
+# === Prepare volcano data ===
+volcano.data <- bindetect_df %>%
+    select(name, motif_id, cluster, TT_CC_change, TT_CC_pvalue) %>%
+    drop_na() %>%
+    mutate(
+        sig = case_when(
+            TT_CC_pvalue < 0.05 & TT_CC_change >  0.1 ~ "up",
+            TT_CC_pvalue < 0.05 & TT_CC_change < -0.1 ~ "down",
+            TRUE ~ "ns"
+        ),
+        sig = factor(sig, levels = c("up","down","ns"))
+    )
+
+# === Plot ===
+ggplot(volcano.data, aes(x = TT_CC_change, y = -log10(TT_CC_pvalue),
+                         fill = sig, size = sig, alpha = sig)) +
+    geom_point(shape = 21, colour = "black") +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "darkgrey") +
+    geom_vline(xintercept = c(-0.1, 0.1), linetype = "dashed", colour = "darkgrey") +
+    scale_fill_manual(values = c("up" = "#D55E00", "down" = "#0072B2", "ns" = "grey80"),
+                      labels = c("up" = "Higher in TT clones",
+                                 "down" = "Higher in CC clones",
+                                 "ns" = "Not significant")) +
+    scale_size_manual(values = c(up = 2.5, down = 2.5, ns = 1.0)) +
+    scale_alpha_manual(values = c(up = 0.9, down = 0.9, ns = 0.5)) +
+    guides(fill = guide_legend(title = "Differential motif binding"),
+           size = "none", alpha = "none", color = "none") +
+    ylim(0, quantile(-log10(volcano.data$TT_CC_pvalue), 0.99) + 5) +
+    theme_minimal(base_size = 18) +
+    theme(
+        plot.title   = element_text(size = 22, face = "bold"),
+        axis.title   = element_text(size = 20, face = "bold"),
+        axis.text    = element_text(size = 16),
+        legend.title = element_text(size = 18, face = "bold"),
+        legend.text  = element_text(size = 16)
+    ) +
+    labs(title = "Volcano plot: TT vs CC (highlighted: absΔ ≥ 0.1 & p < 0.05)",
+         x = "Binding score change (TT - CC)",
+         y = "-log10(p-value)")
+
+# === Save ===
+ggsave("../Footprinting_24_Sj/TOBIAS_24Sj_volcano_plot_TT_vs_CC.pdf",
+       width = 10, height = 8, dpi = 600, device = cairo_pdf)
+
+```
+
+
+### Saving csv
+
+```{r}
+save_volcano.data <- bindetect_df %>%
+    drop_na() %>%
+    mutate(
+        sig = case_when(
+            TT_CC_pvalue < 0.05 & TT_CC_change >  0.1 ~ "up",
+            TT_CC_pvalue < 0.05 & TT_CC_change < -0.1 ~ "down",
+            TRUE ~ "ns"
+        ),
+        sig = factor(sig, levels = c("up","down","ns"))
+    )
+
+write.csv(save_volcano.data, "../Footprinting_24_Sj/Footprinting_TT_CC_24Sj.csv", row.names = F)
+
+```
+
+

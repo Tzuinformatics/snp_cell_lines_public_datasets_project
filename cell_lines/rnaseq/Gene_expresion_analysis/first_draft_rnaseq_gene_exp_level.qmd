@@ -25,6 +25,14 @@ library(ggplot2)
 library(ggrepel)
 library(SummarizedExperiment)
 library(dplyr)
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(limma)
+  library(ggplot2)
+  library(ggrepel)
+})
 ```
 
 ```{r}
@@ -79,6 +87,12 @@ library(tidyverse)
 # Load GTF annotation
 gtf <- import("/Users/cojulian/Desktop/Tzu_projects/Matt/reference_genomces/Homo_sapiens.GRCh38.113.gtf.gz")
 gtf_df <- as.data.frame(gtf)
+
+# Define standard chromosomes
+standard_chroms <- c(as.character(1:22), "X", "Y", "MT")
+
+# Filter the GTF dataframe
+gtf_df <- gtf_df[gtf_df$seqnames %in% standard_chroms, ]
 
 # Create transcript-to-gene mapping
 tx2gene_df <- gtf_df %>%
@@ -651,20 +665,20 @@ dds <- DESeq(dds)
 res <- results(dds, contrast = c("genotype", "TT", "CC"), alpha = 0.05) 
 
 # 9. Convert results to dataframe
-de_results_tt_vs_cc <-  as.data.frame(res) %>%
-    tibble::rownames_to_column("gene_id") %>%
-    left_join(
-        tx2gene_df %>%
-            select(gene_id, gene_name) %>%
-            distinct(gene_id, .keep_all = TRUE),
-        by = "gene_id"
-    ) %>%
-    mutate(FoldChange = 2^log2FoldChange) %>%
-    mutate(significance = case_when(
-        FoldChange >= 1.5 & padj <= 0.05 ~ "up",
-        FoldChange <= (1 / 1.5) & padj <= 0.05 ~ "down",
-        TRUE ~ "ns"
-    ))
+de_results_tt_vs_cc <- as.data.frame(res) %>%
+  tibble::rownames_to_column("gene_id") %>%
+  left_join(
+    tx2gene_df %>%
+      select(gene_id, gene_name) %>%
+      distinct(gene_id, .keep_all = TRUE),
+    by = "gene_id"
+  ) %>%
+  mutate(significance = case_when(
+    pvalue <= 0.05 & log2FoldChange >=  0.2 ~ "up",
+    pvalue <= 0.05 & log2FoldChange <= -0.2 ~ "down",
+    TRUE ~ "ns"
+  ))
+
 
 
 
@@ -750,120 +764,435 @@ print(volcano_plot)
 
 # All around NALM6
 
-## Loop to run DEG NALM6 ONLY
+## DESEq Loop to run DEG NALM6 ONLY rib0
 
 ```{r}
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(dplyr)
+  library(tibble)
+  library(ggplot2)
+  library(ggrepel)
+})
+
 # 📂 1. Create output folder
 out_dir <- "deg_results_NALM6"
 if (!dir.exists(out_dir)) dir.create(out_dir)
 
-# 🧬 2. Function to run DESeq2 for a given comparison with FPKM
-run_deg <- function(count_matrix, metadata, ref_genotype, test_genotype, out_prefix) {
+# 🧬 2. Function to run DESeq2 and volcano plot
+run_deg_deseq <- function(count_matrix, metadata, ref_genotype, test_genotype, out_prefix) {
   
   # 📂 Filter metadata for NALM6 and selected genotypes
   meta_data <- metadata %>%
     filter(cell_line == "NALM6", genotype %in% c(ref_genotype, test_genotype)) %>%
     mutate(genotype = factor(genotype, levels = c(ref_genotype, test_genotype)))  # reference first
+  rownames(meta_data) <- meta_data$sample_id_full
   
   # 📊 Subset count matrix
-  filtered_counts <- count_matrix[, meta_data$sample_id_full]
-  
-  # 🧬 Get gene lengths from GTF (sum of exon widths per gene)
-  gene_lengths <- gtf_df %>%
-    filter(type == "exon") %>%
-    group_by(gene_id) %>%
-    summarise(gene_length_kb = sum(width) / 1000, .groups = "drop")  # kilobases
-  
-  # 📊 Get library sizes (total counts per sample in millions)
-  lib_sizes <- colSums(filtered_counts) / 1e6
-  
-  # 🧮 Compute FPKM
-  fpkm_matrix <- sweep(filtered_counts, 2, lib_sizes, "/") %>%
-    as.data.frame() %>%
-    tibble::rownames_to_column("gene_id") %>%
-    left_join(gene_lengths, by = "gene_id") %>%
-    mutate(across(-c(gene_id, gene_length_kb), ~ .x / gene_length_kb))
-  
-  # 📈 Compute group-specific average FPKM
-  fpkm_long <- fpkm_matrix %>%
-    pivot_longer(-c(gene_id, gene_length_kb), names_to = "Sample", values_to = "fpkm") %>%
-    left_join(meta_data %>% select(Sample = sample_id_full, genotype), by = "Sample")
-  
-  avg_fpkm_grouped <- fpkm_long %>%
-    group_by(gene_id, genotype) %>%
-    summarise(avg_fpkm = mean(fpkm, na.rm = TRUE), .groups = "drop") %>%
-    pivot_wider(names_from = genotype, values_from = avg_fpkm, names_prefix = "fpkm_")
+  filtered_counts <- count_matrix[, meta_data$sample_id_full, drop = FALSE]
   
   # 🧪 DESeq2 analysis
   dds <- DESeqDataSetFromMatrix(
     countData = as.matrix(filtered_counts),
-    colData = meta_data,
-    design = ~ genotype
+    colData   = meta_data,
+    design    = ~ genotype
   )
   dds <- DESeq(dds)
-  res <- results(dds, contrast = c("genotype", test_genotype, ref_genotype), alpha = 0.05)
+  res <- results(dds, contrast = c("genotype", test_genotype, ref_genotype), independentFiltering = TRUE)
   
   # 🧾 Format results
   deg_df <- as.data.frame(res) %>%
-    tibble::rownames_to_column("gene_id") %>%
-    left_join(tx2gene_df %>% select(gene_id, gene_name) %>% distinct(gene_id, .keep_all = TRUE), by = "gene_id") %>%
-    mutate(FoldChange = 2^log2FoldChange) %>%
-    mutate(significance = case_when(
-      FoldChange >= 1.5 & padj <= 0.05 ~ "up",
-      FoldChange <= (1 / 1.5) & padj <= 0.05 ~ "down",
-      TRUE ~ "ns"
-    )) %>%
-    left_join(avg_fpkm_grouped, by = "gene_id")  # ⬅️ Add group-specific FPKM
+    rownames_to_column("gene_id") %>%
+    left_join(tx2gene_df %>% distinct(gene_id, gene_name), by = "gene_id") %>%
+    mutate(
+      significance = case_when(
+        pvalue <= 0.05 & log2FoldChange >=  0.2 ~ "up",
+        pvalue <= 0.05 & log2FoldChange <= -0.2 ~ "down",
+        TRUE ~ "ns"
+      )
+    )
+  
+  
+deg_df <- deg_df %>% filter(!is.na(pvalue), !is.na(log2FoldChange))
+
   
   # 💾 Save results
   write.csv(deg_df, file = file.path(out_dir, paste0(out_prefix, ".csv")), row.names = FALSE)
   
-  # Return the DEG dataframe invisibly
-  invisible(deg_df)
+  # 📊 Volcano plot
+  x_max <- max(abs(deg_df$log2FoldChange), na.rm = TRUE)
+  y_max <- max(-log10(deg_df$pvalue), na.rm = TRUE)
+  
+  # 🧬 Highlight ARID5B
+  highlight_gene <- "ENSG00000150347"  # ARID5B
+  highlight_data <- deg_df %>% filter(gene_id == highlight_gene)
+  
+  volcano_plot <- ggplot(deg_df, aes(x = log2FoldChange, y = -log10(pvalue),
+                                     fill = significance, alpha = significance)) +
+    geom_point(shape = 21, colour = "black", size = 2) +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "grey50") +
+    geom_vline(xintercept = c(-0.2, 0.2), linetype = "dashed", colour = "grey50") +
+    scale_fill_manual(values = c(up = "#D55E00", down = "#0072B2", ns = "grey80")) +
+    scale_alpha_manual(values = c(up = 0.9, down = 0.9, ns = 0.5), guide = "none") +
+    xlim(-x_max, x_max) +
+    ylim(0, y_max) +
+    
+    # 🔴 Highlight ARID5B point
+    geom_point(data = highlight_data, aes(x = log2FoldChange, y = -log10(pvalue)),
+               color = "#1F77B4", fill = "white", shape = 21, size = 3) +
+    
+    # 🏷️ Add offset label with square box + pointer line
+    geom_label_repel(
+      data = highlight_data,
+      aes(x = log2FoldChange, y = -log10(pvalue),
+          label = ifelse(!is.na(gene_name), gene_name, gene_id)),
+      nudge_x = 2, nudge_y = 2,            # push label away
+      color = "black", fill = "white",
+      fontface = "bold", size = 5,
+      box.padding = 0.5, point.padding = 0.3,
+      segment.color = "#1F77B4", segment.size = 1,  # pointer line
+      label.size = 0.4, label.r = unit(0.15, "lines"),
+      max.overlaps = Inf
+    ) +
+    
+    theme_minimal(base_size = 14) +
+    labs(
+      title = paste0("Volcano: NALM6 ", test_genotype, " vs ", ref_genotype, 
+                     " (DESeq2, raw counts)"),
+      x = "log2 Fold Change", y = "-log10(p-value)", fill = "Significance"
+    )
+  
+  ggsave(
+  filename = file.path(out_dir, paste0(out_prefix, "_volcano.pdf")),
+  plot = volcano_plot,
+  width = 8, height = 6, units = "in"
+)
+
+  
+  list(results = deg_df, plot = volcano_plot)
 }
 
-
 # 🚀 3. Run for the 3 desired comparisons
-deg_tt_vs_tc <- run_deg(sf.df.data, sample_metadata, "TC", "TT", "DEG_gen_exp_NALM6_TT_vs_TC")
-deg_tc_vs_cc <- run_deg(sf.df.data, sample_metadata, "CC", "TC", "DEG_gen_exp_NALM6_TC_vs_CC")
-deg_tt_vs_cc <- run_deg(sf.df.data, sample_metadata, "CC", "TT", "DEG_gen_exp_NALM6_TT_vs_CC")
+deg_tt_vs_tc <- run_deg_deseq(sf.df.data, sample_metadata, "TC", "TT", "DEG_gen_exp_NALM6_TT_vs_TC")
+deg_tc_vs_cc <- run_deg_deseq(sf.df.data, sample_metadata, "CC", "TC", "DEG_gen_exp_NALM6_TC_vs_CC")
+deg_tt_vs_cc <- run_deg_deseq(sf.df.data, sample_metadata, "CC", "TT", "DEG_gen_exp_NALM6_TT_vs_CC")
+
+# 📊 Print volcano plots
+deg_tt_vs_tc$plot
+deg_tc_vs_cc$plot
+deg_tt_vs_cc$plot
+
+
 
 ```
+
+
+## TPM Loop to run DEG NALM6 ONLY 
 
 ```{r}
-library(pheatmap)
+# ==============================================================
+# DEG analysis for NALM6 clones (TT, TC, CC) using limma-trend on TPM
+# ==============================================================
 
-# 1. Extract top 10 upregulated genes by fpkm_TT
-top_genes <- deg_tt_vs_cc %>%
-    filter(significance == "down") %>%
-    arrange(fpkm_TT) %>%
-    slice_head(n = 25) %>%
-    pull(gene_id)
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(limma)
+  library(ggplot2)
+  library(ggrepel)
+})
 
-# 2. Define NALM6 sample order: TT, TC, CC
-nalm6_ordered <- c("NALM6_TT_1", "NALM6_TT_2", "NALM6_TT_3",
-                   "NALM6_TC_1", "NALM6_TC_2", "NALM6_TC_3",
-                   "NALM6_CC_1", "NALM6_CC_2", "NALM6_CC_3")
+# ==============================================================
+# DEG analysis for NALM6 clones (TT, TC, CC) using limma-trend on TPM
+# ==============================================================
 
-# 3. Subset FPKM matrix for selected genes and samples
-heatmap_data <- fpkm_matrix_annotated %>%
-    filter(gene_id %in% top_genes) %>%
-    select(gene_name, all_of(nalm6_ordered)) %>%
-    column_to_rownames("gene_name")
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(limma)
+  library(ggplot2)
+  library(ggrepel)
+})
 
-# 4. Log-transform for visualization
-heatmap_matrix <- log2(heatmap_data + 1)
+# 📂 1. Create output folder
+tpm_out_dir <- "TPM_deg_results_NALM6"
+if (!dir.exists(tpm_out_dir)) dir.create(tpm_out_dir)
 
-# 5. Plot heatmap without column clustering
-pheatmap(heatmap_matrix,
-         cluster_rows = TRUE,
-         cluster_cols = FALSE,
-         scale = "row",
-         main = "Top 25 Downregulated Genes in TT vs CC (NALM6)",
-         fontsize_row = 10)
+# 🧮 Helper: convert counts → TPM
+counts_to_tpm <- function(counts, gene_lengths) {
+  rpk <- sweep(counts, 1, gene_lengths, "/")        # reads per kilobase
+  tpm <- apply(rpk, 2, function(x) x / sum(x, na.rm = TRUE) * 1e6)
+  return(tpm)
+}
+
+# 🧬 2. Function to run limma-trend DEG on TPM
+run_deg_tpm <- function(count_matrix, metadata, ref_genotype, test_genotype, out_prefix) {
+  
+  # 📂 Filter metadata for NALM6 and selected genotypes
+  meta_data <- metadata %>%
+    filter(cell_line == "NALM6", genotype %in% c(ref_genotype, test_genotype)) %>%
+    mutate(genotype = factor(genotype, levels = c(ref_genotype, test_genotype)))
+  rownames(meta_data) <- meta_data$sample_id_full
+  
+  # 📊 Subset count matrix
+  filtered_counts <- count_matrix[, meta_data$sample_id_full, drop = FALSE]
+  
+  # 🧬 Gene lengths (kb)
+  gene_lengths <- gtf_df %>%
+    filter(type == "exon") %>%
+    group_by(gene_id) %>%
+    summarise(gene_length_kb = sum(width) / 1000, .groups = "drop")
+  
+  lengths_vec <- setNames(gene_lengths$gene_length_kb, gene_lengths$gene_id)
+  lengths_vec <- lengths_vec[rownames(filtered_counts)]
+  
+  # 🧮 Convert counts → TPM
+  tpm_matrix <- counts_to_tpm(filtered_counts, lengths_vec)
+  expr_log   <- log2(tpm_matrix + 1)
+  
+  # 📝 Design
+  design <- model.matrix(~ genotype, data = meta_data)
+  colnames(design) <- c("Intercept", paste0(test_genotype,"_vs_",ref_genotype))
+  
+  # 🔬 limma-trend
+  fit <- lmFit(expr_log, design)
+  fit <- eBayes(fit, trend = TRUE)
+  coef_name <- colnames(design)[2]
+  
+  tpm_res <- topTable(fit, coef = coef_name, number = Inf) %>%
+    rownames_to_column("gene_id") %>%
+    left_join(tx2gene_df %>% distinct(gene_id, gene_name), by = "gene_id") %>%
+    mutate(
+      significance = case_when(
+        P.Value <= 0.05 & logFC >=  0.2 ~ "up",
+        P.Value <= 0.05 & logFC <= -0.2 ~ "down",
+        TRUE ~ "ns"
+      )
+    ) %>%
+    filter(!is.na(P.Value), !is.na(logFC))
+  
+  # 💾 Save results
+  write.csv(tpm_res, file = file.path(tpm_out_dir, paste0(out_prefix, ".csv")), row.names = FALSE)
+  
+  # === Volcano plot ===
+  plot_df <- tpm_res %>% filter(is.finite(logFC), is.finite(P.Value))
+   x_max <- max(abs(tpm_res$logFC), na.rm = TRUE)
+  y_max <- max(-log10(tpm_res$P.Value), na.rm = TRUE)
+  
+  # 🧬 Highlight ARID5B
+  highlight_gene <- "ENSG00000150347"
+  highlight_data <- plot_df %>% filter(gene_id == highlight_gene)
+  
+  volcano_plot_tpm <- ggplot(plot_df, aes(x = logFC, y = -log10(P.Value),
+                                          fill = significance, alpha = significance)) +
+    geom_point(shape = 21, colour = "black", size = 2) +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "grey50") +
+    geom_vline(xintercept = c(-0.2, 0.2), linetype = "dashed", colour = "grey50") +
+    scale_fill_manual(values = c(up = "#D55E00", down = "#0072B2", ns = "grey80")) +
+    scale_alpha_manual(values = c(up = 0.9, down = 0.9, ns = 0.5), guide = "none") +
+    coord_cartesian(xlim = c(-x_max, x_max), ylim = c(0, y_max)) +
+    
+    # 🔵 Highlight ARID5B
+    geom_point(data = highlight_data, aes(x = logFC, y = -log10(P.Value)),
+               color = "#1F77B4", fill = "white", shape = 21, size = 3) +
+    geom_label_repel(
+      data = highlight_data,
+      aes(x = logFC, y = -log10(P.Value),
+          label = ifelse(!is.na(gene_name), gene_name, gene_id)),
+      nudge_x = 2, nudge_y = 2,
+      color = "black", fill = "white",
+      fontface = "bold", size = 5,
+      box.padding = 0.5, point.padding = 0.3,
+      segment.color = "#1F77B4", segment.size = 1,
+      label.size = 0.4, label.r = unit(0.15, "lines"),
+      max.overlaps = Inf
+    ) +
+    
+    theme_minimal(base_size = 14) +
+    labs(
+      title = paste0("Volcano: Ribo0 NALM6 ", test_genotype, " vs ", ref_genotype, 
+                     " (limma-trend, TPM)"),
+      x = "log2 Fold Change", y = "-log10(p-value)", fill = "Significance"
+    )
+  
+  
+# 💾 Save volcano plot (PDF for vector quality)
+ggsave(
+  filename = file.path(tpm_out_dir, paste0(out_prefix, "_volcano.pdf")),
+  plot = volcano_plot_tpm,
+  width = 8, height = 6, units = "in"
+)
+
+  
+  list(results = tpm_res, plot = volcano_plot_tpm)
+}
+
+# 🚀 3. Run comparisons
+tpm_tt_vs_tc <- run_deg_tpm(sf.df.data, sample_metadata, "TC", "TT", "TPM_NALM6_TT_vs_TC")
+tpm_tc_vs_cc <- run_deg_tpm(sf.df.data, sample_metadata, "CC", "TC", "TPM_NALM6_TC_vs_CC")
+tpm_tt_vs_cc <- run_deg_tpm(sf.df.data, sample_metadata, "CC", "TT", "TPM_NALM6_TT_vs_CC")
+
+# 📊 Print volcano plots
+tpm_tt_vs_tc$plot
+tpm_tc_vs_cc$plot
+tpm_tt_vs_cc$plot
+
 
 ```
 
+## DEG analysis for NALM6 (TT, TC, CC) using limma-trend on TPM
+### Excluding TT Clone 1 and non-coding genes
+```{r}
+# ==============================================================
+# DEG analysis for NALM6 (TT, TC, CC) using limma-trend on TPM
+# Ribo0 dataset: Excluding TT Clone 1 and non-coding genes
+# ==============================================================
+
+suppressPackageStartupMessages({
+    library(dplyr)
+    library(tibble)
+    library(limma)
+    library(ggplot2)
+    library(ggrepel)
+})
+
+# 📂 1. Create output folder
+ribo0_tpm_outdir <- "Ribo0_TPM_deg_results_NALM6_filtered"
+if (!dir.exists(ribo0_tpm_outdir)) dir.create(ribo0_tpm_outdir)
+
+# 🧮 Helper: convert counts → TPM
+counts_to_tpm <- function(counts, gene_lengths) {
+    rpk <- sweep(counts, 1, gene_lengths, "/")
+    tpm <- apply(rpk, 2, function(x) x / sum(x, na.rm = TRUE) * 1e6)
+    return(tpm)
+}
+
+# 🧬 2. Function to run limma-trend DEG on TPM (filtered)
+run_deg_tpm_ribo0 <- function(count_matrix, metadata, ref_genotype, test_genotype, out_prefix) {
+    
+    # ---- Filter metadata (remove TT Clone 1) ----
+    meta_data <- metadata %>%
+        filter(cell_line == "NALM6",
+               genotype %in% c(ref_genotype, test_genotype),
+               sample_id_full != "NALM6_TT_1") %>%
+        mutate(genotype = factor(genotype, levels = c(ref_genotype, test_genotype)))
+    rownames(meta_data) <- meta_data$sample_id_full
+    
+    # ---- Subset count matrix ----
+    filtered_counts <- count_matrix[, meta_data$sample_id_full, drop = FALSE]
+    
+    # ---- Keep only coding genes ----
+    coding_genes <- gtf_df %>%
+        filter(type == "gene", gene_biotype == "protein_coding") %>%
+        pull(gene_id) %>% unique()
+    filtered_counts <- filtered_counts[rownames(filtered_counts) %in% coding_genes, ]
+    
+    # ---- Gene lengths (kb) ----
+    gene_lengths <- gtf_df %>%
+        filter(type == "exon") %>%
+        group_by(gene_id) %>%
+        summarise(gene_length_kb = sum(width) / 1000, .groups = "drop")
+    lengths_vec <- setNames(gene_lengths$gene_length_kb, gene_lengths$gene_id)
+    lengths_vec <- lengths_vec[rownames(filtered_counts)]
+    
+    # ---- Counts → TPM ----
+    tpm_matrix <- counts_to_tpm(filtered_counts, lengths_vec)
+    expr_log   <- log2(tpm_matrix + 1)
+    
+    # ---- Design ----
+    design <- model.matrix(~ genotype, data = meta_data)
+    colnames(design) <- c("Intercept", paste0(test_genotype,"_vs_",ref_genotype))
+    
+    # ---- limma-trend ----
+    fit <- lmFit(expr_log, design)
+    fit <- eBayes(fit, trend = TRUE)
+    coef_name <- colnames(design)[2]
+    
+    # ---- Results ----
+    tpm_res <- topTable(fit, coef = coef_name, number = Inf) %>%
+        rownames_to_column("gene_id") %>%
+        left_join(tx2gene_df %>% distinct(gene_id, gene_name), by = "gene_id") %>%
+        mutate(
+            significance = case_when(
+                P.Value <= 0.05 & logFC >=  0.2 ~ "up",
+                P.Value <= 0.05 & logFC <= -0.2 ~ "down",
+                TRUE ~ "ns"
+            )
+        ) %>%
+        filter(!is.na(P.Value), !is.na(logFC))
+    
+    # 💾 Save results
+    write.csv(tpm_res, file = file.path(ribo0_tpm_outdir, paste0(out_prefix, ".csv")), row.names = FALSE)
+    
+    # === Volcano plot ===
+    plot_df <- tpm_res %>% filter(is.finite(logFC), is.finite(P.Value))
+    x_max <- max(abs(tpm_res$logFC), na.rm = TRUE)
+    y_max <- max(-log10(tpm_res$P.Value), na.rm = TRUE)
+    
+    # 🧬 Highlight ARID5B
+    highlight_gene <- "ENSG00000150347"
+    highlight_data <- plot_df %>% filter(gene_id == highlight_gene)
+    
+    volcano_plot <- ggplot(plot_df, aes(x = logFC, y = -log10(P.Value),
+                                        fill = significance, alpha = significance)) +
+        geom_point(shape = 21, colour = "black", size = 2) +
+        geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "grey50") +
+        geom_vline(xintercept = c(-0.2, 0.2), linetype = "dashed", colour = "grey50") +
+        scale_fill_manual(values = c(up = "#D55E00", down = "#0072B2", ns = "grey80")) +
+        scale_alpha_manual(values = c(up = 0.9, down = 0.9, ns = 0.5), guide = "none") +
+        coord_cartesian(xlim = c(-x_max, x_max), ylim = c(0, y_max)) +
+        
+        # 🔵 Highlight ARID5B if present
+        geom_point(data = highlight_data, aes(x = logFC, y = -log10(P.Value)),
+                   color = "#1F77B4", fill = "white", shape = 21, size = 3) +
+        geom_label_repel(
+            data = highlight_data,
+            aes(x = logFC, y = -log10(P.Value),
+                label = ifelse(!is.na(gene_name), gene_name, gene_id)),
+            nudge_x = 2, nudge_y = 2,
+            color = "black", fill = "white",
+            fontface = "bold", size = 5,
+            box.padding = 0.5, point.padding = 0.3,
+            segment.color = "#1F77B4", segment.size = 1,
+            label.size = 0.4, label.r = unit(0.15, "lines"),
+            max.overlaps = Inf
+        ) +
+        theme_minimal(base_size = 14) +
+        labs(
+            title = paste0("Ribo0 Volcano (coding genes only; removed TT Clone 1): NALM6 ",
+                           test_genotype, " vs ", ref_genotype),
+            x = "log2 Fold Change", y = "-log10(p-value)", fill = "Significance"
+        )
+    
+    # 💾 Save plot
+    ggsave(
+        filename = file.path(ribo0_tpm_outdir, paste0(out_prefix, "_volcano.pdf")),
+        plot = volcano_plot,
+        width = 8, height = 6, units = "in"
+    )
+    
+    list(results = tpm_res, plot = volcano_plot)
+}
+
+# 🚀 3. Run comparisons
+ribo0_tpm_tt_vs_tc <- run_deg_tpm_ribo0(sf.df.data, sample_metadata, "TC", "TT", "Ribo0_TPM_NALM6_TT_vs_TC")
+ribo0_tpm_tc_vs_cc <- run_deg_tpm_ribo0(sf.df.data, sample_metadata, "CC", "TC", "Ribo0_TPM_NALM6_TC_vs_CC")
+ribo0_tpm_tt_vs_cc <- run_deg_tpm_ribo0(sf.df.data, sample_metadata, "CC", "TT", "Ribo0_TPM_NALM6_TT_vs_CC")
+
+# 📊 Print plots
+ribo0_tpm_tt_vs_tc$plot
+ribo0_tpm_tc_vs_cc$plot
+ribo0_tpm_tt_vs_cc$plot
+
+```
+##KLF stuff for NALM6
+
+
+
+
+
+
+---
 ## SPEARMAN CORRELATION of C dosage for NALM6
 
 
@@ -1109,6 +1438,11 @@ cat("✅ Genes passing all filters:", nrow(final_genes), "\n")
 readr::write_csv(final_genes, "/Users/cojulian/Desktop/Tzu_projects/Matt/Clarissa/snp_cell_lines_public_datasets_project/cell_lines/atacseq/Clarissas_bulk_ATAC_Aug_2025/both_rna_atac_nalm6_sig/filtered_DE_genes_TT_vs_CC_expression_screened.csv")
 ```
 
+
+
+
+
+
 ## REH
 
 ```{r}
@@ -1204,4 +1538,367 @@ readr::write_csv(
 )
 
 ```
+
+## Loop to run DEG on REH
+```{r}
+# 📂 1. Create output folder for REH
+out_dir_reh <- "deg_results_REH"
+if (!dir.exists(out_dir_reh)) dir.create(out_dir_reh)
+
+# 🧬 2. Function to run DESeq2 for REH comparisons
+run_deg_reh <- function(count_matrix, metadata, ref_genotype, test_genotype, out_prefix) {
+  
+  # 📂 Filter metadata for REH and selected genotypes
+  meta_data <- metadata %>%
+    filter(cell_line == "REH", genotype %in% c(ref_genotype, test_genotype)) %>%
+    mutate(genotype = factor(genotype, levels = c(ref_genotype, test_genotype)))
+  
+  # 📊 Subset count matrix
+  filtered_counts <- count_matrix[, meta_data$sample_id_full]
+  
+  # 🧬 Gene lengths from GTF
+  gene_lengths <- gtf_df %>%
+    filter(type == "exon") %>%
+    group_by(gene_id) %>%
+    summarise(gene_length_kb = sum(width) / 1000, .groups = "drop")
+  
+  # 📊 Library sizes in millions
+  lib_sizes <- colSums(filtered_counts) / 1e6
+  
+  # 🧮 Compute FPKM
+  fpkm_matrix <- sweep(filtered_counts, 2, lib_sizes, "/") %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column("gene_id") %>%
+    left_join(gene_lengths, by = "gene_id") %>%
+    mutate(across(-c(gene_id, gene_length_kb), ~ .x / gene_length_kb))
+  
+  # 📈 Average FPKM by group
+  fpkm_long <- fpkm_matrix %>%
+    pivot_longer(-c(gene_id, gene_length_kb), names_to = "Sample", values_to = "fpkm") %>%
+    left_join(meta_data %>% select(Sample = sample_id_full, genotype), by = "Sample")
+  
+  avg_fpkm_grouped <- fpkm_long %>%
+    group_by(gene_id, genotype) %>%
+    summarise(avg_fpkm = mean(fpkm, na.rm = TRUE), .groups = "drop") %>%
+    pivot_wider(names_from = genotype, values_from = avg_fpkm, names_prefix = "fpkm_")
+  
+  # 🧪 DESeq2 analysis
+  dds <- DESeqDataSetFromMatrix(
+    countData = as.matrix(filtered_counts),
+    colData = meta_data,
+    design = ~ genotype
+  )
+  dds <- DESeq(dds)
+  res <- results(dds, contrast = c("genotype", test_genotype, ref_genotype), independentFiltering = TRUE)
+  
+  # 🧾 Format results
+  deg_df <- as.data.frame(res) %>%
+    tibble::rownames_to_column("gene_id") %>%
+    left_join(tx2gene_df %>% select(gene_id, gene_name) %>% distinct(gene_id, .keep_all = TRUE), 
+              by = "gene_id") %>%
+    mutate(significance = case_when(
+      pvalue <= 0.05 & log2FoldChange >=  0.2 ~ "up",
+      pvalue <= 0.05 & log2FoldChange <= -0.2 ~ "down",
+      TRUE ~ "ns"
+    )) %>%
+    left_join(avg_fpkm_grouped, by = "gene_id")
+  
+  # 💾 Save results
+  write.csv(deg_df, file = file.path(out_dir_reh, paste0(out_prefix, ".csv")), row.names = FALSE)
+  
+  invisible(deg_df)
+}
+
+# 🚀 3. Run for REH comparisons
+deg_reh_tt_vs_tc <- run_deg_reh(sf.df.data, sample_metadata, "TC", "TT", "DEG_gen_exp_REH_TT_vs_TC")
+deg_reh_tc_vs_cc <- run_deg_reh(sf.df.data, sample_metadata, "CC", "TC", "DEG_gen_exp_REH_TC_vs_CC")
+deg_reh_tt_vs_cc <- run_deg_reh(sf.df.data, sample_metadata, "CC", "TT", "DEG_gen_exp_REH_TT_vs_CC")
+
+```
+
+
+```{r}
+# ==============================================================
+# DEG analysis for REH clones (TT, TC, CC) using limma-trend on TPM
+# ==============================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(limma)
+  library(ggplot2)
+  library(ggrepel)
+})
+
+# 📂 1. Create output folder
+reh_tpm_out_dir <- "TPM_deg_results_REH"
+if (!dir.exists(reh_tpm_out_dir)) dir.create(reh_tpm_out_dir)
+
+# 🧮 Helper: convert counts → TPM
+counts_to_tpm <- function(counts, gene_lengths) {
+  rpk <- sweep(counts, 1, gene_lengths, "/")        # reads per kilobase
+  tpm <- apply(rpk, 2, function(x) x / sum(x, na.rm = TRUE) * 1e6)
+  return(tpm)
+}
+
+# 🧬 2. Function to run limma-trend DEG on TPM
+run_deg_tpm_reh <- function(count_matrix, metadata, ref_genotype, test_genotype, out_prefix) {
+  
+  # 📂 Filter metadata for REH and selected genotypes
+  meta_data <- metadata %>%
+    filter(cell_line == "REH", genotype %in% c(ref_genotype, test_genotype)) %>%
+    mutate(genotype = factor(genotype, levels = c(ref_genotype, test_genotype)))
+  rownames(meta_data) <- meta_data$sample_id_full
+  
+  # 📊 Subset count matrix
+  filtered_counts <- count_matrix[, meta_data$sample_id_full, drop = FALSE]
+  
+  # 🧬 Gene lengths (kb)
+  gene_lengths <- gtf_df %>%
+    filter(type == "exon") %>%
+    group_by(gene_id) %>%
+    summarise(gene_length_kb = sum(width) / 1000, .groups = "drop")
+  
+  lengths_vec <- setNames(gene_lengths$gene_length_kb, gene_lengths$gene_id)
+  lengths_vec <- lengths_vec[rownames(filtered_counts)]
+  
+  # 🧮 Convert counts → TPM
+  tpm_matrix <- counts_to_tpm(filtered_counts, lengths_vec)
+  expr_log   <- log2(tpm_matrix + 1)
+  
+  # 📝 Design
+  design <- model.matrix(~ genotype, data = meta_data)
+  colnames(design) <- c("Intercept", paste0(test_genotype,"_vs_",ref_genotype))
+  
+  # 🔬 limma-trend
+  fit <- lmFit(expr_log, design)
+  fit <- eBayes(fit, trend = TRUE)
+  coef_name <- colnames(design)[2]
+  
+  reh_tpm_res <- topTable(fit, coef = coef_name, number = Inf) %>%
+    rownames_to_column("gene_id") %>%
+    left_join(tx2gene_df %>% distinct(gene_id, gene_name), by = "gene_id") %>%
+    mutate(
+      significance = case_when(
+        P.Value <= 0.05 & logFC >=  0.2 ~ "up",
+        P.Value <= 0.05 & logFC <= -0.2 ~ "down",
+        TRUE ~ "ns"
+      )
+    ) %>%
+    filter(!is.na(P.Value), !is.na(logFC))
+  
+  # 💾 Save results
+  write.csv(reh_tpm_res, file = file.path(reh_tpm_out_dir, paste0(out_prefix, ".csv")), row.names = FALSE)
+  
+  # === Volcano plot ===
+  plot_df <- reh_tpm_res %>% filter(is.finite(logFC), is.finite(P.Value))
+  x_max <- max(abs(reh_tpm_res$logFC), na.rm = TRUE)
+  y_max <- max(-log10(reh_tpm_res$P.Value), na.rm = TRUE)
+  
+  # 🧬 Highlight ARID5B
+  highlight_gene <- "ENSG00000150347"
+  highlight_data <- plot_df %>% filter(gene_id == highlight_gene)
+  
+  volcano_plot_reh <- ggplot(plot_df, aes(x = logFC, y = -log10(P.Value),
+                                          fill = significance, alpha = significance)) +
+    geom_point(shape = 21, colour = "black", size = 2) +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "grey50") +
+    geom_vline(xintercept = c(-0.2, 0.2), linetype = "dashed", colour = "grey50") +
+    scale_fill_manual(values = c(up = "#D55E00", down = "#0072B2", ns = "grey80")) +
+    scale_alpha_manual(values = c(up = 0.9, down = 0.9, ns = 0.5), guide = "none") +
+    coord_cartesian(xlim = c(-x_max, x_max), ylim = c(0, y_max)) +
+    
+    # 🔵 Highlight ARID5B
+    geom_point(data = highlight_data, aes(x = logFC, y = -log10(P.Value)),
+               color = "#1F77B4", fill = "white", shape = 21, size = 3) +
+    geom_label_repel(
+      data = highlight_data,
+      aes(x = logFC, y = -log10(P.Value),
+          label = ifelse(!is.na(gene_name), gene_name, gene_id)),
+      nudge_x = 2, nudge_y = 2,
+      color = "black", fill = "white",
+      fontface = "bold", size = 5,
+      box.padding = 0.5, point.padding = 0.3,
+      segment.color = "#1F77B4", segment.size = 1,
+      label.size = 0.4, label.r = unit(0.15, "lines"),
+      max.overlaps = Inf
+    ) +
+    
+    theme_minimal(base_size = 14) +
+    labs(
+      title = paste0("Volcano: REH ", test_genotype, " vs ", ref_genotype, 
+                     " (limma-trend, TPM)"),
+      x = "log2 Fold Change", y = "-log10(p-value)", fill = "Significance"
+    )
+  
+  # 💾 Save volcano plot
+  ggsave(
+    filename = file.path(reh_tpm_out_dir, paste0(out_prefix, "_volcano.pdf")),
+    plot = volcano_plot_reh,
+    width = 8, height = 6, units = "in"
+  )
+  
+  list(results = reh_tpm_res, plot = volcano_plot_reh)
+}
+
+# 🚀 3. Run comparisons for REH
+reh_tpm_tt_vs_tc <- run_deg_tpm_reh(sf.df.data, sample_metadata, "TC", "TT", "TPM_REH_TT_vs_TC")
+reh_tpm_tc_vs_cc <- run_deg_tpm_reh(sf.df.data, sample_metadata, "CC", "TC", "TPM_REH_TC_vs_CC")
+reh_tpm_tt_vs_cc <- run_deg_tpm_reh(sf.df.data, sample_metadata, "CC", "TT", "TPM_REH_TT_vs_CC")
+
+# 📊 Print volcano plots
+reh_tpm_tt_vs_tc$plot
+reh_tpm_tc_vs_cc$plot
+reh_tpm_tt_vs_cc$plot
+
+
+```
+
+
+## DEG analysis for REH (TT, TC, CC) using limma-trend on TPM
+### Excluding TT Clone 1 and non-coding genes
+```{r}
+# ==============================================================
+# DEG analysis for REH (TT, TC, CC) using limma-trend on TPM
+# Ribo0 dataset: Keep all clones, remove non-coding genes
+# ==============================================================
+
+suppressPackageStartupMessages({
+    library(dplyr)
+    library(tibble)
+    library(limma)
+    library(ggplot2)
+    library(ggrepel)
+})
+
+# 📂 1. Create output folder
+ribo0_reh_outdir <- "Ribo0_TPM_deg_results_REH_filtered"
+if (!dir.exists(ribo0_reh_outdir)) dir.create(ribo0_reh_outdir)
+
+# 🧮 Helper: convert counts → TPM
+counts_to_tpm <- function(counts, gene_lengths) {
+    rpk <- sweep(counts, 1, gene_lengths, "/")
+    tpm <- apply(rpk, 2, function(x) x / sum(x, na.rm = TRUE) * 1e6)
+    return(tpm)
+}
+
+# 🧬 2. Function to run limma-trend DEG on TPM (filtered)
+run_deg_tpm_reh <- function(count_matrix, metadata, ref_genotype, test_genotype, out_prefix) {
+    
+    # ---- Filter metadata (REH only; keep all clones) ----
+    meta_data <- metadata %>%
+        filter(cell_line == "REH",
+               genotype %in% c(ref_genotype, test_genotype)) %>%
+        mutate(genotype = factor(genotype, levels = c(ref_genotype, test_genotype)))
+    rownames(meta_data) <- meta_data$sample_id_full
+    
+    # ---- Subset count matrix ----
+    filtered_counts <- count_matrix[, meta_data$sample_id_full, drop = FALSE]
+    
+    # ---- Keep only coding genes ----
+    coding_genes <- gtf_df %>%
+        filter(type == "gene", gene_biotype == "protein_coding") %>%
+        pull(gene_id) %>% unique()
+    filtered_counts <- filtered_counts[rownames(filtered_counts) %in% coding_genes, ]
+    
+    # ---- Gene lengths (kb) ----
+    gene_lengths <- gtf_df %>%
+        filter(type == "exon") %>%
+        group_by(gene_id) %>%
+        summarise(gene_length_kb = sum(width) / 1000, .groups = "drop")
+    lengths_vec <- setNames(gene_lengths$gene_length_kb, gene_lengths$gene_id)
+    lengths_vec <- lengths_vec[rownames(filtered_counts)]
+    
+    # ---- Counts → TPM ----
+    tpm_matrix <- counts_to_tpm(filtered_counts, lengths_vec)
+    expr_log   <- log2(tpm_matrix + 1)
+    
+    # ---- Design ----
+    design <- model.matrix(~ genotype, data = meta_data)
+    colnames(design) <- c("Intercept", paste0(test_genotype,"_vs_",ref_genotype))
+    
+    # ---- limma-trend ----
+    fit <- lmFit(expr_log, design)
+    fit <- eBayes(fit, trend = TRUE)
+    coef_name <- colnames(design)[2]
+    
+    # ---- Results ----
+    tpm_res <- topTable(fit, coef = coef_name, number = Inf) %>%
+        rownames_to_column("gene_id") %>%
+        left_join(tx2gene_df %>% distinct(gene_id, gene_name), by = "gene_id") %>%
+        mutate(
+            significance = case_when(
+                P.Value <= 0.05 & logFC >=  0.2 ~ "up",
+                P.Value <= 0.05 & logFC <= -0.2 ~ "down",
+                TRUE ~ "ns"
+            )
+        ) %>%
+        filter(!is.na(P.Value), !is.na(logFC))
+    
+    # 💾 Save results
+    write.csv(tpm_res, file = file.path(ribo0_reh_outdir, paste0(out_prefix, ".csv")), row.names = FALSE)
+    
+    # === Volcano plot ===
+    plot_df <- tpm_res %>% filter(is.finite(logFC), is.finite(P.Value))
+    x_max <- max(abs(tpm_res$logFC), na.rm = TRUE)
+    y_max <- max(-log10(tpm_res$P.Value), na.rm = TRUE)
+    
+    # 🧬 Highlight ARID5B (if present in REH)
+    highlight_gene <- "ENSG00000150347"
+    highlight_data <- plot_df %>% filter(gene_id == highlight_gene)
+    
+    volcano_plot <- ggplot(plot_df, aes(x = logFC, y = -log10(P.Value),
+                                        fill = significance, alpha = significance)) +
+        geom_point(shape = 21, colour = "black", size = 2) +
+        geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "grey50") +
+        geom_vline(xintercept = c(-0.2, 0.2), linetype = "dashed", colour = "grey50") +
+        scale_fill_manual(values = c(up = "#D55E00", down = "#0072B2", ns = "grey80")) +
+        scale_alpha_manual(values = c(up = 0.9, down = 0.9, ns = 0.5), guide = "none") +
+        coord_cartesian(xlim = c(-x_max, x_max), ylim = c(0, y_max)) +
+        
+        # 🔵 Highlight ARID5B if present
+        geom_point(data = highlight_data, aes(x = logFC, y = -log10(P.Value)),
+                   color = "#1F77B4", fill = "white", shape = 21, size = 3) +
+        geom_label_repel(
+            data = highlight_data,
+            aes(x = logFC, y = -log10(P.Value),
+                label = ifelse(!is.na(gene_name), gene_name, gene_id)),
+            nudge_x = 2, nudge_y = 2,
+            color = "black", fill = "white",
+            fontface = "bold", size = 5,
+            box.padding = 0.5, point.padding = 0.3,
+            segment.color = "#1F77B4", segment.size = 1,
+            label.size = 0.4, label.r = unit(0.15, "lines"),
+            max.overlaps = Inf
+        ) +
+        theme_minimal(base_size = 14) +
+        labs(
+            title = paste0("Ribo0 Volcano (coding genes only): REH ",
+                           test_genotype, " vs ", ref_genotype),
+            x = "log2 Fold Change", y = "-log10(p-value)", fill = "Significance"
+        )
+    
+    # 💾 Save plot
+    ggsave(
+        filename = file.path(ribo0_reh_outdir, paste0(out_prefix, "_volcano.pdf")),
+        plot = volcano_plot,
+        width = 8, height = 6, units = "in"
+    )
+    
+    list(results = tpm_res, plot = volcano_plot)
+}
+
+# 🚀 3. Run REH comparisons
+reh_tpm_tt_vs_tc <- run_deg_tpm_reh(sf.df.data, sample_metadata, "TC", "TT", "Ribo0_TPM_REH_TT_vs_TC")
+reh_tpm_tc_vs_cc <- run_deg_tpm_reh(sf.df.data, sample_metadata, "CC", "TC", "Ribo0_TPM_REH_TC_vs_CC")
+reh_tpm_tt_vs_cc <- run_deg_tpm_reh(sf.df.data, sample_metadata, "CC", "TT", "Ribo0_TPM_REH_TT_vs_CC")
+
+# 📊 Print plots
+reh_tpm_tt_vs_tc$plot
+reh_tpm_tc_vs_cc$plot
+reh_tpm_tt_vs_cc$plot
+
+```
+
+
 

@@ -278,6 +278,7 @@ nalm6_coldata <- human_coldata %>%
 
 # 2. Filter expression matrix to match NALM6 samples
 nalm6_expr <- sf.df.data[, nalm6_coldata$Sample, drop = FALSE] %>%
+  as.data.frame() %>% 
   tibble::rownames_to_column("gene_id")
 
 # 3. Reshape to tidy format
@@ -608,6 +609,288 @@ overlap_annotated <- overlap_df %>%
 # Save to CSV
 write_csv(overlap_annotated, "overlapping_genes_both_RNA_technologies.csv")
 
+
+```
+
+### PolyA NALM6 for Utah
+```{r}
+# ==============================================================
+# DEG analysis for NALM6 clones (TT, TC, CC) using limma-trend on TPM
+# ==============================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(limma)
+  library(ggplot2)
+  library(ggrepel)
+})
+
+# 📂 1. Create output folder
+nalm6_tpm_out_dir <- "PolyA_TPM_deg_results_NALM6"
+if (!dir.exists(nalm6_tpm_out_dir)) dir.create(nalm6_tpm_out_dir)
+
+# 🧮 Helper: convert counts → TPM
+counts_to_tpm <- function(counts, gene_lengths) {
+  rpk <- sweep(counts, 1, gene_lengths, "/")        # reads per kilobase
+  tpm <- apply(rpk, 2, function(x) x / sum(x, na.rm = TRUE) * 1e6)
+  return(tpm)
+}
+
+# 🧬 2. Function to run limma-trend DEG on TPM
+run_deg_tpm_nalm6 <- function(count_matrix, metadata, ref_genotype, test_genotype, out_prefix) {
+  
+  # 📂 Filter metadata for NALM6 and selected genotypes
+  meta_data <- metadata %>%
+    filter(cell_line == "NALM6", genotype %in% c(ref_genotype, test_genotype)) %>%
+    mutate(genotype = factor(genotype, levels = c(ref_genotype, test_genotype)))
+  rownames(meta_data) <- meta_data$sample_id_full
+  
+  # 📊 Subset count matrix
+  filtered_counts <- count_matrix[, meta_data$sample_id_full, drop = FALSE]
+  
+  # 🧬 Gene lengths (kb) from GTF
+  gene_lengths <- gtf_df %>%
+    filter(type == "exon") %>%
+    group_by(gene_id) %>%
+    summarise(gene_length_kb = sum(width) / 1000, .groups = "drop")
+  
+  lengths_vec <- setNames(gene_lengths$gene_length_kb, gene_lengths$gene_id)
+  lengths_vec <- lengths_vec[rownames(filtered_counts)]
+  
+  # 🧮 Convert counts → TPM
+  tpm_matrix <- counts_to_tpm(filtered_counts, lengths_vec)
+  expr_log   <- log2(tpm_matrix + 1)
+  
+  # 📝 Design
+  design <- model.matrix(~ genotype, data = meta_data)
+  colnames(design) <- c("Intercept", paste0(test_genotype,"_vs_",ref_genotype))
+  
+  # 🔬 limma-trend
+  fit <- lmFit(expr_log, design)
+  fit <- eBayes(fit, trend = TRUE)
+  coef_name <- colnames(design)[2]
+  
+  tpm_res <- topTable(fit, coef = coef_name, number = Inf) %>%
+    rownames_to_column("gene_id") %>%
+    left_join(tx2gene_df %>% distinct(gene_id, gene_name), by = "gene_id") %>%
+    mutate(
+      significance = case_when(
+        P.Value <= 0.05 & logFC >=  0.2 ~ "up",
+        P.Value <= 0.05 & logFC <= -0.2 ~ "down",
+        TRUE ~ "ns"
+      )
+    ) %>%
+    filter(!is.na(P.Value), !is.na(logFC))
+  
+  # 💾 Save results
+  write.csv(tpm_res, file = file.path(nalm6_tpm_out_dir, paste0(out_prefix, ".csv")), row.names = FALSE)
+  
+  # === Volcano plot ===
+  x_max <- max(abs(tpm_res$logFC), na.rm = TRUE)
+  y_max <- max(-log10(tpm_res$P.Value), na.rm = TRUE)
+  
+  highlight_gene <- "ENSG00000150347"  # ARID5B
+  highlight_data <- tpm_res %>% filter(gene_id == highlight_gene)
+  
+  volcano_plot <- ggplot(tpm_res, aes(x = logFC, y = -log10(P.Value),
+                                      fill = significance, alpha = significance)) +
+    geom_point(shape = 21, colour = "black", size = 2) +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "grey50") +
+    geom_vline(xintercept = c(-0.2, 0.2), linetype = "dashed", colour = "grey50") +
+    scale_fill_manual(values = c(up = "#D55E00", down = "#0072B2", ns = "grey80")) +
+    scale_alpha_manual(values = c(up = 0.9, down = 0.9, ns = 0.5), guide = "none") +
+    coord_cartesian(xlim = c(-x_max, x_max), ylim = c(0, y_max)) +
+    
+    # 🔵 Highlight ARID5B (only if present)
+    geom_point(data = highlight_data, aes(x = logFC, y = -log10(P.Value)),
+               color = "#1F77B4", fill = "white", shape = 21, size = 3) +
+    geom_label_repel(
+      data = highlight_data,
+      aes(x = logFC, y = -log10(P.Value),
+          label = ifelse(!is.na(gene_name), gene_name, gene_id)),
+      nudge_x = 2, nudge_y = 2,
+      color = "black", fill = "white",
+      fontface = "bold", size = 5,
+      box.padding = 0.5, point.padding = 0.3,
+      segment.color = "#1F77B4", segment.size = 1,
+      label.size = 0.4, label.r = unit(0.15, "lines"),
+      max.overlaps = Inf
+    ) +
+    
+    theme_minimal(base_size = 14) +
+    labs(
+      title = paste0("Volcano: NALM6 ", test_genotype, " vs ", ref_genotype, 
+                     " (limma-trend, TPM)"),
+      x = "log2 Fold Change", y = "-log10(p-value)", fill = "Significance"
+    )
+  
+  # 💾 Save volcano plot
+  ggsave(
+    filename = file.path(nalm6_tpm_out_dir, paste0(out_prefix, "_volcano.pdf")),
+    plot = volcano_plot,
+    width = 8, height = 6, units = "in"
+  )
+  
+  list(results = tpm_res, plot = volcano_plot)
+}
+
+# 🚀 3. Run comparisons
+nalm6_tpm_tt_vs_tc <- run_deg_tpm_nalm6(sf.df.data, sample_metadata, "TC", "TT", "TPM_NALM6_TT_vs_TC")
+nalm6_tpm_tc_vs_cc <- run_deg_tpm_nalm6(sf.df.data, sample_metadata, "CC", "TC", "TPM_NALM6_TC_vs_CC")
+nalm6_tpm_tt_vs_cc <- run_deg_tpm_nalm6(sf.df.data, sample_metadata, "CC", "TT", "TPM_NALM6_TT_vs_CC")
+
+# 📊 Print volcano plots
+nalm6_tpm_tt_vs_tc$plot
+nalm6_tpm_tc_vs_cc$plot
+nalm6_tpm_tt_vs_cc$plot
+
+```
+
+# DEG analysis for NALM6 (TT, TC, CC) using limma-trend on TPM
+## Excluding TT Clone 1 and non-coding genes
+
+```{r}
+# ==============================================================
+# DEG analysis for NALM6 (TT, TC, CC) using limma-trend on TPM
+# Excluding TT Clone 1 and non-coding genes
+# ==============================================================
+
+suppressPackageStartupMessages({
+    library(dplyr)
+    library(tibble)
+    library(limma)
+    library(ggplot2)
+    library(ggrepel)
+})
+
+# 📂 1. Create output folder
+nalm6_polyA_outdir <- "PolyA_TPM_deg_results_NALM6_filtered"
+if (!dir.exists(nalm6_polyA_outdir)) dir.create(nalm6_polyA_outdir)
+
+# 🧮 Helper: counts → TPM
+counts_to_tpm <- function(counts, gene_lengths) {
+    rpk <- sweep(counts, 1, gene_lengths, "/")        
+    tpm <- apply(rpk, 2, function(x) x / sum(x, na.rm = TRUE) * 1e6)
+    return(tpm)
+}
+
+# 🧬 2. Function for limma-trend DEG on TPM
+run_deg_tpm_nalm6_filtered <- function(count_matrix, metadata, ref_genotype, test_genotype, out_prefix) {
+    
+    # ---- Filter metadata ----
+    meta_data <- metadata %>%
+        filter(cell_line == "NALM6",
+               genotype %in% c(ref_genotype, test_genotype),
+               sample_id_full != "NALM6_TT_1") %>%       # remove TT Clone 1
+        mutate(genotype = factor(genotype, levels = c(ref_genotype, test_genotype)))
+    
+    rownames(meta_data) <- meta_data$sample_id_full
+    
+    # ---- Subset count matrix ----
+    filtered_counts <- count_matrix[, meta_data$sample_id_full, drop = FALSE]
+    
+    # ---- Keep only coding genes ----
+    coding_genes <- gtf_df %>%
+        filter(type == "gene", gene_biotype == "protein_coding") %>%
+        pull(gene_id) %>% unique()
+    
+    filtered_counts <- filtered_counts[rownames(filtered_counts) %in% coding_genes, ]
+    
+    # ---- Gene lengths ----
+    gene_lengths <- gtf_df %>%
+        filter(type == "exon") %>%
+        group_by(gene_id) %>%
+        summarise(gene_length_kb = sum(width) / 1000, .groups = "drop")
+    
+    lengths_vec <- setNames(gene_lengths$gene_length_kb, gene_lengths$gene_id)
+    lengths_vec <- lengths_vec[rownames(filtered_counts)]
+    
+    # ---- Counts → TPM ----
+    tpm_matrix <- counts_to_tpm(filtered_counts, lengths_vec)
+    expr_log   <- log2(tpm_matrix + 1)
+    
+    # ---- Design ----
+    design <- model.matrix(~ genotype, data = meta_data)
+    colnames(design) <- c("Intercept", paste0(test_genotype,"_vs_",ref_genotype))
+    
+    # ---- limma-trend ----
+    fit <- lmFit(expr_log, design)
+    fit <- eBayes(fit, trend = TRUE)
+    coef_name <- colnames(design)[2]
+    
+    # ---- Results ----
+    tpm_res <- topTable(fit, coef = coef_name, number = Inf) %>%
+        rownames_to_column("gene_id") %>%
+        left_join(tx2gene_df %>% distinct(gene_id, gene_name), by = "gene_id") %>%
+        mutate(
+            significance = case_when(
+                P.Value <= 0.05 & logFC >=  0.2 ~ "up",
+                P.Value <= 0.05 & logFC <= -0.2 ~ "down",
+                TRUE ~ "ns"
+            )
+        ) %>%
+        filter(!is.na(P.Value), !is.na(logFC))
+    
+    # 💾 Save results
+    write.csv(tpm_res, file = file.path(nalm6_polyA_outdir, paste0(out_prefix, ".csv")), row.names = FALSE)
+    
+    # ---- Volcano plot ----
+    x_max <- max(abs(tpm_res$logFC), na.rm = TRUE)
+    y_max <- max(-log10(tpm_res$P.Value), na.rm = TRUE)
+    
+    highlight_gene <- "ENSG00000150347"  # ARID5B
+    highlight_data <- tpm_res %>% filter(gene_id == highlight_gene)
+    
+    volcano_plot <- ggplot(tpm_res, aes(x = logFC, y = -log10(P.Value),
+                                        fill = significance, alpha = significance)) +
+        geom_point(shape = 21, colour = "black", size = 2) +
+        geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "grey50") +
+        geom_vline(xintercept = c(-0.2, 0.2), linetype = "dashed", colour = "grey50") +
+        scale_fill_manual(values = c(up = "#D55E00", down = "#0072B2", ns = "grey80")) +
+        scale_alpha_manual(values = c(up = 0.9, down = 0.9, ns = 0.5), guide = "none") +
+        coord_cartesian(xlim = c(-x_max, x_max), ylim = c(0, y_max)) +
+        
+        # 🔵 Highlight ARID5B if present
+        geom_point(data = highlight_data, aes(x = logFC, y = -log10(P.Value)),
+                   color = "#1F77B4", fill = "white", shape = 21, size = 3) +
+        geom_label_repel(
+            data = highlight_data,
+            aes(x = logFC, y = -log10(P.Value),
+                label = ifelse(!is.na(gene_name), gene_name, gene_id)),
+            nudge_x = 2, nudge_y = 2,
+            color = "black", fill = "white",
+            fontface = "bold", size = 5,
+            box.padding = 0.5, point.padding = 0.3,
+            segment.color = "#1F77B4", segment.size = 1,
+            label.size = 0.4, label.r = unit(0.15, "lines"),
+            max.overlaps = Inf
+        ) +
+        theme_minimal(base_size = 14) +
+        labs(
+            title = paste0("PolyA Volcano (coding genes only; removed TT Clone 1): NALM6 ", test_genotype, " vs ", ref_genotype),
+            x = "log2 Fold Change", y = "-log10(p-value)", fill = "Significance"
+        )
+    
+    # 💾 Save plot
+    ggsave(
+        filename = file.path(nalm6_polyA_outdir, paste0(out_prefix, "_volcano.pdf")),
+        plot = volcano_plot,
+        width = 8, height = 6, units = "in"
+    )
+    
+    list(results = tpm_res, plot = volcano_plot)
+}
+
+# 🚀 Run filtered comparisons
+nalm6_polyA_tt_vs_tc <- run_deg_tpm_nalm6_filtered(sf.df.data, sample_metadata, "TC", "TT", "PolyA_TPM_NALM6_TT_vs_TC")
+nalm6_polyA_tc_vs_cc <- run_deg_tpm_nalm6_filtered(sf.df.data, sample_metadata, "CC", "TC", "PolyA_TPM_NALM6_TC_vs_CC")
+nalm6_polyA_tt_vs_cc <- run_deg_tpm_nalm6_filtered(sf.df.data, sample_metadata, "CC", "TT", "PolyA_TPM_NALM6_TT_vs_CC")
+
+# 📊 Print plots
+nalm6_polyA_tt_vs_tc$plot
+nalm6_polyA_tc_vs_cc$plot
+nalm6_polyA_tt_vs_cc$plot
 
 ```
 

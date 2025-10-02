@@ -1,6 +1,17 @@
 ```{r}
 # Load required libraries
 library(tidyverse)
+suppressPackageStartupMessages({
+    library(dplyr)
+    library(tibble)
+    library(limma)
+    library(ggplot2)
+    library(ggrepel)
+    library(stringr)
+    library(cowplot)
+    library(patchwork)
+})
+
 
 # Load genotype and expression data
 genotypes <- read_csv("Genotypes_gu_arid5b_rs7090445.csv", col_names = TRUE)
@@ -19,6 +30,7 @@ genotypes_clean <- genotypes %>%
   ))
 
 ```
+
 # Matching
 
 ```{r}
@@ -114,8 +126,8 @@ tb_pca %>%
 
 ```
 
-
 # T-SNE
+
 ```{r}
 # ---- t-SNE analysis ----
 library(Rtsne)
@@ -204,7 +216,6 @@ TukeyHSD(aov(expression ~ cluster, data = arid5b_expr_tsne))
 ```
 
 # Heatmap
-
 
 ```{r}
 # Use tsne_df which already has cluster assignments
@@ -342,7 +353,6 @@ ggplot2::ggplot(elbow_df, ggplot2::aes(x = k, y = wss)) +
 
 ```
 
-
 ```{r}
 # Load required libraries
 library(dplyr)
@@ -362,79 +372,43 @@ expression_scaled <- scale(expression_matrix)
 dist_matrix <- dist(expression_scaled, method = "euclidean")
 
 # Step 4: Perform hierarchical clustering
-hc <- hclust(dist_matrix, method = "ward.D2")
+# hc <- hclust(dist_matrix, method = "ward.D2")
 
 # Step 5: Cut tree into clusters (e.g., k = 3)
-cluster_labels <- cutree(hc, k = 5)
+#cluster_labels <- cutree(hc, k = 5)
 
-# Step 6: Create cluster assignment table
-sample_clusters <- tibble::tibble(
-    sample_id = rownames(expression_scaled),
-    cluster = cluster_labels
-)
-
-# Optional: View cluster counts
-print(table(sample_clusters$cluster))
+# # Step 6: Create cluster assignment table
+# sample_clusters <- tibble::tibble(
+#     sample_id = rownames(expression_scaled),
+#     cluster = cluster_labels
+# )
+# 
+# # Optional: View cluster counts
+# print(table(sample_clusters$cluster))
 
 ```
 
-
 # Dendrogram
+
 ```{r}
 # ---- Dendrogram with colored clusters ----
 library(ggdendro)
 
 # Cut tree into 4 clusters
-clusters_4 <- stats::cutree(hc, k = 5)
+#clusters_4 <- stats::cutree(hc, k = 5)
 
 # Plot dendrogram
-plot(hc, labels = FALSE, main = "Hierarchical Clustering Dendrogram (k=5)")
-rect.hclust(hc, k = 5, border = 2:5)  # add colored boxes
+#plot(hc, labels = FALSE, main = "Hierarchical Clustering Dendrogram (k=5)")
+#rect.hclust(hc, k = 5, border = 2:5)  # add colored boxes
 
 ```
 
 # Barplots and overlay
+
 ```{r}
-# ---- Merge cluster labels with metadata (k = 5) ----
-sample_clusters <- tibble::tibble(
-    sample_id = rownames(expression_scaled),
-    cluster = stats::cutree(hc, k = 5)   # directly use k=5 here
-)
-
-annotated_clusters <- sample_clusters %>%
-    dplyr::left_join(genotypes_clean, by = "sample_id")
-
-# ---- Cluster composition tables ----
-cat("Cluster composition by ancestry:\n")
-print(table(annotated_clusters$cluster, annotated_clusters$ancestry))
-
-cat("\nCluster composition by genotype:\n")
-print(table(annotated_clusters$cluster, annotated_clusters$genotype_label))
-
-# ---- Quick visualizations ----
-library(ggplot2)
-
-# Proportion of ancestry in each cluster
-ggplot(annotated_clusters, aes(x = factor(cluster), fill = ancestry)) +
-    geom_bar(position = "fill") +
-    theme_minimal() +
-    labs(
-        title = "Cluster composition by ancestry (k = 5)",
-        x = "Cluster",
-        y = "Proportion"
-    )
-
-# Proportion of genotype in each cluster
-ggplot(annotated_clusters, aes(x = factor(cluster), fill = genotype_label)) +
-    geom_bar(position = "fill") +
-    theme_minimal() +
-    labs(
-        title = "Cluster composition by genotype (k = 5)",
-        x = "Cluster",
-        y = "Proportion"
-    )
 
 ```
+
 # TSNE Heatmap
 
 ```{r}
@@ -508,88 +482,184 @@ ggplot(arid5b_expr, aes(x = factor(cluster), y = expression,
 
 ```
 
-# Iacobucci's dataset
+![](images/clipboard-696155630.png)
 
-# 1.1 — Load Iacobucci panel (wide) & expression matrix
+# Comparative Transcriptomics of rs7090445 Genotypes Across B-cell Developmental Stages on Leukemia Patients
+
+## 🇮🇹 Gene Panel
+
+# ![](images/clipboard-217625362.png){width="1457"}
+
+![](images/clipboard-753015269.png){width="1434" height="848"}
+
+## 👶🏽 Expression of 329 B-ALL pediatric patients
+
+![](images/clipboard-2437737040.png)
 
 ```{r}
-# 1.1 — Load Iacobucci panel (wide) & expression matrix ---------------
+## === Libraries (ALL used across the notebook) =========================
+suppressPackageStartupMessages({
+  library(tidyverse)      # dplyr, tidyr, readr, stringr, ggplot2, tibble
+  library(readxl)
+  library(biomaRt)
+  library(tidybulk)
+  library(ggrepel)
+  library(Rtsne)
+  library(pheatmap)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(knitr)
+  library(forcats)
+  library(scales)
+  library(ggdendro)
+  library(RColorBrewer)
+  library(grid)
+})
+
+## === Constants, palettes, helpers =====================================
+set.seed(123)
+
+# Output & cache dirs
+outdir  <- "Wenjians_plots_for_Utah"
+cachedir <- "cache"
+if (!dir.exists(outdir))  dir.create(outdir, recursive = TRUE)
+if (!dir.exists(cachedir)) dir.create(cachedir, recursive = TRUE)
+
+# Lineage order (single source of truth)
+ct_levels <- c("HSCMPP","GMP","pDC","EarlyLymphoid","ProB","PreB","B")
+
+# Consistent palettes
+cell_type_colors <- c(
+  HSCMPP        = "#fb8072",
+  GMP           = "#bebada",
+  pDC           = "#ffd92f",
+  EarlyLymphoid = "#f781bf",
+  ProB          = "#ff33ff",
+  PreB          = "#00e5c0",
+  B             = "#00bfff"
+)
+margin_colors <- c(
+   "Q1 (lowest)" = "#c7e9c0",
+    "Q2"          = "#a1d99b",
+    "Q3"          = "#74c476",
+    "Q4 (highest)"= "#238b45"
+)
+
+# Heatmap body breaks (diagnostics vs module/dominance)
+heat_breaks_diag <- seq(-2,  2, length.out = 201)
+heat_breaks_mod  <- seq(-1,  1, length.out = 201)
+```
+
+## 1.1 — Load Iacobucci panel (wide) & expression matrix
+
+```{r}
+## 1.1 — Load Iacobucci panel (wide) & expression matrix ---------------
 # Panel: 7 columns = cell types (wide)
-Iacobucci_cell_types <- readxl::read_xlsx("Iacobucci Cell Type (1).xlsx") 
+Iacobucci_cell_types <- readxl::read_xlsx("Iacobucci Cell Type (1).xlsx")
+
+# Light sanity checks
+stopifnot(is.data.frame(Iacobucci_cell_types))
+stopifnot(length(Iacobucci_cell_types) >= 7)  # expect ≥7 lineage columns
 
 # Expression: Ensembl rows × samples; keep 'gene' column intact
-expression <- read_csv("gu_arid5b_exp.csv", col_names = TRUE) %>%
-    rename_with(~ str_remove(., "_.*")) %>%
-    mutate(ensembl_id = sub("\\..*", "", gene))  # strip Ensembl version
+expression <- readr::read_csv("gu_arid5b_exp.csv", col_names = TRUE) %>%
+  dplyr::rename_with(~ stringr::str_remove(., "_.*")) %>%  # strip sample suffixes
+  dplyr::mutate(ensembl_id = sub("\\..*", "", gene))       # strip Ensembl version
+
+
 ```
-# 1.2 — Panel to data.frame, list all gene symbols (no dropping yet)
+
+## 1.2 — Panel to data.frame, list all gene symbols (no dropping yet)
 
 ```{r}
-# 1.2 — Panel to data.frame, list all gene symbols --------------------
+## 1.2 — Panel to data.frame, list all gene symbols --------------------
 # Keep as plain data.frame; trim stray spaces; DO NOT drop rows here.
 df <- as.data.frame(Iacobucci_cell_types) %>%
-  mutate(across(everything(), ~ trimws(as.character(.))))
+  dplyr::mutate(across(everything(), ~ trimws(as.character(.))))
+
+# Optional: enforce expected lineage column order if they match ct_levels
+if (all(sort(names(df)) == sort(ct_levels))) {
+  df <- df[, ct_levels, drop = FALSE]
+}
 
 # Collect all symbols that appear anywhere in the panel (may include NA/"")
 genes <- df %>%
-  pivot_longer(everything(), names_to = "cell_type", values_to = "gene") %>%
-  filter(!is.na(gene), gene != "") %>%
-  distinct(gene) %>%
-  pull(gene)
+  tidyr::pivot_longer(everything(), names_to = "cell_type", values_to = "gene") %>%
+  dplyr::filter(!is.na(gene), gene != "") %>%
+  dplyr::distinct(gene) %>%
+  dplyr::pull(gene)
 
 cat("Panel unique HGNC (pre-curation):", length(genes), "\n")
+
 ```
 
-# 1.3 — Validate symbols via BioMart (HGNC → basic info)
+## 1.3 — Validate symbols via BioMart (HGNC → basic info) with caching
 
 ```{r}
-# 1.3 — Validate symbols via BioMart ----------------------------------
+## 1.3 — Validate symbols via BioMart (cached) -------------------------
 ensembl <- biomaRt::useMart("ensembl", dataset = "hsapiens_gene_ensembl")
 
-valid_genes <- biomaRt::getBM(
-  attributes = c("hgnc_symbol", "ensembl_gene_id", "gene_biotype", "entrezgene_id"),
-  filters    = "hgnc_symbol",
-  values     = genes,
-  mart       = ensembl
-)
+cache_file <- file.path(cachedir, "biomart_hgnc_basic.rds")
+if (file.exists(cache_file)) {
+  valid_genes_all <- readRDS(cache_file)
+  # Keep only what we need now (fast path)
+  valid_genes <- valid_genes_all %>% dplyr::filter(hgnc_symbol %in% genes)
+} else {
+  valid_genes <- biomaRt::getBM(
+    attributes = c("hgnc_symbol", "ensembl_gene_id", "gene_biotype", "entrezgene_id"),
+    filters    = "hgnc_symbol",
+    values     = genes,
+    mart       = ensembl
+  ) %>%
+    dplyr::mutate(hgnc_symbol = dplyr::na_if(hgnc_symbol, "")) %>%
+    dplyr::distinct(hgnc_symbol, ensembl_gene_id, .keep_all = TRUE)
+  saveRDS(valid_genes, cache_file)
+}
 
 invalid_genes <- setdiff(genes, valid_genes$hgnc_symbol)
 
 cat("Valid HGNC returned by BioMart:", dplyr::n_distinct(valid_genes$hgnc_symbol), "\n")
 cat("Potentially invalid/missing symbols:", length(invalid_genes), "\n")
 if (length(invalid_genes)) {
-  print(invalid_genes)  # peek (won’t spam the console)
+  print(utils::head(invalid_genes, 20))  # peek without spamming
 }
 ```
 
-# 1.4 — Manual symbol curation (map/replace)
+## 1.4 — Manual symbol curation (map/replace)
 
 ```{r}
-# 1.4 — Manual symbol curation (map/replace), keep NAs -----------------
-# NOTE: We DO NOT na.omit() the wide panel; that would drop entire rows
-# if any single cell is NA. We'll drop NAs later only after pivot_longer.
-gene_updates <- c(
-  "TMEM173"   = "STING1",
-  "C11orf74"  = "IFTAP",
-  "MARC1"     = "MTARC1",
-  "C20orf27"  = "ADISSP",
-  "AC023590.1"= NA,        # remove
-  "AC002454.1"= NA,        # remove
-  "AP000345.2"= NA,        # remove
-  "H1FX"      = "H1-10",
-  "C16orf72"  = "HAPSTR1",
-  "HIST1H2BG" = "H2BC4",
-  "FAM214A"   = "ATOSA",
-  "CLECL1"    = "CLECL1P",
-  "MARCH1"    = "MARCHF1"
-)
+## 1.4 — Manual symbol curation (map/replace), keep NAs ----------------
+
+map_csv <- "hgnc_manual_map.csv"
+if (file.exists(map_csv)) {
+  # Expected columns: from, to (to can be NA for removal)
+  mu <- readr::read_csv(map_csv, show_col_types = FALSE)
+  stopifnot(all(c("from","to") %in% names(mu)))
+  gene_updates <- setNames(mu$to, mu$from)
+} else {
+  gene_updates <- c(
+    "TMEM173"   = "STING1",
+    "C11orf74"  = "IFTAP",
+    "MARC1"     = "MTARC1",
+    "C20orf27"  = "ADISSP",
+    "AC023590.1"= NA,        # remove
+    "AC002454.1"= NA,        # remove
+    "AP000345.2"= NA,        # remove
+    "H1FX"      = "H1-10",
+    "C16orf72"  = "HAPSTR1",
+    "HIST1H2BG" = "H2BC4",
+    "FAM214A"   = "ATOSA",
+    "CLECL1"    = "CLECL1P",
+    "MARCH1"    = "MARCHF1"
+  )
+}
 
 df_updated <- df %>%
-  mutate(across(
+  dplyr::mutate(across(
     everything(),
     ~ dplyr::if_else(. %in% names(gene_updates), gene_updates[.], .)
   )) %>%
-  mutate(across(everything(), ~ na_if(., "")))  # treat empty string as NA
+  dplyr::mutate(across(everything(), ~ dplyr::na_if(., "")))  # treat empty string as NA
 
 # Quick snapshot: how many NAs per cell type after curation
 na_counts <- colSums(is.na(df_updated))
@@ -601,85 +671,127 @@ head(df_updated)
 
 ```
 
-## 1.5 — 🔍 Panel duplicate check (genes across >1 cell type) -----------
-### Why? Some genes are assigned to more than one cell type in the panel.
+## 1.5 — 🔍 Panel duplicate check (genes across \>1 cell type)
 
 ```{r}
+## 1.5 — Duplicate marker check across cell types ----------------------
 panel_dups <- df_updated %>%
-  pivot_longer(everything(), names_to = "cell_type", values_to = "gene") %>%
-  filter(!is.na(gene), gene != "") %>%
-  group_by(gene) %>%
-  summarise(cell_types = paste(unique(cell_type), collapse = ", "),
-            n_cell_types = n_distinct(cell_type),
-            .groups = "drop") %>%
-  filter(n_cell_types > 1) %>%
-  arrange(gene)
+  tidyr::pivot_longer(everything(), names_to = "cell_type", values_to = "gene") %>%
+  dplyr::filter(!is.na(gene), gene != "") %>%
+  dplyr::group_by(gene) %>%
+  dplyr::summarise(
+    cell_types   = paste(unique(cell_type), collapse = ", "),
+    n_cell_types = dplyr::n_distinct(cell_type),
+    .groups = "drop"
+  ) %>%
+  dplyr::filter(n_cell_types > 1) %>%
+  dplyr::arrange(gene)
 
 # Preview as a compact table
 panel_dups
+
 ```
 
-# 2 — Map expression IDs to HGNC & prep the panel
-## 2.1 — 🧭 Map Ensembl IDs → HGNC symbols
+## 2 — Map expression IDs to HGNC & prep the panel
 
-Why? The expression matrix is indexed by Ensembl IDs. We need HGNC symbols so we can match to the panel genes.
+### 2.1 — 🧭 Map Ensembl IDs → HGNC symbols
+
+**Goal:** Attach HGNC symbols to the expression matrix. **Inputs:** `expression` (with `ensembl_id`), `ensembl` (BioMart handle). **Outputs:** `gene_map`, `expression_with_symbol`. **QC:** Mapping rate; missing symbols; guardrails on numeric sample columns.
 
 ```{r}
+## 2.1 — Map Ensembl IDs → HGNC symbols --------------------------------
+# Preconditions
+stopifnot(all(c("gene", "ensembl_id") %in% names(expression)))
+stopifnot(!anyDuplicated(expression$ensembl_id))
+
 # Query Ensembl once for all Ensembl IDs observed in expression
 gene_map <- biomaRt::getBM(
   attributes = c("ensembl_gene_id", "hgnc_symbol"),
-  filters    = "ensembl_gene_id",
+  filters    = "ensembl_gene_id",  # corrected filter name
   values     = unique(expression$ensembl_id),
   mart       = ensembl
 ) %>%
-  dplyr::mutate(hgnc_symbol = dplyr::na_if(hgnc_symbol, "")) %>%
-  dplyr::distinct(ensembl_gene_id, .keep_all = TRUE)
+  dplyr::mutate(hgnc_symbol = dplyr::na_if(hgnc_symbol, "")) %>%  # normalize empties
+  dplyr::distinct(ensembl_gene_id, .keep_all = TRUE)              # 1:1 key → value
 
-# Attach HGNC to the expression table
+# Optional: cache the mapping
+saveRDS(gene_map, file.path(cachedir, "ensembl_to_hgnc_map.rds"))
+
+# Attach HGNC to the expression table (no row drops here)
 expression_with_symbol <- expression %>%
   dplyr::left_join(gene_map, by = c("ensembl_id" = "ensembl_gene_id"))
 
-cat("Mapped Ensembl→HGNC for",
-    sum(!is.na(expression_with_symbol$hgnc_symbol)),
-    "rows out of", nrow(expression_with_symbol), "\n")
+# QC / reporting
+mapped_n   <- sum(!is.na(expression_with_symbol$hgnc_symbol))
+total_n    <- nrow(expression_with_symbol)
+missing_n  <- total_n - mapped_n
+dup_in_map <- any(duplicated(gene_map$ensembl_gene_id))
+
+cat("Ensembl→HGNC mapping rate:", sprintf("%d / %d (%.1f%%)\n",
+    mapped_n, total_n, 100 * mapped_n / total_n))
+cat("Missing HGNC symbols:", missing_n, "\n")
+if (dup_in_map) warning("Duplicated ensembl_gene_id detected in gene_map (unexpected).")
+
+# Guardrail: confirm sample columns are numeric
+.num_ok <- vapply(
+  expression_with_symbol[, setdiff(names(expression_with_symbol),
+                                   c("gene", "ensembl_id", "hgnc_symbol")), drop = FALSE],
+  is.numeric, logical(1)
+)
+stopifnot(all(.num_ok))
+rm(.num_ok)
 ```
 
-## 2.2 — 🧬 Build the panel gene list & check coverage
+### 2.2 — 🧬 Build panel gene list & check coverage
 
-Why? See how many of our curated panel genes are present in the expression matrix.
+**Goal:** Determine how many curated panel genes appear in the expression table. **Inputs:** `df_updated`, `expression_with_symbol`. **Outputs:** `panel_genes`, `present`, `missing`, lineage-level coverage table. **QC:** Panel size; present/missing counts (overall and per lineage).
 
 ```{r}
-# 2.2 — Build the panel gene list & check coverage --------------------
-panel_genes <- df_updated %>%
+## 2.2 — Build the panel gene list & check coverage --------------------
+# Panel genes (HGNC), from curated panel
+panel_long <- df_updated %>%
   tidyr::pivot_longer(everything(), names_to = "cell_type", values_to = "gene") %>%
-  dplyr::filter(!is.na(gene), gene != "") %>%
+  dplyr::filter(!is.na(gene), gene != "")
+
+panel_genes <- panel_long %>%
   dplyr::distinct(gene) %>%
   dplyr::pull(gene)
 
-# Which panel genes are present (by HGNC) in the expression table?
+# Present/missing in expression (by HGNC symbol)
 present <- intersect(panel_genes,
                      unique(stats::na.omit(expression_with_symbol$hgnc_symbol)))
 missing <- setdiff(panel_genes, present)
 
 cat("Panel size (unique HGNC):", length(panel_genes), "\n")
-cat("Present in expression:", length(present), "\n")
-cat("Missing from expression:", length(missing), "\n")
+cat("Present in expression:",   length(present),      "\n")
+cat("Missing from expression:", length(missing),      "\n")
 if (length(missing)) {
   cat("Missing (first 20):", paste(utils::head(missing, 20), collapse = ", "), "\n")
 }
 
+# Coverage by lineage (ordered as ct_levels)
+coverage_tbl <- panel_long %>%
+  dplyr::group_by(cell_type) %>%
+  dplyr::summarise(
+    panel_n   = dplyr::n_distinct(gene),
+    present_n = dplyr::n_distinct(gene[gene %in% present]),
+    missing_n = panel_n - present_n,
+    present_pct = round(100 * present_n / panel_n, 1),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(cell_type = factor(cell_type, levels = ct_levels)) %>%
+  dplyr::arrange(cell_type)
+
+coverage_tbl
+
 ```
-## 2.3 — 🔁 Handle duplicates (multiple Ensembl rows per HGNC)
 
-Why? Some HGNC symbols appear multiple times (different Ensembl IDs, isoforms, etc.).
-We’ll (A) report duplicates, and (B) produce two flavors for downstream plots:
+### 2.3 — 🔁 Handle duplicated Ensembl rows per HGNC
 
- * Unique-only (drop duplicated HGNCs entirely) — conservative visualization.
-
- * Collapsed by symbol (take MAX across Ensembl rows) — robust & keeps all symbols.
+**Goal:** Tame 1:many (Ensembl→HGNC) by (A) dropping duplicated HGNCs (unique-only) and (B) collapsing to one row per HGNC using MAX. **Inputs:** `expression_with_symbol`, `panel_genes`. **Outputs:** `expression_panel`, `expression_panel_unique`, `expr_by_symbol`, `dup_summary`. **QC:** Number of duplicated HGNCs; unique-only gene count.
 
 ```{r}
-# 2.3 — Handle duplicates (report + two flavors) ----------------------
+## 2.3 — Handle duplicates (report + two flavors) ----------------------
 # Keep only rows that have an HGNC symbol AND belong to the panel
 expression_panel <- expression_with_symbol %>%
   dplyr::filter(!is.na(hgnc_symbol), hgnc_symbol %in% panel_genes)
@@ -692,163 +804,175 @@ dup_summary <- expression_panel %>%
 
 dup_symbols <- dup_summary$hgnc_symbol
 
-cat("Duplicated HGNC in panel:", length(dup_symbols), "\n")
-if (nrow(dup_summary)) print(utils::head(dup_summary, 12))
-
 # (A) Unique-only flavor (drop all duplicated HGNCs)
 expression_panel_unique <- expression_panel %>%
   dplyr::filter(!hgnc_symbol %in% dup_symbols)
+
+cat("Unique-only genes:",
+    dplyr::n_distinct(expression_panel_unique$hgnc_symbol), "\n")
 
 # (B) Collapsed-by-symbol flavor (take MAX across rows for each HGNC)
 #     NOTE: change max → mean/sum if you prefer a different aggregator.
 expr_by_symbol <- expression_panel %>%
   dplyr::select(hgnc_symbol, where(is.numeric)) %>%
   dplyr::group_by(hgnc_symbol) %>%
-  dplyr::summarise(dplyr::across(where(is.numeric), ~ max(., na.rm = TRUE)),
-                   .groups = "drop")
-
-cat("Unique-only genes:", dplyr::n_distinct(expression_panel_unique$hgnc_symbol), "\n")
+  dplyr::summarise(
+    dplyr::across(where(is.numeric), ~ max(., na.rm = TRUE)),
+    .groups = "drop"
+  )
 ```
 
-#3 — 🔥 Heatmap explorations
-##3.1 — Heatmap of unique HGNC only
-Here we take only panel genes that map uniquely to one Ensembl ID. We log2-transform the counts, drop flat genes, and standardize each gene (row-wise z-score). That means each gene’s values are centered around 0 with SD = 1, so we’re comparing patterns, not absolute abundance.
-```{r}
-# 1. Select numeric columns + HGNC symbol
-heatmap_mat <- expression_panel_unique %>%
-  select(hgnc_symbol, where(is.numeric)) %>%
-  as.data.frame()
+## 3 — 🔥 Heatmap explorations
 
-# 2. Set rownames and drop symbol column
+### 3.1 — Heatmap of unique HGNC only
+
+**Goal:** Sanity-check marker patterns using only panel genes that map uniquely to one Ensembl ID. **Output:** `pheatmap` of row-z-scored expression.
+
+#### 📊 What is a z-score?
+
+A **z-score** (or standard score) tells you how far a value is from the mean, measured in units of standard deviation. It is a method of **normalizing data**, allowing different features or samples to be compared on the same scale regardless of their original units or ranges.
+
+-   A z-score of **0** means the value is equal to the mean.
+-   A z-score of **+1** means the value is one standard deviation **above** the mean.
+-   A z-score of **–1** means the value is one standard deviation **below** the mean.
+
+Z-scores are commonly used in heatmaps, clustering, and dimensionality reduction to emphasize relative patterns rather than absolute magnitudes.
+
+![](https://vitalflux.com/wp-content/uploads/2022/01/z-scores-formula-concepts-and-examples.jpg){alt="Z-score or Z-statistics: Concepts, Formula & Examples - Analytics Yogi"}
+
+```{r}
+## 3.1 — Unique HGNC-only heatmap -------------------------------------
+# 1) Numeric matrix with HGNC as rownames
+heatmap_mat <- expression_panel_unique %>%
+  dplyr::select(hgnc_symbol, where(is.numeric)) %>%
+  as.data.frame()
 rownames(heatmap_mat) <- heatmap_mat$hgnc_symbol
 heatmap_mat$hgnc_symbol <- NULL
 
-# 3. Log2-transform for visualization
+# 2) Log2(x+1), drop flat rows, row z-score, clip to [-2, 2]
 heatmap_mat <- log2(heatmap_mat + 1)
-
-# 4. Drop genes with zero variance (flat rows)
-zero_var_genes <- apply(heatmap_mat, 1, function(x) var(x, na.rm = TRUE) == 0)
-heatmap_mat_filtered <- heatmap_mat[!zero_var_genes, ]
-
-# 5. Row-wise z-score scaling (mean=0, sd=1), clip to [-2,+2]
-heatmap_scaled <- t(scale(t(heatmap_mat_filtered)))
+zero_var <- apply(heatmap_mat, 1, function(x) var(x, na.rm = TRUE) == 0)
+heatmap_scaled <- t(scale(t(heatmap_mat[!zero_var, , drop = FALSE])))
 heatmap_scaled <- pmin(pmax(heatmap_scaled, -2), 2)
 
-# 6. Draw heatmap
-pheatmap(
+# 3) Plot (use default palette/scale from pheatmap)
+pheatmap::pheatmap(
   heatmap_scaled,
-  cluster_rows = FALSE,  # keep order as given
-  cluster_cols = TRUE,   # cluster samples
+  cluster_rows  = FALSE,
+  cluster_cols  = TRUE,
   show_rownames = TRUE,
   show_colnames = FALSE,
-  main = "Panel genes (unique HGNC only; duplicates removed)"
+  main          = "Panel genes (unique HGNC only; duplicates removed)"
 )
 
+
 ```
-## 3.2 — Heatmap of gene × cell type pairs
 
-Now we re-introduce duplicates: if a gene belongs to multiple cell types, it appears multiple times (once per assignment). This lets you see overlap across compartments. Again, we log2, z-score but this time rows are labeled GENE|CELLTYPE. The heatmap highlights shared markers and whether they behave differently depending on their assigned lineage.
+### 3.2 — Heatmap of gene × cell type pairs
+
+**Goal:** Reintroduce duplicates so that if a gene belongs to multiple cell types, it appears multiple times (rows labeled as `GENE|CELLTYPE`).\
+**Output:** Heatmap with row annotations showing lineage assignments.
+
 ```{r}
-# 1. Expand panel into long form: one row per gene × cell_type
+## 3.2 — Heatmap of gene × cell type pairs -----------------------------
+# 1) Expand panel into long form
 panel_long <- df_updated %>%
-  pivot_longer(everything(), names_to = "cell_type", values_to = "gene") %>%
-  filter(!is.na(gene), gene != "")
+  tidyr::pivot_longer(everything(), names_to = "cell_type", values_to = "gene") %>%
+  dplyr::filter(!is.na(gene), gene != "")
 
-# 2. Collapse Ensembl → HGNC many-to-one with MAX
+# 2) Collapse Ensembl→HGNC many-to-one with MAX
 expr_by_symbol <- expression_with_symbol %>%
-  select(hgnc_symbol, where(is.numeric)) %>%
-  filter(!is.na(hgnc_symbol)) %>%
-  group_by(hgnc_symbol) %>%
-  summarise(across(where(is.numeric), ~ max(., na.rm = TRUE)), .groups = "drop")
+  dplyr::select(hgnc_symbol, where(is.numeric)) %>%
+  dplyr::filter(!is.na(hgnc_symbol)) %>%
+  dplyr::group_by(hgnc_symbol) %>%
+  dplyr::summarise(across(where(is.numeric), ~ max(., na.rm = TRUE)), .groups = "drop")
 
-# 3. Keep only panel genes with expression
+# 3) Keep only panel genes
 panel_long_expr <- panel_long %>%
-  inner_join(expr_by_symbol, by = c("gene" = "hgnc_symbol"))
+  dplyr::inner_join(expr_by_symbol, by = c("gene" = "hgnc_symbol"))
 
-cat("Panel unique genes:", length(unique(panel_long$gene)), "\n")
-cat("Present:", length(unique(panel_long_expr$gene)), "\n")
-cat("Missing:", length(setdiff(unique(panel_long$gene),
-                               unique(panel_long_expr$gene))), "\n")
-
-# 4. Build heatmap matrix with "GENE|CELLTYPE" as row_id
+# 4) Build matrix with "GENE|CELLTYPE" row IDs
 heatmap_mat2 <- panel_long_expr %>%
-  mutate(row_id = paste(gene, cell_type, sep = "|")) %>%
-  select(row_id, where(is.numeric)) %>%
-  column_to_rownames("row_id") %>%
+  dplyr::mutate(row_id = paste(gene, cell_type, sep = "|")) %>%
+  dplyr::select(row_id, where(is.numeric)) %>%
+  tibble::column_to_rownames("row_id") %>%
   as.matrix()
 
-# 5. Transform, scale, clip
+# 5) Log2, drop flat rows, row z-score, clip to [-2, 2]
 heatmap_mat2 <- log2(heatmap_mat2 + 1)
 zero_var2 <- apply(heatmap_mat2, 1, function(x) var(x, na.rm = TRUE) == 0)
 heatmap_scaled2 <- t(scale(t(heatmap_mat2[!zero_var2, , drop = FALSE])))
 heatmap_scaled2 <- pmin(pmax(heatmap_scaled2, -2), 2)
 
-# 6. Row annotations: cell type for each row
+# 6) Row annotations (cell type per row)
 row_annot <- panel_long_expr %>%
-  mutate(row_id = paste(gene, cell_type, sep = "|")) %>%
-  distinct(row_id, cell_type) %>%
-  column_to_rownames("row_id")
+  dplyr::mutate(row_id = paste(gene, cell_type, sep = "|")) %>%
+  dplyr::distinct(row_id, cell_type) %>%
+  tibble::column_to_rownames("row_id")
+row_annot_aligned <- row_annot[rownames(heatmap_scaled2), , drop = FALSE]
+row_annot_aligned$cell_type <- factor(row_annot_aligned$cell_type, levels = ct_levels)
 
-# 7. Plot
-pheatmap(
+# 7) Plot
+pheatmap::pheatmap(
   heatmap_scaled2,
-  cluster_rows = FALSE,
-  cluster_cols = TRUE,
+  cluster_rows  = FALSE,
+  cluster_cols  = TRUE,
   show_rownames = TRUE,
   show_colnames = FALSE,
-  annotation_row = row_annot["cell_type", drop = FALSE],
+  annotation_row = row_annot_aligned["cell_type", drop = FALSE],
+  annotation_colors = list(cell_type = cell_type_colors),
   main = "🔥 Panel genes (HGNC collapsed; gene×cell_type rows preserved)"
 )
 
 ```
 
-## 3.3 — Heatmap with rows ordered by cell type
-Here we tidy the view by grouping rows by their cell type (e.g., all HSCMPP genes together, then GMP, etc.) and adding visual gaps between blocks. Genes inside each block are ordered alphabetically. This doesn’t change the data but makes the heatmap more interpretable.
+### 3.3 — Heatmap with rows ordered by cell type
+
+**Goal:** Organize rows by cell type, with genes ordered alphabetically within each block and visual gaps between groups.\
+**Output:** Cleaner heatmap where lineage modules are visually separated.
 
 ```{r}
-# 3.3 — Heatmap: rows ordered by cell type ----------------------------
-cell_order <- colnames(df_updated)  # use panel’s cell-type order
-
-# Ensure row annotation matches current heatmap rows
+## 3.3 — Heatmap ordered by cell type ---------------------------------
+# Ensure annotation matches rows
 row_annot2 <- row_annot[rownames(heatmap_scaled2), , drop = FALSE]
-row_annot2$cell_type <- factor(row_annot2$cell_type, levels = cell_order)
+row_annot2$cell_type <- factor(row_annot2$cell_type, levels = ct_levels)
 
-# Order rows: first by cell type, then alphabetically by gene
+# Order rows by (cell type → gene)
 gene_from_row <- sub("\\|.*$", "", rownames(heatmap_scaled2))
 row_order <- order(row_annot2$cell_type, gene_from_row)
-
 hm_ordered <- heatmap_scaled2[row_order, , drop = FALSE]
 row_annot_ordered <- row_annot2[row_order, , drop = FALSE]
 
-# Add gaps between blocks
+# Gaps between blocks
 group_sizes <- table(row_annot_ordered$cell_type)
 gaps_row <- cumsum(head(as.integer(group_sizes), -1))
 
 # Plot
-pheatmap(
+pheatmap::pheatmap(
   hm_ordered,
-  cluster_rows = FALSE,
-  cluster_cols = TRUE,
+  cluster_rows  = FALSE,
+  cluster_cols  = TRUE,
   show_rownames = FALSE,
   show_colnames = FALSE,
   annotation_row = row_annot_ordered["cell_type", drop = FALSE],
+  annotation_colors = list(cell_type = cell_type_colors),
   gaps_row = gaps_row,
   main = "Panel genes (grouped by cell type)"
 )
 
 ```
 
-## 3.4 — Cell-type module scores
+### 3.4 — Cell-type module scores
 
-This step collapses all marker genes of a given cell type into a single average profile. For each sample, the average of standardized (z-scored) gene values is computed, yielding one “module score” per cell type per sample. Positive values mean markers for that lineage are higher than expected; negative values mean lower. The resulting heatmap (7 rows × 329 samples) shows which cell type signatures are enriched per sample.
+**Goal:** Collapse marker genes into a single average profile per lineage, across all samples.\
+**Output:** Heatmap of mean z-scores (7 lineages × N samples).
 
 ```{r}
-# 3.4 — Cell-type module scores (7 rows × N samples) ------------------
-ct_levels <- colnames(df_updated)
+## 3.4 — Cell-type module scores --------------------------------------
 ct_by_row <- row_annot[rownames(heatmap_scaled2), "cell_type", drop = TRUE]
 ct_by_row <- factor(ct_by_row, levels = ct_levels)
 
-# Compute mean z-score per cell type
+# 1) Average z-score per cell type
 split_idx <- split(seq_len(nrow(heatmap_scaled2)), ct_by_row)
 avg_z_by_ct <- vapply(
   split_idx,
@@ -858,64 +982,1287 @@ avg_z_by_ct <- vapply(
 avg_z_by_ct <- t(avg_z_by_ct)
 rownames(avg_z_by_ct) <- levels(ct_by_row)
 
-# Plot
-pheatmap(
+# 2) Plot
+pheatmap::pheatmap(
   avg_z_by_ct,
-  cluster_rows = FALSE,
-  cluster_cols = TRUE,
+  cluster_rows  = FALSE,
+  cluster_cols  = TRUE,
   show_rownames = TRUE,
   show_colnames = FALSE,
   main = "Cell-type module scores (mean z per cell type)"
 )
 
-# Quick diagnostics: how many markers per cell type
-print(table(ct_by_row))
-
-
-
-```
-
-### 3.4.1
-Quick diagnostics: marker counts & top cell type per sample ----
-
-```{r}
-# How many markers were used per cell type group
+# 3) Diagnostics
 cat("Markers per cell type:\n")
 print(table(ct_by_row))
 
-# For each sample (column), which cell type has the highest avg z-score?
+```
+
+### 3.4.1 — Diagnostics
+
+**Goal:** Quick checks of module scores. Count markers per cell type and identify the top lineage per sample.\
+**Output:** Tables showing frequency and proportion of dominant cell types.
+
+```{r}
+## 3.4.1 — Diagnostics -------------------------------------------------
 top_ct <- apply(avg_z_by_ct, 2, function(v) names(which.max(v)))
 
 cat("\nTop cell type per sample (frequency):\n")
 print(sort(table(top_ct), decreasing = TRUE))
 
-# Add proportions (frequency / total samples)
-top_ct_freq <- sort(table(top_ct), decreasing = TRUE)
-top_ct_prop <- round(100 * top_ct_freq / ncol(avg_z_by_ct), 1)
-
 cat("\nTop cell type per sample (proportions %):\n")
-print(top_ct_prop)
+print(round(100 * sort(table(top_ct), decreasing = TRUE) / ncol(avg_z_by_ct), 1))
 
 ```
 
+### 3.5 — Tian’s method: column-scaled dominance
 
-
-
-# Things as for 
+**Goal:** Assign each sample to its strongest lineage relative to others. Confidence is measured as the margin between the best and second-best lineage scores.\
+**Output:** Annotated heatmap with winner lineages and dominance margins.
 
 ```{r}
-Keep the cell types on the row
-Separate the columns wether they have been classified (brake the columns into 7 separate groups)
-Within each, sort them (order them) based on which ones are the most red 
-Within the reddest B people (and any other group), separate them based on snp genotype and plot their avg expression (3 boxplots)
+## 3.5 — Tian’s method: column-scaled dominance -----------------------
+stopifnot(exists("avg_z_by_ct"))
+
+# 1) Winner, runner-up, margin
+top_idx    <- apply(avg_z_by_ct, 2, which.max)
+second_idx <- apply(avg_z_by_ct, 2, function(v) order(v, decreasing = TRUE)[2])
+dominant_tbl <- tibble::tibble(
+  sample       = colnames(avg_z_by_ct),
+  top_ct       = ct_levels[top_idx],
+  top_score    = mapply(function(j,i)  avg_z_by_ct[i,  j], seq_along(top_idx),    top_idx),
+  second_ct    = ct_levels[second_idx],
+  second_score = mapply(function(j,i2) avg_z_by_ct[i2, j], seq_along(second_idx), second_idx)
+) %>%
+  dplyr::mutate(margin = top_score - second_score)
+
+# 2) Column order (winner → margin → top_score)
+col_order <- order(
+  factor(dominant_tbl$top_ct, levels = ct_levels),
+  -dominant_tbl$margin,
+  -dominant_tbl$top_score
+)
+avg_z_by_ct_ord <- avg_z_by_ct[, col_order, drop = FALSE]
+dominant_tbl    <- dominant_tbl[col_order, ]
+
+# 3) Annotations
+margin_bins <- cut(
+  dominant_tbl$margin,
+  breaks = quantile(dominant_tbl$margin, probs = seq(0,1,0.25), na.rm = TRUE),
+  include.lowest = TRUE,
+  labels = c("Q1 (lowest)","Q2","Q3","Q4 (highest)")
+)
+ann_col <- data.frame(
+  top_ct = factor(dominant_tbl$top_ct, levels = ct_levels),
+  margin = margin_bins,
+  row.names = dominant_tbl$sample
+)
+
+# 4) Plot (pheatmap)
+pheatmap::pheatmap(
+  avg_z_by_ct_ord,
+  cluster_rows   = FALSE,
+  cluster_cols   = FALSE,
+  show_rownames  = TRUE,
+  show_colnames  = FALSE,
+  annotation_col = ann_col,
+  annotation_colors = list(top_ct = cell_type_colors, margin = margin_colors),
+  gaps_col = cumsum(rle(as.character(ann_col$top_ct))$lengths)[-length(rle(as.character(ann_col$top_ct))$lengths)],
+  gaps_row = seq_len(nrow(avg_z_by_ct_ord) - 1),
+  border_color = NA,
+  main = "Per-sample dominant lineage (grouped by winner; margin annotated)"
+)
+
 ```
+
+![](images/clipboard-1004366631.png)
+
+-   For each sample (a column in `avg_z_by_ct`):
+    -   Find the **top lineage** (highest average z-score).
+    -   Find the **second best lineage**.
+    -   Compute the **margin = top_score − second_score**.
+-   This margin quantifies **how confident** the assignment is:
+    -   A large margin → winner is much stronger than runner-up.
+    -   A small margin → winner is only slightly better than runner-up.
+
+#### 3.5.1 — ComplexHeatmap version of dominance heatmap
+
+```{r}
+## 3.5.1 — ComplexHeatmap dominance heatmap ----------------------------
+
+# Column split: by winner lineage (top_ct)
+col_split <- ann_col$top_ct
+
+# Row split: each lineage as its own group
+row_split <- factor(rownames(avg_z_by_ct_ord), levels = rownames(avg_z_by_ct_ord))
+
+# Heatmap color scale (consistent, clamp to [-1, 1])
+col_fun <- circlize::colorRamp2(
+  seq(-1, 1, length.out = 201),
+  colorRampPalette(c("blue", "white", "red"))(201)
+)
+
+# Column annotations (reuse global palettes)
+ha <- ComplexHeatmap::HeatmapAnnotation(
+  margin  = ann_col$margin,
+  top_ct  = ann_col$top_ct,
+  col     = list(
+    margin = margin_colors,
+    top_ct = cell_type_colors
+  ),
+  annotation_name_side = "left"
+)
+
+# Build heatmap
+ht2 <- ComplexHeatmap::Heatmap(
+  avg_z_by_ct_ord,
+  name = "z-score",
+  col = col_fun,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  row_split = row_split,      # lineage bands
+  column_split = col_split,   # sample groups
+  show_row_names = TRUE,
+  show_column_names = FALSE,
+  top_annotation = ha,
+  border = TRUE,
+  column_title = "Per-sample dominant lineage (grouped by winner; margin annotated)",
+  column_title_gp = grid::gpar(fontsize = 12, fontface = "bold")
+)
+
+# Draw
+draw(ht2, heatmap_legend_side = "right", annotation_legend_side = "right")
+
+```
+
+## 4 — 🧬 ARID5B per genotype
+
+### 4.1 — Merge lineage calls with genotype and ARID5B expression
+
+**Goal:** Combine dominant lineage calls with genotype and ARID5B expression per sample.\
+**Output:** Clean merged dataset for downstream summaries and plots.
+
+```{r}
+## 4.1 — Merge lineage calls with genotype+ARID5B ----------------------
+
+# Use lineage calls from 3.5
+calls_35 <- dominant_tbl %>%
+  transmute(COMPBIOID = sample, top_ct)
+
+# Map genotypes + ARID5B expression
+geno_clean <- genotypes %>%
+  distinct(COMPBIOID, .keep_all = TRUE) %>%
+  transmute(
+    COMPBIOID,
+    ancestry,
+    genotype_code = as.integer(rs7090445),
+    genotype = case_when(
+      genotype_code == 0 ~ "CC",
+      genotype_code == 1 ~ "CT",
+      genotype_code == 2 ~ "TT",
+      TRUE ~ NA_character_
+    ),
+    ARID5B_expr = `ENSG00000150347`
+  ) %>%
+  mutate(genotype = factor(genotype, levels = c("CC","CT","TT")))
+
+# Merge both
+merged <- calls_35 %>%
+  inner_join(geno_clean, by = "COMPBIOID") %>%
+  filter(!is.na(genotype), !is.na(ARID5B_expr)) %>%
+  mutate(
+    top_ct = factor(top_ct, levels = ct_levels),
+    ARID5B_log2p1 = log2(ARID5B_expr + 1)
+  )
+
+cat("Samples retained after join & filtering:", nrow(merged), "\n")
+```
+
+### 4.2 — Counts per lineage × genotype
+
+**Goal:** Tabulate how many samples fall into each lineage/genotype combination.\
+**Output:** Wide contingency table (rows = lineage, columns = genotype).
+
+```{r}
+counts_tbl <- merged %>%
+  count(top_ct, genotype) %>%
+  tidyr::pivot_wider(
+    names_from  = genotype,
+    values_from = n,
+    values_fill = 0
+  ) %>%
+  arrange(top_ct)
+
+counts_tbl
+```
+
+### 4.3 — Summary statistics of ARID5B expression
+
+**Goal:** Describe ARID5B expression distribution within each lineage × genotype group.\
+**Output:** Table with n, median, mean, and SD.
+
+```{r}
+## 4.3 — Summary stats per lineage × genotype ------------------------
+summary_tbl <- merged %>%
+  group_by(top_ct, genotype) %>%
+  summarise(
+    n      = n(),
+    median = median(ARID5B_expr, na.rm = TRUE),
+    mean   = mean(ARID5B_expr, na.rm = TRUE),
+    sd     = sd(ARID5B_expr, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(top_ct, genotype)
+
+summary_tbl
+```
+
+### 4.4 — Non-parametric test (Kruskal–Wallis)
+
+**Goal:** Test whether ARID5B expression differs across genotypes within each lineage.\
+**Output:** Compact table of Kruskal–Wallis p-values.
+
+```{r}
+kw_tbl <- merged %>%
+  group_by(top_ct) %>%
+  summarise(
+    groups = n_distinct(genotype),
+    n      = n(),
+    kw_p   = if (groups >= 2) suppressWarnings(
+                kruskal.test(ARID5B_expr ~ genotype)$p.value
+             ) else NA_real_,
+    .groups = "drop"
+  ) %>%
+  arrange(top_ct)
+
+kw_tbl
+```
+
+### 4.5 — ARID5B expression by genotype (violin + boxplots)
+
+**Goal:** Visualize ARID5B expression distributions across genotypes within each lineage.\
+**Output:** Faceted violin/boxplot with jittered points.
+
+```{r}
+## 4.5 — Plot ARID5B expression by genotype --------------------------
+ARID5B_by_genotype_log <- ggplot(merged, aes(x = genotype, y = ARID5B_log2p1)) +
+  geom_violin(trim = FALSE, alpha = 0.6) +
+  geom_boxplot(width = 0.2, outlier.shape = NA) +
+  geom_jitter(width = 0.08, alpha = 0.5, size = 1) +
+  facet_wrap(~ top_ct, scales = "free_y") +
+  labs(
+    title = "ARID5B log2(x+1) by genotype within lineage calls",
+    x = "Genotype (rs7090445)", y = "ARID5B log2(x+1)"
+  ) +
+  theme_minimal(base_size = 12)
+
+ARID5B_by_genotype_log
+```
+
+## 5 — 📊 Stacked barplots of dominant lineage × genotype
+
+### 5.1 — Per-ancestry stacked barplots
+
+**Goal:** Within each ancestry, show the distribution of dominant lineage calls across rs7090445 genotypes.\
+**Output:** One stacked proportion barplot per ancestry (Hispanic, Asian, Black, Other, White).
+
+```{r}
+plot_lineage_by_genotype <- function(ancestry_name, dominant_tbl, genotypes, df_updated) {
+  geno_map <- genotypes %>%
+    distinct(COMPBIOID, .keep_all = TRUE) %>%
+    transmute(
+      sample = COMPBIOID,
+      ancestry,
+      genotype_code = as.integer(rs7090445),
+      genotype = case_when(
+        genotype_code == 0 ~ "CC",
+        genotype_code == 1 ~ "CT",
+        genotype_code == 2 ~ "TT",
+        TRUE ~ NA_character_
+      )
+    )
+  
+  lineage_levels  <- colnames(df_updated)
+  genotype_levels <- c("CC","CT","TT")
+  
+  df_sub <- dominant_tbl %>%
+    select(sample, top_ct) %>%
+    inner_join(geno_map, by = "sample") %>%
+    filter(ancestry == ancestry_name, !is.na(genotype)) %>%
+    mutate(
+      top_ct   = factor(top_ct, levels = lineage_levels),
+      genotype = factor(genotype, levels = genotype_levels)
+    )
+  
+  n_by_geno <- df_sub %>%
+    count(genotype, name = "N") %>%
+    complete(genotype = factor(genotype_levels, levels = genotype_levels), fill = list(N = 0)) %>%
+    arrange(genotype)
+  
+  plot_df <- df_sub %>%
+    count(genotype, top_ct, name = "n") %>%
+    complete(genotype = factor(genotype_levels, levels = genotype_levels),
+             top_ct   = factor(lineage_levels, levels = lineage_levels),
+             fill = list(n = 0)) %>%
+    group_by(genotype) %>%
+    mutate(prop = if (sum(n) == 0) 0 else n/sum(n)) %>%
+    ungroup()
+  
+  bar_N_labels <- n_by_geno %>% mutate(y = 1.02, label = paste0("N=", N))
+  
+  ggplot(plot_df, aes(x = genotype, y = prop, fill = top_ct)) +
+    geom_col(width = 0.7, color = "white", linewidth = 0.2) +
+    geom_text(data = bar_N_labels,
+              aes(x = genotype, y = y, label = label),
+              inherit.aes = FALSE, vjust = 0, size = 3.2) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                       expand  = expansion(mult = c(0, .12))) +
+    scale_x_discrete(labels = c("CC", "CT (TC)", "TT")) +
+    scale_fill_manual(name = "Dominant lineage", values = cell_type_colors) +
+    labs(
+      title    = paste(ancestry_name, ": dominant lineage proportions by rs7090445 genotype"),
+      subtitle = "Each bar shows the within-genotype composition of lineage calls",
+      x = "Genotype (rs7090445)", y = "Samples (%)"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(panel.grid.minor = element_blank(), legend.position = "right")
+}
+
+# Generate plots for each ancestry
+Hispanic_barplot <- plot_lineage_by_genotype("Hispanic", dominant_tbl, genotypes, df_updated)
+Asian_barplot    <- plot_lineage_by_genotype("Asian",    dominant_tbl, genotypes, df_updated)
+Black_barplot    <- plot_lineage_by_genotype("Black",    dominant_tbl, genotypes, df_updated)
+Other_barplot    <- plot_lineage_by_genotype("Other",    dominant_tbl, genotypes, df_updated)
+White_barplot    <- plot_lineage_by_genotype("White",    dominant_tbl, genotypes, df_updated)
+```
+
+### 5.2 — Global stacked barplot (all ancestries pooled)
+
+**Goal:** Show pooled lineage composition across all ancestries, split by rs7090445 genotype.\
+**Output:** Single stacked barplot with within-genotype proportions and total N labels.
+
+```{r}
+## 5.2 — Global stacked barplot --------------------------------------
+geno_map <- genotypes %>%
+  distinct(COMPBIOID, .keep_all = TRUE) %>%
+  transmute(
+    sample = COMPBIOID,
+    ancestry,
+    genotype_code = as.integer(rs7090445),
+    genotype = case_when(
+      genotype_code == 0 ~ "CC",
+      genotype_code == 1 ~ "CT",
+      genotype_code == 2 ~ "TT",
+      TRUE ~ NA_character_
+    )
+  )
+
+lineage_levels  <- colnames(df_updated)
+genotype_levels <- c("CC","CT","TT")
+
+df_all <- dominant_tbl %>%
+  select(sample, top_ct) %>%
+  inner_join(geno_map, by = "sample") %>%
+  filter(!is.na(genotype)) %>%
+  mutate(
+    top_ct   = factor(top_ct, levels = lineage_levels),
+    genotype = factor(genotype, levels = genotype_levels)
+  )
+
+n_by_geno_all <- df_all %>%
+  count(genotype, name = "N") %>%
+  complete(genotype = factor(genotype_levels, levels = genotype_levels), fill = list(N = 0))
+
+plot_df_all <- df_all %>%
+  count(genotype, top_ct, name = "n") %>%
+  complete(genotype = factor(genotype_levels, levels = genotype_levels),
+           top_ct   = factor(lineage_levels, levels = lineage_levels),
+           fill = list(n = 0)) %>%
+  group_by(genotype) %>%
+  mutate(prop = if (sum(n) == 0) 0 else n/sum(n)) %>%
+  ungroup()
+
+bar_N_labels_all <- n_by_geno_all %>% mutate(y = 1.02, label = paste0("N=", N))
+
+all_ancestries_barplot <- ggplot(plot_df_all, aes(x = genotype, y = prop, fill = top_ct)) +
+  geom_col(width = 0.7, color = "white", linewidth = 0.2) +
+  geom_text(data = bar_N_labels_all,
+            aes(x = genotype, y = y, label = label),
+            inherit.aes = FALSE, vjust = 0, size = 3.2) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     expand  = expansion(mult = c(0, .12))) +
+  scale_x_discrete(labels = c("CC", "CT (TC)", "TT")) +
+  scale_fill_manual(name = "Dominant lineage", values = cell_type_colors) +
+  labs(
+    title    = "All ancestries: dominant lineage proportions by rs7090445 genotype",
+    subtitle = "Each bar shows pooled within-genotype lineage composition",
+    x = "Genotype (rs7090445)", y = "Samples (%)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank(), legend.position = "right")
+
+```
+
+#### 5.2.1 All of them
+
+```{r}
+## === Simplify titles for ancestry plots ==============================
+Hispanic_barplot <- Hispanic_barplot +
+  labs(title = "Hispanic", subtitle = NULL, x = NULL, y = NULL)
+
+Asian_barplot <- Asian_barplot +
+  labs(title = "Asian", subtitle = NULL, x = NULL, y = NULL)
+
+Black_barplot <- Black_barplot +
+  labs(title = "Black", subtitle = NULL, x = NULL, y = NULL)
+
+Other_barplot <- Other_barplot +
+  labs(title = "Other", subtitle = NULL, x = NULL, y = NULL)
+
+White_barplot <- White_barplot +
+  labs(title = "White", subtitle = NULL, x = NULL, y = NULL)
+
+all_ancestries_barplot <- all_ancestries_barplot +
+  labs(title = "All ancestries", subtitle = NULL, x = NULL, y = NULL)
+
+## === Combine clean plots ============================================
+combined_plot <- (
+    Hispanic_barplot + Asian_barplot + Black_barplot +
+    Other_barplot + White_barplot + all_ancestries_barplot
+) +
+    plot_layout(ncol = 3, guides = "collect") +
+    plot_annotation(
+        title = "Dominant Lineage Proportions by rs7090445 Genotype",
+        subtitle = NULL,   # keep global subtitle short
+        theme = theme(
+            plot.title = element_text(size = 16, face = "bold"),
+            plot.subtitle = element_text(size = 12)
+        )
+    )
+
+combined_plot
+
+```
+
+# 6 DEG
+
+## DEG of ProB TT vs CC
+
+```{r}
+# =======================================================
+# DEG in ProB cells: TT (numerator) vs CC (denominator)
+# (limma-trend; adds HGNC symbols + labeled volcano)
+# =======================================================
+# --- 1) ProB-dominated samples ----------------------------------------
+prob_samples <- dominant_tbl %>%
+  filter(top_ct == "ProB") %>%
+  pull(sample)
+
+# Map genotype; keep ONLY CC (0) and TT (2); drop CT (1) and NAs
+prob_meta <- genotypes %>%
+  filter(COMPBIOID %in% prob_samples) %>%
+  transmute(
+    sample        = COMPBIOID,
+    genotype_code = as.integer(rs7090445),
+    genotype      = case_when(
+      genotype_code == 0 ~ "CC",
+      genotype_code == 2 ~ "TT",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(genotype)) %>%
+  mutate(genotype = factor(genotype, levels = c("CC","TT")))
+rownames(prob_meta) <- prob_meta$sample
+
+# --- 2) Build expression matrix (genes × samples) ----------------------
+expr_prob <- expression %>%
+  select(ensembl_id, gene, all_of(prob_meta$sample))
+
+expr_mat <- expr_prob %>%
+  column_to_rownames("ensembl_id") %>%
+  select(-gene) %>%
+  as.matrix()
+
+expr_log <- log2(expr_mat + 1)
+
+# --- 3) Design (baseline = CC; coef = TTvsCC) --------------------------
+design <- model.matrix(~ genotype, data = prob_meta)
+colnames(design) <- c("Intercept","TTvsCC")
+expr_log <- expr_log[, rownames(design), drop = FALSE]
+
+# Sanity checks
+stopifnot(ncol(expr_log) == nrow(design))
+stopifnot(all(colnames(expr_log) == rownames(design)))
+
+# --- 4) limma-trend fit ------------------------------------------------
+fit <- lmFit(expr_log, design)
+fit <- eBayes(fit, trend = TRUE)
+
+# Join HGNC symbols (from §2.1 gene_map) and keep original 'gene' column for reference
+results <- topTable(fit, coef = "TTvsCC", number = Inf) %>%
+  rownames_to_column("ensembl_id") %>%
+  left_join(expr_prob %>% select(ensembl_id, gene) %>% distinct(),
+            by = "ensembl_id") %>%
+  left_join(gene_map %>% distinct(ensembl_gene_id, hgnc_symbol) %>%
+              rename(ensembl_id = ensembl_gene_id),
+            by = "ensembl_id") %>%
+  relocate(ensembl_id, hgnc_symbol, gene)
+
+# --- 5) Volcano plot + labels -----------------------------------------
+volcano_df <- results %>%
+  mutate(
+    neglog10P = -log10(P.Value),
+    sig = case_when(
+      P.Value < 0.05 & logFC >  0.5 ~ "up",
+      P.Value < 0.05 & logFC < -0.5 ~ "down",
+      TRUE ~ "ns"
+    ),
+    label_gene = if_else(!is.na(hgnc_symbol) & nzchar(hgnc_symbol),
+                         hgnc_symbol, ensembl_id)
+  )
+
+
+# Select top 15 up and down by p-value
+top15_up <- volcano_df %>%
+  filter(sig == "up") %>%
+  arrange(P.Value) %>%
+  slice(1:15)
+
+top15_down <- volcano_df %>%
+  filter(sig == "down") %>%
+  arrange(P.Value) %>%
+  slice(1:15)
+
+label_data_15 <- bind_rows(top15_up, top15_down) %>%
+  distinct(label_gene, .keep_all = TRUE)
+
+# Plot
+proB_TT_vs_CC_plot <-  ggplot(volcano_df, aes(x = logFC, y = neglog10P,
+                       fill = sig, size = sig, alpha = sig)) +
+    geom_point(shape = 21, colour = "black") +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "darkgrey") +
+    geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed", colour = "darkgrey") +
+    geom_label_repel(
+        data = label_data_15,
+        aes(label = label_gene, fill = sig),
+        color = "white", fontface = "bold", size = 4,
+        max.overlaps = Inf,
+        force = 2,            # less repelling force
+        force_pull = 1,       # stronger pull toward points
+        box.padding = 0.2,    # tighter label box
+        point.padding = 0.05, # hug points closely
+        nudge_y = 0.5,        # smaller vertical offset
+        min.segment.length = 0, segment.size = 0.3,
+        segment.color = "grey40",
+        label.size = 0.5,
+        label.r = unit(0.15, "lines"),
+        label.padding = unit(0.15, "lines"),
+        show.legend = FALSE
+    ) +
+    scale_fill_manual(values = c("up" = "#D55E00",
+                                 "down" = "#0072B2",
+                                 "ns" = "grey80"),
+                      labels = c("up" = "Higher in TT clones",
+                                 "down" = "Higher in CC clones",
+                                 "ns" = "Not significant")) +
+    scale_size_manual(values = c("up" = 2.5, "down" = 2.5, "ns" = 1.2)) +
+    scale_alpha_manual(values = c("up" = 1, "down" = 1, "ns" = 0.6)) +
+    guides(fill = guide_legend(title = "Differential expression"),
+           size = "none", alpha = "none", color = "none") +
+    ylim(0, quantile(volcano_df$neglog10P, 0.99) + 2) +
+    theme_minimal(base_size = 16) +
+    theme(
+        plot.title   = element_text(size = 18, face = "bold"),
+        axis.title   = element_text(size = 16, face = "bold"),
+        axis.text    = element_text(size = 14),
+        legend.title = element_text(size = 15, face = "bold"),
+        legend.text  = element_text(size = 13)
+    ) +
+    labs(title = "Volcano plot: ProB TT vs CC (limma-trend, top 15 up/down genes)",
+         x = "log2 Fold Change (TT / CC)",
+         y = "-log10(p-value)")
+
+```
+
+### Function for all of them
+
+```{r}
+### Function + all contrasts and plots (with TPM conversion)
+suppressPackageStartupMessages({
+    library(dplyr)
+    library(tibble)
+    library(limma)
+    library(ggplot2)
+    library(ggrepel)
+    library(stringr)
+})
+
+# Helper to unify genotypes
+.canon_gt <- function(g) { g <- toupper(g); if (g %in% c("TC","CT")) "CT" else g }
+
+# Helper to convert FPKM → TPM (per sample)
+fpkm_to_tpm <- function(fpkm_mat) {
+    apply(fpkm_mat, 2, function(x) (x / sum(x, na.rm = TRUE)) * 1e6)
+}
+
+run_deg_volcano <- function(lineage_A, genotype_A,
+                            lineage_B, genotype_B,
+                            logfc_thresh = 0.2,
+                            p_thresh     = 0.05,
+                            top_n        = 15) {
+    
+    stopifnot(exists("expression"), exists("genotypes"),
+              exists("dominant_tbl"), exists("gene_map"))
+    
+    gA <- .canon_gt(genotype_A); gB <- .canon_gt(genotype_B)
+    
+    # ---- Sample selection ----
+    samp_A <- dominant_tbl %>% filter(top_ct == lineage_A) %>% pull(sample)
+    samp_B <- dominant_tbl %>% filter(top_ct == lineage_B) %>% pull(sample)
+    
+    gt_map <- genotypes %>%
+        transmute(
+            sample = COMPBIOID,
+            genotype = case_when(
+                as.integer(rs7090445) == 0 ~ "CC",
+                as.integer(rs7090445) == 1 ~ "CT",
+                as.integer(rs7090445) == 2 ~ "TT",
+                TRUE ~ NA_character_
+            )
+        )
+    
+    meta_A <- gt_map %>% filter(sample %in% samp_A, genotype == gA) %>% mutate(group = "A")
+    meta_B <- gt_map %>% filter(sample %in% samp_B, genotype == gB) %>% mutate(group = "B")
+    meta   <- bind_rows(meta_A, meta_B) %>% distinct(sample, .keep_all = TRUE)
+    
+    # keep only samples present in expression
+    present <- intersect(meta$sample, colnames(expression))
+    meta    <- meta %>% filter(sample %in% present)
+    
+    if (nrow(meta) < 2 || length(unique(meta$group)) < 2) {
+        stop("Not enough samples per group after filtering: nA=",
+             sum(meta$group=="A"), " nB=", sum(meta$group=="B"))
+    }
+    
+    # ---- Expression submatrix (FPKM → TPM) ----
+    expr_sub <- expression %>%
+        select(ensembl_id, gene, any_of(meta$sample))
+    
+    fpkm_mat <- expr_sub %>%
+        column_to_rownames("ensembl_id") %>%
+        select(-gene) %>%
+        as.matrix()
+    
+    # Convert to TPM and log-transform
+    tpm_mat  <- fpkm_to_tpm(fpkm_mat)
+    expr_log <- log2(tpm_mat + 1)
+    
+    # ---- Design ----
+    meta_df <- as.data.frame(meta)
+    rownames(meta_df) <- meta_df$sample
+    meta_df$group <- factor(meta_df$group, levels = c("B","A"))
+    
+    design <- model.matrix(~ group, data = meta_df)
+    colnames(design) <- c("Intercept","A_vs_B")
+    
+    # Align expression and design
+    common <- intersect(colnames(expr_log), rownames(design))
+    expr_log <- expr_log[, common, drop = FALSE]
+    design   <- design[common, , drop = FALSE]
+    
+    stopifnot(ncol(expr_log) == nrow(design))
+    stopifnot(all(colnames(expr_log) == rownames(design)))
+    
+    # ---- limma-trend ----
+    fit <- lmFit(expr_log, design)
+    fit <- eBayes(fit, trend = TRUE)
+    
+    results <- topTable(fit, coef = "A_vs_B", number = Inf) %>%
+        rownames_to_column("ensembl_id") %>%
+        left_join(expr_sub %>% select(ensembl_id, gene) %>% distinct(), by = "ensembl_id") %>%
+        left_join(gene_map %>% distinct(ensembl_gene_id, hgnc_symbol) %>%
+                      rename(ensembl_id = ensembl_gene_id),
+                  by = "ensembl_id") %>%
+        relocate(ensembl_id, hgnc_symbol, gene)
+    
+    # ---- Volcano + labels ----
+    volcano_df <- results %>%
+        mutate(
+            neglog10P = -log10(P.Value),
+            sig = case_when(
+                P.Value <= p_thresh & logFC >=  logfc_thresh ~ "up",
+                P.Value <= p_thresh & logFC <= -logfc_thresh ~ "down",
+                TRUE ~ "ns"
+            ),
+            label_gene = if_else(!is.na(hgnc_symbol) & nzchar(hgnc_symbol),
+                                 hgnc_symbol, ensembl_id)
+        )
+    
+    # Top labels
+    top_up   <- volcano_df %>% filter(sig == "up")   %>% slice_min(P.Value, n = top_n, with_ties = FALSE)
+    top_down <- volcano_df %>% filter(sig == "down") %>% slice_min(P.Value, n = top_n, with_ties = FALSE)
+    label_data <- bind_rows(top_up, top_down) %>% distinct(label_gene, .keep_all = TRUE)
+    
+    # Title + legend
+    pretty_A <- paste(lineage_A, gA)
+    pretty_B <- paste(lineage_B, gB)
+    title_txt <- paste0(
+        "Volcano plot: ", pretty_A, " vs ",
+        if (lineage_B == lineage_A) gB else pretty_B,
+        " (limma-trend on log2 TPM, top ", top_n, " up/down genes)"
+    )
+    legend_labs <- c(
+        up   = paste("Higher in",  pretty_A),
+        down = paste("Higher in",  pretty_B),
+        ns   = "Not significant"
+    )
+    
+    p <- ggplot(volcano_df, aes(x = logFC, y = neglog10P,
+                                fill = sig, size = sig, alpha = sig)) +
+        geom_point(shape = 21, colour = "black") +
+        geom_hline(yintercept = -log10(p_thresh), linetype = "dashed", colour = "grey50") +
+        geom_vline(xintercept = c(-logfc_thresh, logfc_thresh), linetype = "dashed", colour = "grey50") +
+        geom_label_repel(
+            data = label_data,
+            aes(label = label_gene, fill = sig),
+            color = "white", fontface = "bold", size = 3.8,
+            max.overlaps = Inf,
+            force = 1.5, force_pull = 1.2,
+            box.padding = 0.15, point.padding = 0.02, nudge_y = 0.3,
+            min.segment.length = 0, segment.size = 0.25, segment.color = "grey50",
+            label.size = 0.4, label.r = unit(0.15, "lines"),
+            label.padding = unit(0.15, "lines"),
+            show.legend = FALSE
+        ) +
+        scale_fill_manual(values = c(up = "#D55E00", down = "#0072B2", ns = "grey80"),
+                          labels = legend_labs, name = "Differential expression") +
+        scale_size_manual(values = c(up = 2.5, down = 2.5, ns = 1.0), guide = "none") +
+        scale_alpha_manual(values = c(up = 0.9, down = 0.9, ns = 0.5), guide = "none") +
+        ylim(0, quantile(volcano_df$neglog10P, 0.99, na.rm = TRUE) + 2) +
+        theme_minimal(base_size = 15) +
+        theme(
+            plot.title   = element_text(size = 18, face = "bold", hjust = 0.5),
+            axis.title   = element_text(size = 15, face = "bold"),
+            axis.text    = element_text(size = 13),
+            legend.title = element_text(size = 14, face = "bold"),
+            legend.text  = element_text(size = 12),
+            panel.grid.minor = element_blank()
+        ) +
+        labs(title = title_txt,
+             x = "log2 Fold Change (A / B)",
+             y = "-log10(p-value)")
+    
+    list(
+        meta         = meta_df,
+        nA           = sum(meta_df$group == "A"),
+        nB           = sum(meta_df$group == "B"),
+        results      = results,
+        volcano_df   = volcano_df,
+        label_data   = label_data,
+        volcano_plot = p
+    )
+}
+
+# =========================
+# Run your contrasts
+# =========================
+deg_PreB_TT_vs_CC    <- run_deg_volcano("PreB",         "TT", "PreB",  "CC")
+deg_EL_TT_vs_ProB_TT <- run_deg_volcano("EarlyLymphoid","TT", "ProB",  "TT")
+deg_EL_TT_vs_ProB_CT <- run_deg_volcano("EarlyLymphoid","TT", "ProB",  "CT")
+deg_EL_TT_vs_ProB_CC <- run_deg_volcano("EarlyLymphoid","TT", "ProB",  "CC")
+deg_ProB_TT_vs_CC    <- run_deg_volcano("ProB","TT", "ProB","CC")
+
+# =========================
+# Print volcano plots
+# =========================
+deg_ProB_TT_vs_CC$volcano_plot
+deg_PreB_TT_vs_CC$volcano_plot
+deg_EL_TT_vs_ProB_TT$volcano_plot
+deg_EL_TT_vs_ProB_CT$volcano_plot
+deg_EL_TT_vs_ProB_CC$volcano_plot
+
+
+# 📂 Create output folder for ProB analysis
+proB_outdir <- "proB_DEG_analysis"
+if (!dir.exists(proB_outdir)) dir.create(proB_outdir)
+
+# 🚀 Run contrasts for ProB
+deg_PreB_TT_vs_TC <- run_deg_volcano("ProB", "TT", "ProB", "TC")
+deg_PreB_TT_vs_CC <- run_deg_volcano("ProB", "TT", "ProB", "CC")
+deg_PreB_TC_vs_CC <- run_deg_volcano("ProB", "TC", "ProB", "CC")
+
+# 💾 Save results + plots
+write.csv(deg_PreB_TT_vs_TC$volcano_df,
+          file = file.path(proB_outdir, "ProB_TT_vs_TC_results.csv"),
+          row.names = FALSE)
+ggsave(file.path(proB_outdir, "ProB_TT_vs_TC_volcano.pdf"),
+       plot = deg_PreB_TT_vs_TC$volcano_plot, width = 8, height = 6)
+
+write.csv(deg_PreB_TT_vs_CC$volcano_df,
+          file = file.path(proB_outdir, "ProB_TT_vs_CC_results.csv"),
+          row.names = FALSE)
+ggsave(file.path(proB_outdir, "ProB_TT_vs_CC_volcano.pdf"),
+       plot = deg_PreB_TT_vs_CC$volcano_plot, width = 8, height = 6)
+
+write.csv(deg_PreB_TC_vs_CC$volcano_df,
+          file = file.path(proB_outdir, "ProB_TC_vs_CC_results.csv"),
+          row.names = FALSE)
+ggsave(file.path(proB_outdir, "ProB_TC_vs_CC_volcano.pdf"),
+       plot = deg_PreB_TC_vs_CC$volcano_plot, width = 8, height = 6)
+
+
+```
+
+
+```{r}
+
+# Load GTF annotation
+gtf <- rtracklayer::import("/Users/cojulian/Desktop/Tzu_projects/Matt/reference_genomces/Homo_sapiens.GRCh38.113.gtf.gz")
+gtf_df <- as.data.frame(gtf)
+
+# Create transcript-to-gene mapping
+tx2gene_df <- gtf_df %>%
+  dplyr::select(transcript_id, gene_id, gene_name) %>%
+  dplyr::distinct(transcript_id, gene_id, gene_name) %>%
+  drop_na()
+
+```
+
+```{r}
+### Function + all contrasts and plots (TPM conversion, coding only, highlight ARID5B)
+suppressPackageStartupMessages({
+    library(dplyr)
+    library(tibble)
+    library(limma)
+    library(ggplot2)
+    library(ggrepel)
+    library(stringr)
+})
+
+# Helper to unify genotypes
+.canon_gt <- function(g) { g <- toupper(g); if (g %in% c("TC","CT")) "CT" else g }
+
+# Helper: FPKM → TPM (per sample)
+fpkm_to_tpm <- function(fpkm_mat) {
+    apply(fpkm_mat, 2, function(x) (x / sum(x, na.rm = TRUE)) * 1e6)
+}
+
+run_deg_volcano <- function(lineage_A, genotype_A,
+                            lineage_B, genotype_B,
+                            logfc_thresh = 0.2,
+                            p_thresh     = 0.05) {
+    
+    stopifnot(exists("expression"), exists("genotypes"),
+              exists("dominant_tbl"), exists("gene_map"), exists("gtf_df"))
+    
+    gA <- .canon_gt(genotype_A); gB <- .canon_gt(genotype_B)
+    
+    # ---- Sample selection ----
+    samp_A <- dominant_tbl %>% filter(top_ct == lineage_A) %>% pull(sample)
+    samp_B <- dominant_tbl %>% filter(top_ct == lineage_B) %>% pull(sample)
+    
+    gt_map <- genotypes %>%
+        transmute(
+            sample = COMPBIOID,
+            genotype = case_when(
+                as.integer(rs7090445) == 0 ~ "CC",
+                as.integer(rs7090445) == 1 ~ "CT",
+                as.integer(rs7090445) == 2 ~ "TT",
+                TRUE ~ NA_character_
+            )
+        )
+    
+    meta_A <- gt_map %>% filter(sample %in% samp_A, genotype == gA) %>% mutate(group = "A")
+    meta_B <- gt_map %>% filter(sample %in% samp_B, genotype == gB) %>% mutate(group = "B")
+    meta   <- bind_rows(meta_A, meta_B) %>% distinct(sample, .keep_all = TRUE)
+    
+    # keep only samples present in expression
+    present <- intersect(meta$sample, colnames(expression))
+    meta    <- meta %>% filter(sample %in% present)
+    
+    if (nrow(meta) < 2 || length(unique(meta$group)) < 2) {
+        stop("Not enough samples per group after filtering: nA=",
+             sum(meta$group=="A"), " nB=", sum(meta$group=="B"))
+    }
+    
+    # ---- Expression submatrix ----
+    expr_sub <- expression %>%
+        select(ensembl_id, gene, any_of(meta$sample))
+    
+    fpkm_mat <- expr_sub %>%
+        column_to_rownames("ensembl_id") %>%
+        select(-gene) %>%
+        as.matrix()
+    
+    # ---- Keep coding genes only ----
+    coding_genes <- gtf_df %>%
+        filter(type == "gene", gene_biotype == "protein_coding") %>%
+        pull(gene_id) %>% unique()
+    fpkm_mat <- fpkm_mat[rownames(fpkm_mat) %in% coding_genes, , drop = FALSE]
+    
+    # ---- TPM + log2 ----
+    tpm_mat  <- fpkm_to_tpm(fpkm_mat)
+    expr_log <- log2(tpm_mat + 1)
+    
+    # ---- Design ----
+    meta_df <- as.data.frame(meta)
+    rownames(meta_df) <- meta_df$sample
+    meta_df$group <- factor(meta_df$group, levels = c("B","A"))
+    
+    design <- model.matrix(~ group, data = meta_df)
+    colnames(design) <- c("Intercept","A_vs_B")
+    
+    # Align expression and design
+    common <- intersect(colnames(expr_log), rownames(design))
+    expr_log <- expr_log[, common, drop = FALSE]
+    design   <- design[common, , drop = FALSE]
+    
+    stopifnot(ncol(expr_log) == nrow(design))
+    
+    # ---- limma-trend ----
+    fit <- lmFit(expr_log, design)
+    fit <- eBayes(fit, trend = TRUE)
+    
+    results <- topTable(fit, coef = "A_vs_B", number = Inf) %>%
+        rownames_to_column("ensembl_id") %>%
+        left_join(expr_sub %>% select(ensembl_id, gene) %>% distinct(),
+                  by = "ensembl_id") %>%
+        left_join(gene_map %>% distinct(ensembl_gene_id, hgnc_symbol) %>%
+                      rename(ensembl_id = ensembl_gene_id),
+                  by = "ensembl_id") %>%
+        relocate(ensembl_id, hgnc_symbol, gene)
+    
+    volcano_df <- results %>%
+        mutate(
+            neglog10P = -log10(P.Value),
+            sig = case_when(
+                P.Value <= p_thresh & logFC >=  logfc_thresh ~ "up",
+                P.Value <= p_thresh & logFC <= -logfc_thresh ~ "down",
+                TRUE ~ "ns"
+            ),
+            label_gene = if_else(!is.na(hgnc_symbol) & nzchar(hgnc_symbol),
+                                 hgnc_symbol, ensembl_id)
+        )
+    
+    # ---- Symmetric axes ----
+    x_max <- max(abs(volcano_df$logFC), na.rm = TRUE)
+    y_max <- max(volcano_df$neglog10P, na.rm = TRUE)
+    
+    # ---- Highlight ARID5B ----
+    highlight_gene <- "ENSG00000150347"
+    highlight_data <- volcano_df %>% filter(ensembl_id == highlight_gene)
+    
+    pretty_A <- paste(lineage_A, gA)
+    pretty_B <- paste(lineage_B, gB)
+    title_txt <- paste0("Volcano plot (coding only): ", pretty_A, " vs ", pretty_B)
+    
+    p <- ggplot(volcano_df, aes(x = logFC, y = neglog10P,
+                                fill = sig, size = sig, alpha = sig)) +
+        geom_point(shape = 21, colour = "black") +
+        geom_hline(yintercept = -log10(p_thresh), linetype = "dashed", colour = "grey50") +
+        geom_vline(xintercept = c(-logfc_thresh, logfc_thresh), linetype = "dashed", colour = "grey50") +
+        geom_point(data = highlight_data, aes(x = logFC, y = neglog10P),
+                   color = "red", fill = "red", shape = 21, size = 3) +
+        geom_label_repel(
+            data = highlight_data,
+            aes(label = ifelse(!is.na(hgnc_symbol), hgnc_symbol, ensembl_id)),
+            color = "black", fill = "white",
+            fontface = "bold", size = 5,
+            box.padding = 0.5, point.padding = 0.3,
+            segment.color = "red", segment.size = 0.7,
+            label.size = 0.4, label.r = unit(0.15, "lines"),
+            max.overlaps = Inf
+        ) +
+        scale_fill_manual(values = c(up = "#D55E00", down = "#0072B2", ns = "grey80")) +
+        scale_size_manual(values = c(up = 2.5, down = 2.5, ns = 1.0), guide = "none") +
+        scale_alpha_manual(values = c(up = 0.9, down = 0.9, ns = 0.5), guide = "none") +
+        coord_cartesian(xlim = c(-x_max, x_max), ylim = c(0, y_max)) +
+        theme_minimal(base_size = 15) +
+        theme(
+            plot.title   = element_text(size = 18, face = "bold", hjust = 0.5),
+            axis.title   = element_text(size = 15, face = "bold"),
+            axis.text    = element_text(size = 13),
+            legend.title = element_text(size = 14, face = "bold"),
+            legend.text  = element_text(size = 12),
+            panel.grid.minor = element_blank()
+        ) +
+        labs(title = title_txt,
+             x = "log2 Fold Change (A / B)",
+             y = "-log10(p-value)")
+    
+    list(
+        meta         = meta_df,
+        nA           = sum(meta_df$group == "A"),
+        nB           = sum(meta_df$group == "B"),
+        results      = results,
+        volcano_df   = volcano_df,
+        volcano_plot = p
+    )
+}
+
+```
+
+# ProB saving
+
+```{r}
+# ==============================================================
+# DEG analysis for ProB lineage (TT, TC, CC) using limma-trend on TPM
+# Coding genes only, highlight ARID5B
+# ==============================================================
+
+# 📂 Create output folder
+proB_outdir <- "Only_Coding_ProB_TPM_DEG_results"
+if (!dir.exists(proB_outdir)) dir.create(proB_outdir)
+
+# 🚀 Run ProB contrasts
+deg_ProB_TT_vs_TC <- run_deg_volcano("ProB", "TT", "ProB", "TC")
+deg_ProB_TT_vs_CC <- run_deg_volcano("ProB", "TT", "ProB", "CC")
+deg_ProB_TC_vs_CC <- run_deg_volcano("ProB", "TC", "ProB", "CC")
+
+# 💾 Save results (CSV) and plots (PDF)
+write.csv(deg_ProB_TT_vs_TC$volcano_df,
+          file = file.path(proB_outdir, "ProB_TT_vs_TC_results.csv"),
+          row.names = FALSE)
+ggsave(file.path(proB_outdir, "ProB_TT_vs_TC_volcano.pdf"),
+       plot = deg_ProB_TT_vs_TC$volcano_plot, width = 8, height = 6)
+
+write.csv(deg_ProB_TT_vs_CC$volcano_df,
+          file = file.path(proB_outdir, "ProB_TT_vs_CC_results.csv"),
+          row.names = FALSE)
+ggsave(file.path(proB_outdir, "ProB_TT_vs_CC_volcano.pdf"),
+       plot = deg_ProB_TT_vs_CC$volcano_plot, width = 8, height = 6)
+
+write.csv(deg_ProB_TC_vs_CC$volcano_df,
+          file = file.path(proB_outdir, "ProB_TC_vs_CC_results.csv"),
+          row.names = FALSE)
+ggsave(file.path(proB_outdir, "ProB_TC_vs_CC_volcano.pdf"),
+       plot = deg_ProB_TC_vs_CC$volcano_plot, width = 8, height = 6)
+
+
+significance_genes_Wenjians_for_peaks_24_sj <- deg_ProB_TT_vs_CC$volcano_df %>% 
+    filter(sig != "ns") %>% 
+    select(sig, label_gene) 
+
+write.csv(significance_genes_Wenjians_for_peaks_24_sj,
+          file = file.path(proB_outdir, "significance_genes_Wenjians_for_peaks_24_sj.csv"),
+          row.names = FALSE)
+```
+
+
+# PreB saving
+```{r}
+# ==============================================================
+# DEG analysis for PreB lineage (TT, TC, CC) using limma-trend on TPM
+# Coding genes only, highlight ARID5B
+# ==============================================================
+
+# 📂 Create output folder
+preB_outdir <- "PreB_TPM_DEG_results"
+if (!dir.exists(preB_outdir)) dir.create(preB_outdir)
+
+# 🚀 Run PreB contrasts
+deg_PreB_TT_vs_TC <- run_deg_volcano("PreB", "TT", "PreB", "TC")
+deg_PreB_TT_vs_CC <- run_deg_volcano("PreB", "TT", "PreB", "CC")
+deg_PreB_TC_vs_CC <- run_deg_volcano("PreB", "TC", "PreB", "CC")
+
+# 💾 Save results (CSV) and plots (PDF)
+write.csv(deg_PreB_TT_vs_TC$volcano_df,
+          file = file.path(preB_outdir, "PreB_TT_vs_TC_results.csv"),
+          row.names = FALSE)
+ggsave(file.path(preB_outdir, "PreB_TT_vs_TC_volcano.pdf"),
+       plot = deg_PreB_TT_vs_TC$volcano_plot, width = 8, height = 6)
+
+write.csv(deg_PreB_TT_vs_CC$volcano_df,
+          file = file.path(preB_outdir, "PreB_TT_vs_CC_results.csv"),
+          row.names = FALSE)
+ggsave(file.path(preB_outdir, "PreB_TT_vs_CC_volcano.pdf"),
+       plot = deg_PreB_TT_vs_CC$volcano_plot, width = 8, height = 6)
+
+write.csv(deg_PreB_TC_vs_CC$volcano_df,
+          file = file.path(preB_outdir, "PreB_TC_vs_CC_results.csv"),
+          row.names = FALSE)
+ggsave(file.path(preB_outdir, "PreB_TC_vs_CC_volcano.pdf"),
+       plot = deg_PreB_TC_vs_CC$volcano_plot, width = 8, height = 6)
+
+```
+---
+
+## 8 
+```{r}
+# ============================================================
+# Subset expression to ProB TT & CC samples (St Jude, Wenjian)
+# Keep only KLF1–KLF16 family genes
+# Rename samples with "_TT" or "_CC" suffix
+# Save to CSV (HGNC symbol first column)
+# ============================================================
+
+suppressPackageStartupMessages({
+    library(dplyr)
+})
+
+# --- 1. Identify ProB-dominated samples ---
+prob_samples <- dominant_tbl %>%
+    filter(top_ct == "ProB") %>%
+    pull(sample)
+
+# --- 2. Map genotype (CC = 0, TT = 2) ---
+prob_meta <- genotypes %>%
+    filter(COMPBIOID %in% prob_samples) %>%
+    transmute(
+        sample        = COMPBIOID,
+        genotype_code = as.integer(rs7090445),
+        genotype      = case_when(
+            genotype_code == 0 ~ "CC",
+            genotype_code == 2 ~ "TT",
+            TRUE ~ NA_character_
+        )
+    ) %>%
+    filter(!is.na(genotype)) %>%
+    distinct(sample, .keep_all = TRUE)   # 🔑 ensure unique
+
+# --- 3. Restrict to TT and CC sets ---
+prob_tt <- prob_meta %>% filter(genotype == "TT") %>% pull(sample)
+prob_cc <- prob_meta %>% filter(genotype == "CC") %>% pull(sample)
+
+# --- 4. Define KLF gene set and get Ensembl IDs ---
+klf_genes <- c("KLF1","KLF10","KLF11","KLF12","KLF13",
+               "KLF14","KLF15","KLF16","KLF2","KLF3",
+               "KLF4","KLF5","KLF6","KLF7")
+
+klf_ids <- gtf_df %>%
+    filter(type == "gene", gene_name %in% klf_genes) %>%
+    distinct(gene_id, gene_name)
+
+# --- 5. Subset expression matrix ---
+expr_sub <- expr_prob %>%
+    select(ensembl_id, gene, any_of(c(prob_tt, prob_cc))) %>%
+    semi_join(klf_ids, by = c("ensembl_id" = "gene_id"))
+
+# --- 6. Replace Ensembl gene ID with HGNC symbol ---
+expr_sub <- expr_sub %>%
+    left_join(klf_ids, by = c("ensembl_id" = "gene_id")) %>%
+    rename(hgnc_symbol = gene_name) %>%
+    select(hgnc_symbol, ensembl_id, everything(), -gene)
+
+# --- 7. Create mapping old → new names ---
+rename_map <- prob_meta %>%
+    mutate(newname = paste0(sample, "_", genotype)) %>%
+    select(sample, newname)
+
+# --- 8. Apply renaming safely ---
+expr_sub <- expr_sub %>%
+    rename_with(~ rename_map$newname[match(., rename_map$sample)],
+                .cols = any_of(rename_map$sample))
+
+# --- 9. Save to CSV ---
+write.csv(expr_sub, "fpkm_of_TT_CC_sj_wenjians.csv", row.names = FALSE)
+
+```
+
+
+
+### 7 Venn Diagrams with Clarissa's cell lines
+
+#### Loading NALM6 ribo0 DEG results RAW COUNTS
+
+```{r}
+# Define folder path
+deg_dir <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Clarissa/snp_cell_lines_public_datasets_project/cell_lines/rnaseq/Gene_expresion_analysis/deg_results_NALM6/"
+
+# Read results
+deg_tc_vs_cc <- read.csv(file.path(deg_dir, "DEG_gen_exp_NALM6_TC_vs_CC.csv"))
+deg_tt_vs_cc <- read.csv(file.path(deg_dir, "DEG_gen_exp_NALM6_TT_vs_CC.csv"))
+deg_tt_vs_tc <- read.csv(file.path(deg_dir, "DEG_gen_exp_NALM6_TT_vs_TC.csv"))
+
+```
+
+#### Loading REH ribo0 DEG results RAW COUNTS
+
+```{r}
+deg_dir_REH <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Clarissa/snp_cell_lines_public_datasets_project/cell_lines/rnaseq/Gene_expresion_analysis/deg_results_REH/"
+
+# Read results
+deg_tc_vs_cc_REH <- read.csv(file.path(deg_dir_REH, "DEG_gen_exp_REH_TC_vs_CC.csv"))
+deg_tt_vs_cc_REH <- read.csv(file.path(deg_dir_REH, "DEG_gen_exp_REH_TT_vs_CC.csv"))
+deg_tt_vs_tc_REH <- read.csv(file.path(deg_dir_REH, "DEG_gen_exp_REH_TT_vs_TC.csv"))
+```
+
+
+
+
+#### Loading NALM6 ribo0 DEG results RAW COUNTS
+
+
+
+
+### Plotting 
+
+```{r}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(ggvenn)
+  library(cowplot)
+})
+
+# --- 1) Define up/down gene sets -------------------------------------
+
+# Study 1: NALM6
+nal_up   <- deg_tt_vs_cc %>% filter(significance == "up")   %>% pull(gene_name) %>% na.omit() %>% unique()
+nal_down <- deg_tt_vs_cc %>% filter(significance == "down") %>% pull(gene_name) %>% na.omit() %>% unique()
+
+# Study 2: Wenjian's ProB (use hgnc_symbol if available, fallback to ensembl_id)
+wenj_up   <- deg_ProB_TT_vs_CC$volcano_df %>% filter(sig == "up")   %>% 
+  mutate(label = if_else(!is.na(hgnc_symbol) & nzchar(hgnc_symbol), hgnc_symbol, ensembl_id)) %>%
+  pull(label) %>% na.omit() %>% unique()
+
+wenj_down <- deg_ProB_TT_vs_CC$volcano_df %>% filter(sig == "down") %>% 
+  mutate(label = if_else(!is.na(hgnc_symbol) & nzchar(hgnc_symbol), hgnc_symbol, ensembl_id)) %>%
+  pull(label) %>% na.omit() %>% unique()
+
+# --- 2) Create ggvenn plots ------------------------------------------
+
+# Upregulated overlap
+venn_up <- ggvenn(
+  list(NALM6 = nal_up, Wenjian = wenj_up),
+  fill_color = c("#D55E00", "#0072B2"),
+  stroke_size = 0.5, set_name_size = 5, text_size = 4
+) + labs(title = "Overlap of Upregulated Genes (TT vs CC)")
+
+# Downregulated overlap
+venn_down <- ggvenn(
+  list(NALM6 = nal_down, Wenjian = wenj_down),
+  fill_color = c("#D55E00", "#0072B2"),
+  stroke_size = 0.5, set_name_size = 5, text_size = 4
+) + labs(title = "Overlap of Downregulated Genes (TT vs CC)")
+
+# --- 3) Combine plots with cowplot -----------------------------------
+combined_venn <- plot_grid(
+  venn_up, venn_down,
+  ncol = 1, align = "v", labels = c("A", "B"), label_size = 14
+)
+
+# Print
+combined_venn
+
+```
+
+
+
+
+
+
+
+
+
+
+## Take NALM6 (PolyA) DEG results and do venn diagrams (up or down)
+
+## Make the same volcano pot for NALM6 polyA
+
+### Make sure we use 0.05 for adjP and LF +- 0.5
+
+#### Take boxplots for proB and preB, show significance with an anova (dont show ns)
+
+------------------------------------------------------------------------
 
 Repeat the same analysis now for:
-
-```{r}
-Clarissas cell lines, ribo0
----
-For polyA, check ARID5B expression
-```
-
-
