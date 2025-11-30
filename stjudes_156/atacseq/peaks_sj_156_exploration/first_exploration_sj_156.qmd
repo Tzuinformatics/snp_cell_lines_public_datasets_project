@@ -1,0 +1,2681 @@
+# 1 Setup and global options
+## 1.1 Load libraries
+```{r}
+## 1.1 Load libraries and global parameters -------------------------------
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(ggplot2)
+  library(tidyr)
+  library(DESeq2)
+  library(matrixStats)
+  library(GenomicRanges)
+  library(GenomeInfoDb)
+  library(ChIPseeker)
+  library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+  library(org.Hs.eg.db)
+})
+
+half_batches <- read.csv("../../half_batches_3_156sj.csv")
+second_batches <- read.csv("snp_summary_with_flags_all_batches.csv")
+
+# Remove the 'X' column from half_batches
+half_batches_clean <- half_batches[, !(colnames(half_batches) %in% "X")]
+
+# Row-bind the cleaned half_batches with second_batches
+combined_batches <- rbind(half_batches_clean, second_batches)
+
+# Check the result
+head(combined_batches)
+
+## Global parameters for PCA filters
+MIN_READS_PCA   <- 10L     # min counts per peak
+MIN_SAMPLES_PCA <- 5L      # min samples with counts >= MIN_READS_PCA
+N_TOP_VAR_PCA   <- 50000L  # max number of most-variable peaks
+
+## Color palettes used throughout
+allele_cols <- c(T = "#E4007C", C = "#D3AF37")             # T (pink), C (gold)
+geno_cols   <- c(TT = "#E4007C", TC = "#4F6D7A", CC = "#D3AF37")  # genotype colors
+
+
+```
+
+# 2. SNP C/T profiles and genotype metadata
+## 2.1 Load SNP summary tables and merge
+
+```{r}
+## 2.1 Load SNP summary tables and merge ---------------------------------
+
+half_batches <- read.csv("../../half_batches_3_156sj.csv")
+second_batches <- read.csv("snp_summary_with_flags_all_batches.csv")
+
+## Remove the generic 'X' column (row index) if present
+half_batches_clean <- half_batches %>%
+  dplyr::select(-any_of("X"))
+
+## Sanity check: column sets should match before binding
+stopifnot(
+  identical(
+    sort(colnames(half_batches_clean)),
+    sort(colnames(second_batches))
+  )
+)
+
+## Safer row-bind (respects column names)
+combined_batches <- dplyr::bind_rows(half_batches_clean, second_batches)
+
+## Rename ALT.% column once to a safer name
+combined_batches <- combined_batches %>%
+  dplyr::rename(ALT_pct = `ALT.`)
+
+## Quick look
+head(combined_batches)
+
+```
+
+
+## 2.2 Derive C/T-based coverage state and T fraction
+
+```{r}
+## 2.2 Derive C/T-based coverage state and T fraction --------------------
+
+ct_only <- combined_batches %>%
+  transmute(
+    Sample,
+    C,
+    T,
+    ct_state = case_when(
+      T > 0 & C == 0 ~ "TT",
+      T > 0 & C > 0  ~ "TC",
+      C > 0 & T == 0 ~ "CC",
+      TRUE           ~ "NoCov"     # no coverage / weird combinations
+    ),
+    Tfrac = if_else(C + T > 0, T / (C + T), NA_real_)
+  )
+
+## Order: TT -> TC -> CC -> NoCov, and within each by decreasing Tfrac
+sample_levels <- ct_only %>%
+  arrange(
+    factor(ct_state, levels = c("TT", "TC", "CC", "NoCov")),
+    desc(Tfrac)
+  ) %>%
+  pull(Sample)
+
+```
+
+## 2.3 Define genotype from ALT percentage and QC vs C/T-based state
+
+```{r}
+## 2.3 Define genotype from ALT% and QC vs C/T-based state ---------------
+
+combined_batches <- combined_batches %>%
+  mutate(
+    genotype = case_when(
+      ALT_pct == 100 ~ "TT",
+      ALT_pct == 0   ~ "CC",
+      between(ALT_pct, 1, 99) ~ "TC",
+      TRUE ~ NA_character_
+    )
+  )
+
+## Join C/T state and genotype to check consistency
+geno_qc <- ct_only %>%
+  left_join(combined_batches %>% dplyr::select(Sample, genotype),
+            by = "Sample")
+
+## Cross-tabulation for QC (optional: inspect in console)
+geno_qc_table <- table(geno_qc$ct_state, geno_qc$genotype, useNA = "ifany")
+geno_qc_table
+
+```
+
+## 2.4 Barplot of C vs T counts per sample (ordered by genotype & Tfrac)
+```{r}
+## 2.4 Barplot of C vs T counts per sample -------------------------------
+
+snp_long <- ct_only %>%
+  dplyr::select(Sample, C, T) %>%
+  pivot_longer(cols = c(C, T),
+               names_to = "Base",
+               values_to = "Count") %>%
+  mutate(
+    Sample = factor(Sample, levels = sample_levels),
+    Base   = factor(Base, levels = c("T", "C"))  # T on top of C in stacks
+  )
+
+ggplot(snp_long, aes(x = Sample, y = Count, fill = Base)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = allele_cols) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(
+      angle = 90, hjust = 1, vjust = 0.5, size = 12
+    ),
+    axis.text.y   = element_text(size = 12),
+    axis.title.x  = element_text(size = 16),
+    axis.title.y  = element_text(size = 16),
+    legend.title  = element_text(size = 14),
+    legend.text   = element_text(size = 12),
+    plot.title    = element_text(size = 18, face = "bold"),
+    panel.grid.major.x = element_blank()
+  ) +
+  labs(
+    title = "C vs T counts per sample (ordered by C/T state and T fraction)",
+    x = "Sample",
+    y = "Read count",
+    fill = "Allele"
+  )
+
+```
+
+
+# 3. ATAC consensus peak matrix and genomic annotation
+## 3.1 Load featureCounts output and build counts matrix
+
+```{r}
+## 3.1 Load featureCounts matrix -----------------------------------------
+
+fc <- read.delim(
+  "consensus_peaks.mLb.clN.featureCounts.txt",
+  header       = TRUE,
+  comment.char = "#",
+  check.names  = FALSE   # keep original sample names
+)
+
+## Split annotation vs counts
+anno   <- fc[, 1:6]
+counts <- as.matrix(fc[, -(1:6)])
+
+rownames(counts) <- anno$Geneid
+storage.mode(counts) <- "integer"
+
+## Clean column names: strip full paths and reduce to "ATAC_XX_REP1"
+colnames(counts) <- basename(colnames(counts))
+colnames(counts) <- sub("^(ATAC_\\d+_REP1).*", "\\1", colnames(counts))
+
+## Sanity: Length should equal (End - Start + 1); hard stop if not
+stopifnot(all(anno$Length == (anno$End - anno$Start + 1)))
+
+```
+
+
+## 3.2 Build GRanges object and keep standard chromosomes
+
+```{r}
+## 3.2 Build GRanges and keep standard chromosomes -----------------------
+
+gr <- GRanges(
+  seqnames = anno$Chr,
+  ranges   = IRanges(start = anno$Start, end = anno$End),
+  strand   = ifelse(anno$Strand %in% c("+", "-"), anno$Strand, "*")
+)
+names(gr) <- anno$Geneid
+
+## Harmonize chromosome naming style with TxDb (UCSC style: chr1, chr2, ...)
+seqlevelsStyle(gr) <- "UCSC"
+
+## Restrict to canonical chromosomes; drop chrM and unused levels
+gr <- keepStandardChromosomes(gr, pruning.mode = "coarse")   # chr1–22, chrX, chrY, chrM
+gr <- keepSeqlevels(gr, setdiff(seqlevels(gr), "chrM"), pruning.mode = "coarse")
+gr <- keepSeqlevels(gr, seqlevelsInUse(gr), pruning.mode = "coarse")
+
+## Align counts rows to GRanges after chromosome filtering
+common_ids <- intersect(rownames(counts), names(gr))
+stopifnot(length(common_ids) > 0)
+
+counts <- counts[common_ids, , drop = FALSE]
+gr     <- gr[common_ids]
+
+```
+
+
+## 3.3 Annotate peaks with ChIPseeker (±1 kb around TSS)
+
+```{r}
+## 3.3 Annotate peaks with ChIPseeker (±1 kb TSS) ------------------------
+
+txdb <- TxDb.Hsapiens.UCSC.hg38.knownGene
+
+peakAnno <- annotatePeak(
+  gr,
+  TxDb      = txdb,
+  tssRegion = c(-1000, 1000),   # promoter window; report this in Methods
+  annoDb    = "org.Hs.eg.db",
+  level     = "gene"
+)
+
+anno_df <- as.data.frame(peakAnno)
+
+## Attach peak IDs as a stable key
+stopifnot(nrow(anno_df) == length(gr))
+anno_df$peak_id <- names(gr)
+
+## Minimal gene-centric annotation you'll reuse downstream
+gene_anno_min <- anno_df[, c("peak_id", "SYMBOL", "geneId", "annotation", "distanceToTSS")]
+
+```
+
+
+# 4. PCA of ATAC peaks by genotype (pre-subtype)
+## 4.1 Build ATAC metadata from SNP genotypes
+
+```{r}
+## 4.1 Build ATAC metadata from SNP genotypes -----------------------------
+
+## Start from combined_batches (which already has ALT_pct and genotype)
+meta <- combined_batches %>%
+  dplyr::select(Sample, genotype, ALT_pct) %>%
+  dplyr::mutate(
+    Sample   = as.character(Sample),
+    genotype = factor(genotype, levels = c("TT", "TC", "CC"))
+  ) %>%
+  dplyr::distinct(Sample, .keep_all = TRUE)
+
+## Align metadata to counts columns
+samples_in_counts <- intersect(colnames(counts), meta$Sample)
+stopifnot(length(samples_in_counts) > 0)
+
+meta_sub <- meta %>%
+  dplyr::filter(Sample %in% samples_in_counts) %>%
+  dplyr::arrange(match(Sample, colnames(counts)))
+
+## Optional: report samples present in counts but missing in meta
+missing_meta <- setdiff(colnames(counts), meta_sub$Sample)
+if (length(missing_meta) > 0) {
+  message("Samples in counts without metadata (will be dropped): ",
+          paste(missing_meta, collapse = ", "))
+}
+
+## Subset counts to samples with metadata and enforce same order
+counts_sub <- counts[, meta_sub$Sample, drop = FALSE]
+
+```
+
+## 4.2 PCA of all peaks by genotype
+
+```{r}
+## 4.2 PCA of all peaks by genotype --------------------------------------
+
+## Filter peaks for PCA stability
+keep <- rowSums(counts_sub >= MIN_READS_PCA) >= MIN_SAMPLES_PCA
+counts_filt <- counts_sub[keep, , drop = FALSE]
+
+## Restrict to top-N most variable peaks
+if (nrow(counts_filt) > N_TOP_VAR_PCA) {
+  v <- matrixStats::rowVars(as.matrix(counts_filt))
+  o <- order(v, decreasing = TRUE)[seq_len(N_TOP_VAR_PCA)]
+  counts_filt <- counts_filt[o, , drop = FALSE]
+}
+cat("Peaks retained for PCA (all peaks):", nrow(counts_filt), "\n")
+
+## VST transform with DESeq2 (blind = TRUE for exploratory PCA)
+dds <- DESeqDataSetFromMatrix(
+  countData = counts_filt,
+  colData   = as.data.frame(meta_sub),
+  design    = ~ 1
+)
+dds <- estimateSizeFactors(dds)
+vsd <- vst(dds, blind = TRUE)
+mat <- assay(vsd)   # peaks x samples
+
+## PCA on samples
+pca <- prcomp(t(mat), center = TRUE, scale. = FALSE)
+var_expl <- (pca$sdev^2) / sum(pca$sdev^2) * 100
+
+pca_df <- data.frame(
+  Sample   = meta_sub$Sample,
+  genotype = meta_sub$genotype,
+  ALT_pct  = meta_sub$ALT_pct,
+  PC1 = pca$x[, 1],
+  PC2 = pca$x[, 2],
+  PC3 = pca$x[, 3],
+  stringsAsFactors = FALSE
+)
+
+ggplot(pca_df, aes(x = PC1, y = PC2, color = genotype)) +
+  geom_point(size = 3, alpha = 0.9) +
+  scale_color_manual(values = geno_cols, drop = FALSE) +
+  labs(
+    title = "PCA of VST-transformed ATAC peak counts (all peaks)",
+    x     = paste0("PC1 (", round(var_expl[1], 1), "%)"),
+    y     = paste0("PC2 (", round(var_expl[2], 1), "%)"),
+    color = "Genotype"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title   = element_text(face = "bold"),
+    legend.title = element_text(size = 12),
+    legend.text  = element_text(size = 11)
+  )
+# + ggrepel::geom_text_repel(aes(label = Sample), max.overlaps = 50, size = 3)
+
+## (Optional) export PCA scores
+# write.table(pca_df, "PCA_scores_ATAC_all_peaks.tsv",
+#             sep = "\t", quote = FALSE, row.names = FALSE)
+
+```
+
+
+## 4.3 PCA of promoter peaks only (pre-subtype)
+```{r}
+## 4.3 PCA of promoter peaks only (pre-subtype) --------------------------
+
+## Select promoter peaks via ChIPseeker annotation
+## ChIPseeker uses labels like "Promoter (<=1kb)"; strip the detail part
+base_cat <- sub(" \\(.*\\)$", "", anno_df$annotation)
+promoter_ids <- anno_df$peak_id[base_cat == "Promoter"]
+
+## Intersect with available peaks in counts_sub
+promoter_ids <- intersect(promoter_ids, rownames(counts_sub))
+if (length(promoter_ids) == 0) {
+  stop("No promoter peaks found after intersection with counts.")
+}
+
+counts_prom <- counts_sub[promoter_ids, , drop = FALSE]
+
+## Filter promoter peaks for PCA stability
+keep_prom <- rowSums(counts_prom >= MIN_READS_PCA) >= MIN_SAMPLES_PCA
+counts_prom <- counts_prom[keep_prom, , drop = FALSE]
+if (nrow(counts_prom) < 500) {
+  message("Warning: <500 promoter peaks retained; consider relaxing filters.")
+}
+
+## Restrict to top-N most variable promoter peaks
+if (nrow(counts_prom) > N_TOP_VAR_PCA) {
+  v_prom <- matrixStats::rowVars(as.matrix(counts_prom))
+  o_prom <- order(v_prom, decreasing = TRUE)[seq_len(N_TOP_VAR_PCA)]
+  counts_prom <- counts_prom[o_prom, , drop = FALSE]
+}
+cat("Promoter peaks retained for PCA:", nrow(counts_prom), "\n")
+
+## VST transform and PCA
+dds_prom <- DESeqDataSetFromMatrix(
+  countData = counts_prom,
+  colData   = as.data.frame(meta_sub),
+  design    = ~ 1
+)
+dds_prom <- estimateSizeFactors(dds_prom)
+vsd_prom <- vst(dds_prom, blind = TRUE)
+mat_prom <- assay(vsd_prom)
+
+pca_prom <- prcomp(t(mat_prom), center = TRUE, scale. = FALSE)
+var_expl_prom <- (pca_prom$sdev^2) / sum(pca_prom$sdev^2) * 100
+
+pca_prom_df <- data.frame(
+  Sample   = meta_sub$Sample,
+  genotype = meta_sub$genotype,
+  ALT_pct  = meta_sub$ALT_pct,
+  PC1 = pca_prom$x[, 1],
+  PC2 = pca_prom$x[, 2],
+  stringsAsFactors = FALSE
+)
+
+ggplot(pca_prom_df, aes(x = PC1, y = PC2, color = genotype)) +
+  geom_point(size = 3, alpha = 0.9) +
+  scale_color_manual(values = geno_cols, drop = FALSE) +
+  labs(
+    title = "PCA of VST-transformed ATAC counts (promoter peaks only)",
+    x     = paste0("PC1 (", round(var_expl_prom[1], 1), "%)"),
+    y     = paste0("PC2 (", round(var_expl_prom[2], 1), "%)"),
+    color = "Genotype"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title   = element_text(face = "bold"),
+    legend.title = element_text(size = 12),
+    legend.text  = element_text(size = 11)
+  )
+
+## (Optional) export promoter PCA scores
+# write.table(pca_prom_df, "PCA_scores_ATAC_promoters.tsv",
+#             sep = "\t", quote = FALSE, row.names = FALSE)
+
+```
+
+
+
+# 5. Integration of St. Jude molecular subtypes into PCA
+## 5.1 Load subtype table and merge with ATAC metadata
+```{r}
+## 5.1 Load St. Jude subtype table and merge with ATAC meta --------------
+
+suppressPackageStartupMessages(library(readxl))
+
+## This assumes `meta` already exists from Section 4.1
+## and contains columns: Sample, genotype, ALT_pct
+
+sj_subtypes <- readxl::read_xlsx("mmc3 (2).xlsx")
+
+## Harmonise sample IDs: ATAC_123_REP1 → ATAC_sample_123
+meta_sj <- meta %>%
+  dplyr::mutate(
+    Sample_ID = gsub("ATAC_(\\d+)_REP1", "ATAC_sample_\\1", Sample)
+  ) %>%
+  dplyr::left_join(
+    sj_subtypes %>% dplyr::select(Sample_ID, Subtype),
+    by = "Sample_ID"
+  )
+
+## Optional: check how many samples got a subtype
+table(is.na(meta_sj$Subtype))
+
+```
+
+## 5.2 Helper: PCA with genotype + subtype labels
+
+```{r}
+## 5.2 Helper to run PCA with genotype + subtype labels ------------------
+
+run_atac_pca_with_subtype <- function(counts,
+                                      meta_sj,
+                                      peak_ids = NULL,
+                                      title   = "PCA of VST-transformed ATAC counts") {
+  stopifnot(is.matrix(counts))
+  stopifnot(all(c("Sample", "genotype", "ALT_pct", "Subtype") %in% names(meta_sj)))
+
+  ## 1) Align metadata to count matrix columns
+  meta_sub <- meta_sj %>%
+    dplyr::select(Sample, genotype, ALT_pct, Subtype) %>%
+    dplyr::mutate(
+      Sample   = as.character(Sample),
+      genotype = factor(genotype, levels = c("TT", "TC", "CC"))
+    ) %>%
+    dplyr::distinct(Sample, .keep_all = TRUE)
+
+  samples_in_counts <- intersect(colnames(counts), meta_sub$Sample)
+  stopifnot(length(samples_in_counts) > 0)
+
+  meta_sub <- meta_sub %>%
+    dplyr::filter(Sample %in% samples_in_counts) %>%
+    dplyr::arrange(match(Sample, colnames(counts)))
+
+  counts_sub <- counts[, meta_sub$Sample, drop = FALSE]
+
+  ## 2) Optional: restrict to given peak subset (e.g., promoters)
+  if (!is.null(peak_ids)) {
+    peak_ids <- intersect(peak_ids, rownames(counts_sub))
+    if (length(peak_ids) == 0L) {
+      stop("No peaks remain after intersecting `peak_ids` with count matrix rownames.")
+    }
+    counts_sub <- counts_sub[peak_ids, , drop = FALSE]
+  }
+
+  ## 3) Peak filtering for stable PCA
+  keep <- rowSums(counts_sub >= MIN_READS_PCA) >= MIN_SAMPLES_PCA
+  counts_filt <- counts_sub[keep, , drop = FALSE]
+
+  if (nrow(counts_filt) == 0L) {
+    stop("All peaks were filtered out; relax MIN_READS_PCA / MIN_SAMPLES_PCA.")
+  }
+
+  ## Restrict to top-N most variable peaks
+  if (nrow(counts_filt) > N_TOP_VAR_PCA) {
+    v <- matrixStats::rowVars(as.matrix(counts_filt))
+    o <- order(v, decreasing = TRUE)[seq_len(N_TOP_VAR_PCA)]
+    counts_filt <- counts_filt[o, , drop = FALSE]
+  }
+
+  cat("Peaks retained for PCA (",
+      if (is.null(peak_ids)) "all" else "subset",
+      "): ", nrow(counts_filt), "\n", sep = "")
+
+  ## 4) VST and PCA
+  dds <- DESeqDataSetFromMatrix(
+    countData = counts_filt,
+    colData   = as.data.frame(meta_sub),
+    design    = ~ 1
+  )
+  dds <- estimateSizeFactors(dds)
+  vsd <- vst(dds, blind = TRUE)
+  mat <- assay(vsd)
+
+  pca <- stats::prcomp(t(mat), center = TRUE, scale. = FALSE)
+  var_expl <- (pca$sdev^2) / sum(pca$sdev^2) * 100
+
+  pca_df <- data.frame(
+    Sample   = meta_sub$Sample,
+    genotype = meta_sub$genotype,
+    ALT_pct  = meta_sub$ALT_pct,
+    Subtype  = meta_sub$Subtype,
+    PC1      = pca$x[, 1],
+    PC2      = pca$x[, 2],
+    stringsAsFactors = FALSE
+  )
+
+  p <- ggplot(pca_df, aes(PC1, PC2, color = genotype)) +
+    geom_point(size = 3, alpha = 0.9) +
+    ggrepel::geom_text_repel(
+      aes(label = Subtype),
+      size             = 4,
+      max.overlaps     = Inf,
+      min.segment.length = 0,
+      box.padding      = 0.3,
+      point.padding    = 0.2
+    ) +
+    scale_color_manual(values = geno_cols, drop = FALSE) +
+    labs(
+      title = title,
+      x     = paste0("PC1 (", round(var_expl[1], 1), "%)"),
+      y     = paste0("PC2 (", round(var_expl[2], 1), "%)"),
+      color = "Genotype"
+    ) +
+    theme_bw(base_size = 14) +
+    theme(
+      plot.title   = element_text(face = "bold"),
+      legend.title = element_text(size = 12),
+      legend.text  = element_text(size = 11)
+    )
+
+  invisible(list(
+    pca_df   = pca_df,
+    var_expl = var_expl,
+    plot     = p
+  ))
+}
+```
+
+## 5.3 PCA – all peaks with genotype + subtype labels
+```{r}
+## 5.3 PCA of all peaks with genotype + subtype --------------------------
+
+res_pca_all_subtype <- run_atac_pca_with_subtype(
+  counts  = counts,
+  meta_sj = meta_sj,
+  peak_ids = NULL,
+  title   = "PCA of VST-transformed ATAC peak counts (ALL peaks, genotype + subtype)"
+)
+
+## To display the plot in an interactive session:
+res_pca_all_subtype$plot
+
+## Optional: export PCA scores
+# write.table(res_pca_all_subtype$pca_df,
+#             "PCA_scores_all_peaks_with_subtype.tsv",
+#             sep = "\t", quote = FALSE, row.names = FALSE)
+
+```
+
+## 5.4 PCA – promoter peaks only with genotype + subtype labels
+
+```{r}
+## 5.4 PCA of promoter peaks only with genotype + subtype ----------------
+
+## Select promoter peaks from ChIPseeker annotation
+base_cat <- sub(" \\(.*\\)$", "", anno_df$annotation)   # strip "(<=1kb)" etc.
+promoter_ids <- anno_df$peak_id[base_cat == "Promoter"]
+
+if (length(promoter_ids) == 0L) {
+  stop("No peaks are annotated as 'Promoter' in anno_df.")
+}
+
+res_pca_prom_subtype <- run_atac_pca_with_subtype(
+  counts   = counts,
+  meta_sj  = meta_sj,
+  peak_ids = promoter_ids,
+  title    = "PCA of VST-transformed ATAC counts (Promoter peaks only, genotype + subtype)"
+)
+
+## To display the plot:
+# res_pca_prom_subtype$plot
+
+## Optional: export promoter PCA scores
+# write.table(res_pca_prom_subtype$pca_df,
+#             "PCA_scores_promoters_with_subtype.tsv",
+#             sep = "\t", quote = FALSE, row.names = FALSE)
+
+```
+
+
+# 6. Lineage module scores using Iacobucci panel (“Ilaria’s 700 genes”)
+## 6.1 Load Iacobucci panel and reshape wide → long
+
+```{r}
+## 6.1 Load Iacobucci panel and reshape wide → long ----------------------
+
+suppressPackageStartupMessages({
+  library(edgeR)
+  library(pheatmap)
+  library(stringr)
+})
+
+## Lineage order and colors (Iacobucci-like B-cell trajectory)
+ct_levels <- c("HSCMPP", "GMP", "pDC", "EarlyLymphoid", "ProB", "PreB", "B")
+
+cell_type_colors <- c(
+  HSCMPP        = "#fb8072",
+  GMP           = "#bebada",
+  pDC           = "#ffd92f",
+  EarlyLymphoid = "#f781bf",
+  ProB          = "#ff33ff",
+  PreB          = "#00e5c0",
+  B             = "#00bfff"
+)
+
+margin_colors <- c(
+  "Q1 (lowest)"  = "#c7e9c0",
+  "Q2"           = "#a1d99b",
+  "Q3"           = "#74c476",
+  "Q4 (highest)" = "#238b45"
+)
+
+## Read pre-cleaned Iacobucci “700 genes” panel
+panel_path <- "~/Desktop/Tzu_projects/Matt/Clarissa/snp_cell_lines_public_datasets_project/sj_expression_arid5b_Wenjian/clean_ilarias_700_genes.csv"
+
+panel_wide <- read.csv(panel_path, check.names = FALSE)
+
+## Trim whitespace from all entries
+panel_wide <- panel_wide %>%
+  dplyr::mutate(dplyr::across(dplyr::everything(), ~ trimws(as.character(.)))) %>%
+  { 
+    ## If column names match ct_levels, reorder to that canonical order
+    if (all(sort(names(.)) == sort(ct_levels))) {
+      .[, ct_levels, drop = FALSE]
+    } else {
+      .
+    }
+  }
+
+## Wide (columns = lineages) → long: (cell_type, gene)
+panel_long <- panel_wide %>%
+  tidyr::pivot_longer(
+    cols      = dplyr::everything(),
+    names_to  = "cell_type",
+    values_to = "gene"
+  ) %>%
+  dplyr::filter(!is.na(gene), gene != "") %>%
+  dplyr::mutate(cell_type = factor(cell_type, levels = ct_levels))
+
+```
+
+
+## 6.2 Align counts + annotation; helper to build module matrix
+
+```{r}
+## 6.2 Align counts rows to anno_df and define module helper --------------
+
+## REQUIRE: `counts` (peaks x samples), `anno_df` with peak_id, SYMBOL, annotation
+stopifnot(all(c("peak_id", "SYMBOL", "annotation") %in% names(anno_df)))
+
+peaks_in_counts <- nrow(counts)
+peaks_in_anno   <- length(unique(anno_df$peak_id))
+common_peaks    <- intersect(rownames(counts), anno_df$peak_id)
+
+cat("Peaks in counts: ",  peaks_in_counts, "\n",
+    "Peaks in anno_df:", peaks_in_anno,   "\n",
+    "Intersection:    ", length(common_peaks), "\n",
+    "Dropped (counts - anno): ",
+    peaks_in_counts - length(common_peaks), "\n", sep = "")
+
+stopifnot(length(common_peaks) > 0L)
+
+## Keep only peaks that have an annotation
+counts_annot <- counts[common_peaks, , drop = FALSE]
+
+## Helper to compute lineage module scores and heatmap --------------------
+build_modules_from_atac <- function(count_mat,
+                                    anno_tbl,
+                                    panel_long,
+                                    use_subset = c("all_gene_assigned", "promoter_only"),
+                                    min_reads = 10,
+                                    min_samples = 5,
+                                    aggregator = c("max", "mean"),
+                                    clip_z = 2) {
+  use_subset <- match.arg(use_subset)
+  aggregator <- match.arg(aggregator)
+
+  ## 1) Restrict to annotated peaks (SYMBOL) and optionally to promoters
+  anno_use <- anno_tbl %>%
+    dplyr::filter(!is.na(SYMBOL), SYMBOL != "")
+
+  if (use_subset == "promoter_only") {
+    base_cat <- sub(" \\(.*\\)$", "", anno_use$annotation)
+    anno_use <- anno_use[base_cat == "Promoter", , drop = FALSE]
+  }
+
+  peak_ids <- intersect(anno_use$peak_id, rownames(count_mat))
+  if (length(peak_ids) == 0L) {
+    stop("No peaks found for the chosen subset (", use_subset, ").")
+  }
+
+  ## 2) Basic peak filtering
+  x <- count_mat[peak_ids, , drop = FALSE]
+  keep <- rowSums(x >= min_reads) >= min_samples
+  x <- x[keep, , drop = FALSE]
+  if (nrow(x) == 0L) {
+    stop("All peaks filtered out; relax min_reads / min_samples.")
+  }
+
+  ## 3) Library-size normalization → logCPM
+  logcpm <- edgeR::cpm(x, log = TRUE, prior.count = 1)
+
+  ## 4) Collapse peaks → genes using SYMBOL and chosen aggregator
+  symb  <- anno_use$SYMBOL[match(rownames(logcpm), anno_use$peak_id)]
+  logdf <- data.frame(SYMBOL = symb, as.data.frame(logcpm), check.names = FALSE)
+
+  if (aggregator == "max") {
+    gene_mat <- logdf %>%
+      dplyr::group_by(SYMBOL) %>%
+      dplyr::summarise(
+        dplyr::across(where(is.numeric), ~ max(., na.rm = TRUE)),
+        .groups = "drop"
+      )
+  } else {
+    gene_mat <- logdf %>%
+      dplyr::group_by(SYMBOL) %>%
+      dplyr::summarise(
+        dplyr::across(where(is.numeric), ~ mean(., na.rm = TRUE)),
+        .groups = "drop"
+      )
+  }
+
+  gene_mat <- as.data.frame(gene_mat)
+  rownames(gene_mat) <- gene_mat$SYMBOL
+  gene_mat$SYMBOL <- NULL
+  gene_mat <- as.matrix(gene_mat)
+
+  ## 5) Row z-score (genes) across samples; remove zero-variance; clip
+  zero_var <- matrixStats::rowVars(gene_mat) == 0
+  if (any(zero_var)) gene_mat <- gene_mat[!zero_var, , drop = FALSE]
+  if (nrow(gene_mat) == 0L) {
+    stop("No genes left after zero-variance filter.")
+  }
+
+  z_gene <- t(scale(t(gene_mat)))
+  z_gene[is.na(z_gene)] <- 0
+  if (!is.null(clip_z)) {
+    z_gene <- pmin(pmax(z_gene, -clip_z), clip_z)
+  }
+
+  ## 6) Average z-score per lineage (panel gene sets)
+  z_genes <- rownames(z_gene)
+  avg_list <- lapply(levels(panel_long$cell_type), function(ct) {
+    g_ct <- panel_long$gene[panel_long$cell_type == ct]
+    g_ct <- intersect(unique(g_ct), z_genes)
+    if (length(g_ct) == 0L) {
+      rep(NA_real_, ncol(z_gene))
+    } else {
+      colMeans(z_gene[g_ct, , drop = FALSE])
+    }
+  })
+
+  avg_z_by_ct <- do.call(rbind, avg_list)
+  rownames(avg_z_by_ct) <- levels(panel_long$cell_type)
+  colnames(avg_z_by_ct) <- colnames(z_gene)
+
+  ## Drop lineages with no genes present
+  all_na <- apply(avg_z_by_ct, 1, function(r) all(is.na(r)))
+  if (any(all_na)) {
+    message("Dropping lineages with no genes present in ATAC data: ",
+            paste(rownames(avg_z_by_ct)[all_na], collapse = ", "))
+    avg_z_by_ct <- avg_z_by_ct[!all_na, , drop = FALSE]
+  }
+
+  ## 7) Determine "winner" lineage per sample and ordering
+  top_idx    <- apply(avg_z_by_ct, 2, which.max)
+  second_idx <- apply(avg_z_by_ct, 2, function(v) order(v, decreasing = TRUE)[2])
+
+  top_ct       <- rownames(avg_z_by_ct)[top_idx]
+  second_ct    <- rownames(avg_z_by_ct)[second_idx]
+  top_score    <- mapply(function(j, i)  avg_z_by_ct[i,  j], seq_along(top_idx),    top_idx)
+  second_score <- mapply(function(j, i2) avg_z_by_ct[i2, j], seq_along(second_idx), second_idx)
+  margin       <- top_score - second_score
+
+  winner_order <- factor(
+    top_ct,
+    levels = c(
+      intersect(ct_levels, rownames(avg_z_by_ct)),
+      setdiff(rownames(avg_z_by_ct), ct_levels)
+    )
+  )
+
+  col_order <- order(winner_order, -margin, -top_score)
+  avg_z_by_ct_ord <- avg_z_by_ct[, col_order, drop = FALSE]
+
+  ## 8) Margin quantiles for annotation
+  margin_bins <- cut(
+    margin[col_order],
+    breaks = stats::quantile(margin, probs = seq(0, 1, 0.25), na.rm = TRUE),
+    include.lowest = TRUE,
+    labels = c("Q1 (lowest)", "Q2", "Q3", "Q4 (highest)")
+  )
+
+  ann_col <- data.frame(
+    top_ct = factor(top_ct[col_order], levels = rownames(avg_z_by_ct)),
+    margin = margin_bins,
+    row.names = colnames(avg_z_by_ct_ord)
+  )
+
+  r <- rle(as.character(ann_col$top_ct))
+  gaps_col <- if (length(r$lengths) > 1L) cumsum(r$lengths)[-length(r$lengths)] else NULL
+
+  ## 9) Plot heatmap
+  pheatmap::pheatmap(
+    avg_z_by_ct_ord,
+    cluster_rows   = FALSE,
+    cluster_cols   = FALSE,
+    show_rownames  = TRUE,
+    show_colnames  = FALSE,
+    annotation_col = ann_col,
+    annotation_colors = list(
+      top_ct = cell_type_colors[names(cell_type_colors) %in% rownames(avg_z_by_ct_ord)],
+      margin = margin_colors
+    ),
+    gaps_col    = gaps_col,
+    gaps_row    = if (nrow(avg_z_by_ct_ord) > 1L) seq_len(nrow(avg_z_by_ct_ord) - 1L) else NULL,
+    border_color = NA,
+    main = paste0(
+      "ATAC module scores — ",
+      if (use_subset == "promoter_only") "Promoters only" else "All gene-assigned peaks",
+      " (aggregator = ", aggregator, ")"
+    )
+  )
+
+  invisible(list(
+    avg_z_by_ct     = avg_z_by_ct,
+    avg_z_by_ct_ord = avg_z_by_ct_ord,
+    ann_col         = ann_col,
+    z_gene          = z_gene
+  ))
+}
+
+```
+
+## 6.3 Run module analysis: ALL peaks vs PROMOTER-only
+
+```{r}
+## 6.3 Run module analysis: ALL peaks vs PROMOTER-only --------------------
+
+mods_all <- build_modules_from_atac(
+  count_mat  = counts_annot,
+  anno_tbl   = anno_df,
+  panel_long = panel_long,
+  use_subset = "all_gene_assigned",
+  min_reads  = 10,
+  min_samples = 5,
+  aggregator = "max",
+  clip_z     = 2
+)
+avg_z_by_ct_ord_all <- mods_all$avg_z_by_ct_ord
+ann_col_all         <- mods_all$ann_col
+
+cat("\nHead of avg_z_by_ct_ord_all:\n")
+print(utils::head(avg_z_by_ct_ord_all, 2))
+
+mods_prom <- build_modules_from_atac(
+  count_mat  = counts_annot,
+  anno_tbl   = anno_df,
+  panel_long = panel_long,
+  use_subset = "promoter_only",
+  min_reads  = 10,
+  min_samples = 5,
+  aggregator = "max",
+  clip_z     = 2
+)
+avg_z_by_ct_ord_prom <- mods_prom$avg_z_by_ct_ord
+ann_col_prom         <- mods_prom$ann_col
+
+cat("\nHead of avg_z_by_ct_ord_prom:\n")
+print(utils::head(avg_z_by_ct_ord_prom, 2))
+
+## Optional: export module matrices
+# write.table(avg_z_by_ct_ord_all,  "ATAC_avgZ_byCT_ALL_ord.tsv",
+#             sep = "\t", quote = FALSE)
+# write.table(avg_z_by_ct_ord_prom, "ATAC_avgZ_byCT_PROM_ord.tsv",
+#             sep = "\t", quote = FALSE)
+
+```
+
+## 6.4 Replot module heatmaps adding genotype annotation
+
+```{r}
+## 6.4 Replot module heatmaps with genotype annotation -------------------
+
+geno_cols <- c(TT = "#E4007C", TC = "#4F6D7A", CC = "#D3AF37")
+
+plot_modules_with_genotype <- function(mat_ord, ann_col, title) {
+  stopifnot(is.matrix(mat_ord), is.data.frame(ann_col))
+  stopifnot(exists("meta_sj"))
+
+  geno_tbl <- meta_sj %>%
+    dplyr::select(Sample, genotype) %>%
+    dplyr::mutate(genotype = factor(genotype, levels = c("TT", "TC", "CC"))) %>%
+    dplyr::distinct(Sample, .keep_all = TRUE)
+
+  ann2 <- ann_col[colnames(mat_ord), , drop = FALSE]
+  ann2$genotype <- geno_tbl$genotype[match(rownames(ann2), geno_tbl$Sample)]
+
+  if (any(is.na(ann2$genotype))) {
+    msg <- paste(rownames(ann2)[is.na(ann2$genotype)], collapse = ", ")
+    message("Samples missing genotype (annotation shown as NA): ", msg)
+  }
+
+  r <- rle(as.character(ann2$top_ct))
+  gaps_col <- if (length(r$lengths) > 1L) cumsum(r$lengths)[-length(r$lengths)] else NULL
+
+  pheatmap::pheatmap(
+    mat_ord,
+    cluster_rows   = FALSE,
+    cluster_cols   = FALSE,
+    show_rownames  = TRUE,
+    show_colnames  = FALSE,
+    annotation_col = ann2,
+    annotation_colors = list(
+      top_ct   = cell_type_colors[names(cell_type_colors) %in% rownames(mat_ord)],
+      margin   = margin_colors,
+      genotype = geno_cols
+    ),
+    gaps_col    = gaps_col,
+    gaps_row    = if (nrow(mat_ord) > 1L) seq_len(nrow(mat_ord) - 1L) else NULL,
+    border_color = NA,
+    main = title
+  )
+}
+
+## ALL gene-assigned peaks + genotype
+plot_modules_with_genotype(
+  mat_ord = avg_z_by_ct_ord_all,
+  ann_col = ann_col_all,
+  title   = "ATAC module scores — ALL peaks (with genotype)"
+)
+
+## PROMOTER-only peaks + genotype
+plot_modules_with_genotype(
+  mat_ord = avg_z_by_ct_ord_prom,
+  ann_col = ann_col_prom,
+  title   = "ATAC module scores — Promoters only (with genotype)"
+)
+
+```
+
+## 6.5 Replot module heatmaps adding genotype + subtype annotations
+
+```{r}
+## 6.5 Replot module heatmaps with genotype + subtype --------------------
+
+suppressPackageStartupMessages(library(RColorBrewer))
+
+## Automatic subtype color palette
+make_subtype_colors <- function(subtypes) {
+  subs <- sort(unique(stats::na.omit(subtypes)))
+  n    <- length(subs)
+  base <- RColorBrewer::brewer.pal(12, "Set3")
+  pal  <- if (n <= 12L) base[seq_len(n)] else grDevices::colorRampPalette(base)(n)
+  stats::setNames(pal, subs)
+}
+
+plot_modules_with_genotype_subtype <- function(mat_ord, ann_col, title) {
+  stopifnot(is.matrix(mat_ord), is.data.frame(ann_col))
+  stopifnot(exists("meta_sj"))
+
+  meta_min <- meta_sj %>%
+    dplyr::select(Sample, genotype, Subtype) %>%
+    dplyr::mutate(genotype = factor(genotype, levels = c("TT", "TC", "CC"))) %>%
+    dplyr::distinct(Sample, .keep_all = TRUE)
+
+  ann2 <- ann_col[colnames(mat_ord), , drop = FALSE]
+  ann2$genotype <- meta_min$genotype[match(rownames(ann2), meta_min$Sample)]
+  ann2$Subtype  <- meta_min$Subtype[match(rownames(ann2), meta_min$Sample)]
+
+  if (any(is.na(ann2$genotype))) {
+    message("Samples missing genotype: ",
+            paste(rownames(ann2)[is.na(ann2$genotype)], collapse = ", "))
+  }
+  if (any(is.na(ann2$Subtype))) {
+    message("Samples missing Subtype: ",
+            paste(rownames(ann2)[is.na(ann2$Subtype)], collapse = ", "))
+  }
+
+  sub_cols <- make_subtype_colors(ann2$Subtype)
+
+  r <- rle(as.character(ann2$top_ct))
+  gaps_col <- if (length(r$lengths) > 1L) cumsum(r$lengths)[-length(r$lengths)] else NULL
+
+  pheatmap::pheatmap(
+    mat_ord,
+    cluster_rows   = FALSE,
+    cluster_cols   = FALSE,
+    show_rownames  = TRUE,
+    show_colnames  = FALSE,
+    annotation_col = ann2,
+    annotation_colors = list(
+      top_ct   = cell_type_colors[names(cell_type_colors) %in% rownames(mat_ord)],
+      margin   = margin_colors,
+      genotype = geno_cols,
+      Subtype  = sub_cols
+    ),
+    gaps_col    = gaps_col,
+    gaps_row    = if (nrow(mat_ord) > 1L) seq_len(nrow(mat_ord) - 1L) else NULL,
+    border_color = NA,
+    main = title
+  )
+}
+
+## ALL peaks: genotype + subtype
+plot_modules_with_genotype_subtype(
+  mat_ord = avg_z_by_ct_ord_all,
+  ann_col = ann_col_all,
+  title   = "ATAC module scores — ALL peaks (with genotype + subtype)"
+)
+
+## PROMOTER-only: genotype + subtype
+plot_modules_with_genotype_subtype(
+  mat_ord = avg_z_by_ct_ord_prom,
+  ann_col = ann_col_prom,
+  title   = "ATAC module scores — Promoters only (with genotype + subtype)"
+)
+
+```
+# 7 Spain lineage modules
+
+```{r}
+# =====================================================================
+# 7. Spain-specific lineage modules (PROMOTER vs ENHANCER markers)
+#    Same ATAC "openness" scoring pipeline as Section 6,
+#    but with Spain marker genes and explicit HSC → CLP → ProB → PreB → Immature-B ordering
+# =====================================================================
+
+suppressPackageStartupMessages({
+    library(dplyr)
+    library(tidyr)
+    library(readr)
+})
+
+
+spain_prom_path <- "~/Desktop/Tzu_projects/Matt/Clarissa/snp_cell_lines_public_datasets_project/spain_group/atacseq/100_M_reads/promoter_markers_by_celltype_marker_genes_wide.csv"
+spain_enh_path  <- "~/Desktop/Tzu_projects/Matt/Clarissa/snp_cell_lines_public_datasets_project/spain_group/atacseq/100_M_reads/enhancer_markers_by_celltype_marker_genes_wide.csv"
+
+## Canonical Spain lineage order for the heatmaps
+ct_spain_order <- c("HSC", "CLP", "ProB", "PreB", "Immature-B")
+
+load_spain_panel_long <- function(path, ct_order) {
+    wide <- read.csv(path, check.names = FALSE)
+    
+    wide <- wide %>%
+        mutate(across(everything(), ~ trimws(as.character(.))))
+    
+    ## If columns are exactly the cell types, reorder to canonical order
+    if (all(sort(colnames(wide)) == sort(ct_order))) {
+        wide <- wide[, ct_order, drop = FALSE]
+    }
+    
+    wide %>%
+        pivot_longer(
+            cols      = everything(),
+            names_to  = "cell_type",
+            values_to = "gene"
+        ) %>%
+        filter(!is.na(gene), gene != "") %>%
+        mutate(cell_type = factor(cell_type, levels = ct_order))
+}
+
+panel_spain_prom_long <- load_spain_panel_long(spain_prom_path, ct_spain_order)
+panel_spain_enh_long  <- load_spain_panel_long(spain_enh_path,  ct_spain_order)
+
+
+# =====================================================================
+# New, plotting-free build_modules_from_atac()
+# Works for BOTH Ilaria and Spain marker panels
+# =====================================================================
+build_modules_from_atac <- function(count_mat,
+                                    anno_tbl,
+                                    panel_long,
+                                    use_subset  = c("all_gene_assigned", "promoter_only"),
+                                    min_reads   = 10,
+                                    min_samples = 5,
+                                    aggregator = c("max", "sum", "mean"),
+                                    clip_z      = 2) {
+  stopifnot(is.matrix(count_mat),
+            is.data.frame(anno_tbl),
+            is.data.frame(panel_long))
+  stopifnot("peak_id" %in% colnames(anno_tbl),
+            "SYMBOL"  %in% colnames(anno_tbl),
+            "annotation" %in% colnames(anno_tbl))
+
+  use_subset <- match.arg(use_subset)
+  aggregator <- match.arg(aggregator)
+
+  # Align annotation to count_mat rows
+  anno_sub <- anno_tbl[match(rownames(count_mat), anno_tbl$peak_id), ]
+  stopifnot(identical(anno_sub$peak_id, rownames(count_mat)))
+
+  # Strip " (1-2kb)" etc from annotation
+  base_cat <- sub(" \\(.*\\)$", "", anno_sub$annotation)
+
+  has_gene <- !is.na(anno_sub$SYMBOL) & anno_sub$SYMBOL != ""
+
+  if (use_subset == "promoter_only") {
+    keep_peaks <- (base_cat == "Promoter") & has_gene
+  } else {
+    # all_gene_assigned = any peak with a SYMBOL
+    keep_peaks <- has_gene
+  }
+
+  count_sub <- count_mat[keep_peaks, , drop = FALSE]
+  anno_sub  <- anno_sub[keep_peaks, , drop = FALSE]
+
+  if (nrow(count_sub) == 0L) {
+    stop("No peaks left after filtering for subset = ", use_subset,
+         " and having a valid gene symbol.")
+  }
+
+  # Peak-level filtering by read support
+  keep_peaks2 <- rowSums(count_sub >= min_reads) >= min_samples
+  count_sub   <- count_sub[keep_peaks2, , drop = FALSE]
+  anno_sub    <- anno_sub[keep_peaks2, , drop = FALSE]
+
+  if (nrow(count_sub) == 0L) {
+    stop("No peaks left after min_reads/min_samples filters.")
+  }
+
+  # ------------------------------------------------------------
+  # Gene-level counts: aggregate peaks per gene
+  # ------------------------------------------------------------
+  gene2peak <- split(rownames(count_sub), anno_sub$SYMBOL)
+
+  agg_fun <- switch(
+    aggregator,
+    max  = function(x) apply(x, 2, max),
+    sum  = function(x) colSums(x),
+    mean = function(x) colMeans(x)
+  )
+
+  gene_counts <- vapply(
+    gene2peak,
+    function(peaks) agg_fun(count_sub[peaks, , drop = FALSE]),
+    FUN.VALUE = numeric(ncol(count_sub))
+  )
+  gene_counts <- t(gene_counts)
+  colnames(gene_counts) <- colnames(count_sub)
+
+  # Optional: gene-level filter for stability
+  keep_genes <- rowSums(gene_counts >= min_reads) >= min_samples
+  gene_counts <- gene_counts[keep_genes, , drop = FALSE]
+
+  if (nrow(gene_counts) == 0L) {
+    stop("No genes left after gene-level min_reads/min_samples filters.")
+  }
+
+  # ------------------------------------------------------------
+  # logCPM + per-gene z-scores
+  # ------------------------------------------------------------
+  logcpm <- edgeR::cpm(gene_counts, log = TRUE, prior.count = 1)
+
+  z_gene <- t(scale(t(logcpm)))
+  z_gene[is.na(z_gene)] <- 0
+  if (!is.null(clip_z)) {
+    z_gene <- pmin(pmax(z_gene, -clip_z), clip_z)
+  }
+
+  # ------------------------------------------------------------
+  # Average z-score per lineage (module matrix)
+  # ------------------------------------------------------------
+  ct_levels_local <- sort(unique(as.character(panel_long$cell_type)))
+
+  avg_list <- lapply(ct_levels_local, function(ct) {
+    g_ct <- panel_long$gene[panel_long$cell_type == ct]
+    g_ct <- intersect(unique(as.character(g_ct)), rownames(z_gene))
+    if (length(g_ct) == 0L) {
+      rep(NA_real_, ncol(z_gene))
+    } else {
+      colMeans(z_gene[g_ct, , drop = FALSE])
+    }
+  })
+
+  avg_z_by_ct <- do.call(rbind, avg_list)
+  rownames(avg_z_by_ct) <- ct_levels_local
+  colnames(avg_z_by_ct) <- colnames(z_gene)
+
+  # Return ONLY data; all plotting happens in dedicated functions
+  invisible(list(
+    avg_z_by_ct = avg_z_by_ct,
+    z_gene      = z_gene,
+    gene_counts = gene_counts,
+    panel_long  = panel_long,
+    subset      = use_subset
+  ))
+}
+
+
+## NOTE: uses build_modules_from_atac() defined above (no changes).
+
+mods_spain_prom <- build_modules_from_atac(
+    count_mat   = counts_annot,
+    anno_tbl    = anno_df,
+    panel_long  = panel_spain_prom_long,
+    use_subset  = "promoter_only",       # like "Promoters only" in Ilaria section
+    min_reads   = 10,
+    min_samples = 5,
+    aggregator  = "max",
+    clip_z      = 2
+)
+
+mods_spain_enh <- build_modules_from_atac(
+    count_mat   = counts_annot,
+    anno_tbl    = anno_df,
+    panel_long  = panel_spain_enh_long,
+    use_subset  = "all_gene_assigned",   # enhancer markers can use all annotated peaks
+    min_reads   = 10,
+    min_samples = 5,
+    aggregator  = "max",
+    clip_z      = 2
+)
+
+cat("\nHead of raw Spain PROMOTER avg_z_by_ct:\n")
+print(utils::head(mods_spain_prom$avg_z_by_ct, 2))
+cat("\nHead of raw Spain ENHANCER avg_z_by_ct:\n")
+print(utils::head(mods_spain_enh$avg_z_by_ct, 2))
+
+##     HSC-max samples are leftmost, then CLP, then ProB, then PreB, then Immature-B
+##     within each group, samples with the "reddest" (highest) module score appear first
+
+prep_spain_modules <- function(mods_obj, ct_order) {
+    mat0 <- mods_obj$avg_z_by_ct          # lineages x samples, unsorted
+    
+    ## Keep only Spain cell types and put them in canonical order (rows)
+    ct_present <- intersect(ct_order, rownames(mat0))
+    mat0 <- mat0[ct_present, , drop = FALSE]
+    
+    ## For each sample, identify top and second-best lineage and their scores
+    top_idx     <- apply(mat0, 2, which.max)
+    top_ct      <- rownames(mat0)[top_idx]
+    top_score   <- mat0[cbind(top_idx, seq_along(top_idx))]
+    
+    second_idx  <- apply(mat0, 2, function(v) order(v, decreasing = TRUE)[2])
+    second_score <- mat0[cbind(second_idx, seq_along(second_idx))]
+    margin      <- top_score - second_score
+    
+    ## Ordering: first by top_ct (HSC → CLP → ProB → PreB → Immature-B),
+    ## then by descending margin (how clearly that lineage "wins"),
+    ## then by descending top_score (reddest first).
+    winner_factor <- factor(top_ct, levels = ct_order)
+    col_order <- order(winner_factor, -margin, -top_score)
+    
+    mat_ord <- mat0[, col_order, drop = FALSE]
+    
+    ## Quantile bins of margin, same labels as Section 6
+    margin_bins <- cut(
+        margin[col_order],
+        breaks = stats::quantile(margin, probs = seq(0, 1, 0.25), na.rm = TRUE),
+        include.lowest = TRUE,
+        labels = c("Q1 (lowest)", "Q2", "Q3", "Q4 (highest)")
+    )
+    
+    ann_col <- data.frame(
+        top_ct = factor(top_ct[col_order], levels = ct_present),
+        margin = margin_bins,
+        row.names = colnames(mat_ord)
+    )
+    
+    invisible(list(
+        mat_ord  = mat_ord,
+        ann_col  = ann_col
+    ))
+}
+
+spain_prom_prepped <- prep_spain_modules(mods_spain_prom, ct_spain_order)
+spain_enh_prepped  <- prep_spain_modules(mods_spain_enh,  ct_spain_order)
+
+avg_z_spain_prom_ord   <- spain_prom_prepped$mat_ord
+ann_col_spain_prom     <- spain_prom_prepped$ann_col
+
+avg_z_spain_enh_ord    <- spain_enh_prepped$mat_ord
+ann_col_spain_enh      <- spain_enh_prepped$ann_col
+
+cat("\nHead of Spain PROMOTER modules (ordered):\n")
+print(utils::head(avg_z_spain_prom_ord, 2))
+cat("\nHead of Spain ENHANCER modules (ordered):\n")
+print(utils::head(avg_z_spain_enh_ord, 2))
+
+##    (same idea as plot_modules_with_genotype_subtype(), but with Spain
+##     cell-type colors and our explicit HSC → CLP → ProB → PreB → Immature-B ordering)
+
+plot_spain_modules <- function(mat_ord, ann_col, title) {
+    stopifnot(is.matrix(mat_ord), is.data.frame(ann_col))
+    stopifnot(exists("meta_sj"))
+    
+    # Minimal metadata
+    meta_min <- meta_sj %>%
+        dplyr::select(Sample, genotype, Subtype) %>%
+        dplyr::mutate(genotype = factor(genotype, levels = c("TT", "TC", "CC"))) %>%
+        dplyr::distinct(Sample, .keep_all = TRUE)
+    
+    ann2 <- ann_col[colnames(mat_ord), , drop = FALSE]
+    ann2$genotype <- meta_min$genotype[match(rownames(ann2), meta_min$Sample)]
+    ann2$Subtype  <- meta_min$Subtype[match(rownames(ann2), meta_min$Sample)]
+    
+    if (any(is.na(ann2$genotype))) {
+        message("Samples missing genotype: ",
+                paste(rownames(ann2)[is.na(ann2$genotype)], collapse = ", "))
+    }
+    if (any(is.na(ann2$Subtype))) {
+        message("Samples missing Subtype: ",
+                paste(rownames(ann2)[is.na(ann2$Subtype)], collapse = ", "))
+    }
+    
+    ## Spain-specific top_ct colors (you can tweak these if you want)
+    cell_type_colors_spain <- c(
+        HSC         = "#fb8072",
+        CLP         = "#bebada",
+        ProB        = "#ff33ff",
+        PreB        = "#00e5c0",
+        `Immature-B` = "#00bfff"
+    )
+    
+    sub_cols <- make_subtype_colors(ann2$Subtype)
+    
+    ## Column gaps between top_ct blocks (HSC, CLP, ProB, PreB, Immature-B)
+    r <- rle(as.character(ann2$top_ct))
+    gaps_col <- if (length(r$lengths) > 1L) cumsum(r$lengths)[-length(r$lengths)] else NULL
+    
+    pheatmap::pheatmap(
+        mat_ord,
+        cluster_rows   = FALSE,
+        cluster_cols   = FALSE,
+        show_rownames  = TRUE,
+        show_colnames  = FALSE,
+        annotation_col = ann2,
+        annotation_colors = list(
+            top_ct   = cell_type_colors_spain[names(cell_type_colors_spain) %in% rownames(mat_ord)],
+            margin   = margin_colors,
+            genotype = geno_cols,
+            Subtype  = sub_cols
+        ),
+        gaps_col    = gaps_col,
+        gaps_row    = if (nrow(mat_ord) > 1L) seq_len(nrow(mat_ord) - 1L) else NULL,
+        border_color = NA,
+        main = title
+    )
+}
+
+plot_spain_modules(
+    mat_ord = avg_z_spain_prom_ord,
+    ann_col = ann_col_spain_prom,
+    title   = "ATAC module scores — Spain PROMOTER markers (Promoters only, ATAC openness)"
+)
+
+## 7.4.2 Spain ENHANCER markers: all gene-assigned peaks
+plot_spain_modules(
+    mat_ord = avg_z_spain_enh_ord,
+    ann_col = ann_col_spain_enh,
+    title   = "ATAC module scores — Spain ENHANCER markers (All gene-assigned peaks, ATAC openness)"
+)
+
+
+# write.table(avg_z_spain_prom_ord,
+#             "ATAC_avgZ_Spain_PROM_markers_ord.tsv",
+#             sep = "\t", quote = FALSE)
+#
+# write.table(avg_z_spain_enh_ord,
+#             "ATAC_avgZ_Spain_ENH_markers_ord.tsv",
+#             sep = "\t", quote = FALSE)
+
+```
+
+
+# 8. Diagnostics and QC of Ilaria vs Spain Modules
+
+
+```{r}
+# =============================================================
+# Diagnostics: Ilaria vs Spain modules
+# =============================================================
+
+## 0. Basic SNP/genotype and metadata objects ------------------
+
+cat("\n[0.1] combined_batches (SNP summary)\n")
+print(dim(combined_batches))
+print(head(combined_batches, 3))
+
+cat("\n[0.2] ct_only (C/T-based state)\n")
+print(dim(ct_only))
+print(head(ct_only, 3))
+cat("ct_state counts:\n")
+print(table(ct_only$ct_state, useNA = "ifany"))
+
+cat("\n[0.3] geno_qc_table (C/T vs ALT% genotype)\n")
+print(geno_qc_table)
+
+cat("\n[0.4] meta (ATAC metadata: Sample, genotype, ALT_pct)\n")
+print(dim(meta))
+print(head(meta, 5))
+cat("Genotype distribution in meta:\n")
+print(table(meta$genotype, useNA = "ifany"))
+
+cat("\n[0.5] meta_sj (ATAC metadata + St Jude subtype)\n")
+print(dim(meta_sj))
+print(head(meta_sj, 5))
+cat("Genotype distribution in meta_sj:\n")
+print(table(meta_sj$genotype, useNA = "ifany"))
+cat("Subtype distribution in meta_sj:\n")
+print(table(meta_sj$Subtype, useNA = "ifany"))
+
+## 1. ATAC counts and annotation --------------------------------
+
+cat("\n[1.1] counts (raw consensus counts matrix)\n")
+print(dim(counts))
+cat("First 3 rows, first 5 samples:\n")
+print(counts[1:3, 1:5])
+
+cat("\n[1.2] anno_df (ChIPseeker annotation)\n")
+print(dim(anno_df))
+print(head(anno_df[, c("peak_id", "SYMBOL", "annotation", "distanceToTSS")], 5))
+
+cat("\n[1.3] counts_annot (counts restricted to annotated peaks)\n")
+print(dim(counts_annot))
+cat("Row names example (1:5):\n")
+print(rownames(counts_annot)[1:5])
+
+## 2. Ilaria panel and modules ----------------------------------
+
+cat("\n[2.1] panel_long (Ilaria 700 genes, long format)\n")
+print(dim(panel_long))
+cat("Cell type counts (Ilaria):\n")
+print(table(panel_long$cell_type, useNA = "ifany"))
+cat("Total unique genes in Ilaria panel:\n")
+print(length(unique(panel_long$gene)))
+
+cat("\n[2.2] Ilaria modules: mods_all$avg_z_by_ct\n")
+print(dim(mods_all$avg_z_by_ct))
+cat("Row (lineage) names:\n")
+print(rownames(mods_all$avg_z_by_ct))
+cat("Per-lineage value ranges:\n")
+print(apply(mods_all$avg_z_by_ct, 1, range, na.rm = TRUE))
+
+cat("\n[2.3] Ilaria modules: mods_prom$avg_z_by_ct (promoters only)\n")
+print(dim(mods_prom$avg_z_by_ct))
+cat("Row (lineage) names:\n")
+print(rownames(mods_prom$avg_z_by_ct))
+cat("Per-lineage value ranges:\n")
+print(apply(mods_prom$avg_z_by_ct, 1, range, na.rm = TRUE))
+
+cat("\n[2.4] Ordered Ilaria matrices\n")
+cat("avg_z_by_ct_ord_all (all peaks) dim:\n")
+print(dim(avg_z_by_ct_ord_all))
+cat("avg_z_by_ct_ord_prom (promoter-only) dim:\n")
+print(dim(avg_z_by_ct_ord_prom))
+
+cat("\n[2.5] Ilaria top_ct distributions\n")
+cat("ALL peaks top_ct:\n")
+print(table(ann_col_all$top_ct, useNA = "ifany"))
+cat("PROMOTER-only top_ct:\n")
+print(table(ann_col_prom$top_ct, useNA = "ifany"))
+
+## 3. Spain marker panels ---------------------------------------
+
+cat("\n[3.1] panel_spain_prom_long (Spain PROMOTER markers, long)\n")
+print(dim(panel_spain_prom_long))
+cat("Cell type counts (Spain PROM):\n")
+print(table(panel_spain_prom_long$cell_type, useNA = "ifany"))
+cat("Unique PROMOTER marker genes:\n")
+print(length(unique(panel_spain_prom_long$gene)))
+
+cat("\n[3.2] panel_spain_enh_long (Spain ENHANCER markers, long)\n")
+print(dim(panel_spain_enh_long))
+cat("Cell type counts (Spain ENH):\n")
+print(table(panel_spain_enh_long$cell_type, useNA = "ifany"))
+cat("Unique ENHANCER marker genes:\n")
+print(length(unique(panel_spain_enh_long$gene)))
+
+## Overlap with ATAC genes (Ilaria vs Spain) --------------------
+
+cat("\n[3.3] Overlap of gene sets with ATAC gene universe\n")
+ilaria_genes      <- unique(panel_long$gene)
+spain_prom_genes  <- unique(panel_spain_prom_long$gene)
+spain_enh_genes   <- unique(panel_spain_enh_long$gene)
+
+## Use Ilaria ALL z_gene as proxy for ATAC gene space
+atac_genes_all <- rownames(mods_all$z_gene)
+
+cat("Total ATAC genes (mods_all$z_gene):", length(atac_genes_all), "\n")
+cat("Ilaria genes present in ATAC:", length(intersect(ilaria_genes, atac_genes_all)), "\n")
+cat("Spain PROM genes present in ATAC:", length(intersect(spain_prom_genes, atac_genes_all)), "\n")
+cat("Spain ENH genes present in ATAC:", length(intersect(spain_enh_genes, atac_genes_all)), "\n")
+
+cat("Shared genes: Ilaria ∩ Spain PROM:", length(intersect(ilaria_genes, spain_prom_genes)), "\n")
+cat("Shared genes: Ilaria ∩ Spain ENH:", length(intersect(ilaria_genes, spain_enh_genes)), "\n")
+cat("Shared genes: Spain PROM ∩ Spain ENH:", length(intersect(spain_prom_genes, spain_enh_genes)), "\n")
+
+## 4. Spain modules (PROMOTER vs ENHANCER) -----------------------
+
+cat("\n[4.1] Spain PROMOTER modules: mods_spain_prom$avg_z_by_ct\n")
+print(dim(mods_spain_prom$avg_z_by_ct))
+cat("Row (lineage) names:\n")
+print(rownames(mods_spain_prom$avg_z_by_ct))
+cat("Per-lineage value ranges:\n")
+print(apply(mods_spain_prom$avg_z_by_ct, 1, range, na.rm = TRUE))
+
+cat("\n[4.2] Spain ENHANCER modules: mods_spain_enh$avg_z_by_ct\n")
+print(dim(mods_spain_enh$avg_z_by_ct))
+cat("Row (lineage) names:\n")
+print(rownames(mods_spain_enh$avg_z_by_ct))
+cat("Per-lineage value ranges:\n")
+print(apply(mods_spain_enh$avg_z_by_ct, 1, range, na.rm = TRUE))
+
+cat("\n[4.3] Ordered Spain matrices (after prep_spain_modules)\n")
+cat("avg_z_spain_prom_ord dim:\n")
+print(dim(avg_z_spain_prom_ord))
+cat("avg_z_spain_enh_ord dim:\n")
+print(dim(avg_z_spain_enh_ord))
+
+cat("\n[4.4] Spain top_ct distributions\n")
+cat("Spain PROM top_ct:\n")
+print(table(ann_col_spain_prom$top_ct, useNA = "ifany"))
+cat("Spain ENH top_ct:\n")
+print(table(ann_col_spain_enh$top_ct, useNA = "ifany"))
+
+## 5. Quick summary of value ranges across all module matrices -----------
+
+cat("\n[5.1] Global ranges of module scores (all matrices)\n")
+ranges_list <- list(
+    Ilaria_ALL      = mods_all$avg_z_by_ct,
+    Ilaria_PROM     = mods_prom$avg_z_by_ct,
+    Spain_PROM      = mods_spain_prom$avg_z_by_ct,
+    Spain_ENH       = mods_spain_enh$avg_z_by_ct
+)
+
+for (nm in names(ranges_list)) {
+    mat <- ranges_list[[nm]]
+    cat("\n", nm, ":\n", sep = "")
+    cat("  dim =", paste(dim(mat), collapse = " x "), "\n")
+    cat("  overall range =", paste(range(mat, na.rm = TRUE), collapse = " to "), "\n")
+}
+
+```
+
+# 9. Saving Core State Objects (SJ156 + Spain)
+
+## 9.1 Saving SJ156 state (only SJ156)
+
+```{r}
+# # =====================================================================
+# # 9. Saving Core State Objects (SJ156 ONLY) — FINAL CLEAN VERSION
+# # =====================================================================
+# 
+# suppressPackageStartupMessages({
+#     library(dplyr)
+# })
+# 
+# # ---------------------------------------------------------------------
+# # 0) Output directory
+# # ---------------------------------------------------------------------
+# combined_dir <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Clarissa/snp_cell_lines_public_datasets_project/stjudes_156/atacseq/peaks_sj_156_exploration/combined_sj156_spain"
+# 
+# if (!dir.exists(combined_dir)) {
+#     dir.create(combined_dir, recursive = TRUE)
+# }
+# 
+# # ---------------------------------------------------------------------
+# # 1) Build gene_counts_sj if missing
+# # ---------------------------------------------------------------------
+# if (!exists("gene_counts_sj")) {
+#     
+#     stopifnot(exists("gene_anno_min"), exists("counts_annot"))
+#     
+#     gene2peak_sj <- gene_anno_min %>%
+#         filter(!is.na(SYMBOL), SYMBOL != "") %>%
+#         distinct(SYMBOL, peak_id) %>%
+#         filter(peak_id %in% rownames(counts_annot))
+#     
+#     peaks_by_gene_sj <- split(gene2peak_sj$peak_id, gene2peak_sj$SYMBOL)
+#     
+#     gene_counts_sj <- purrr::map_dfc(
+#         peaks_by_gene_sj,
+#         ~ colSums(counts_annot[.x, , drop = FALSE])
+#     )
+#     
+#     gene_counts_sj <- t(as.matrix(gene_counts_sj))
+#     rownames(gene_counts_sj) <- names(peaks_by_gene_sj)
+#     
+#     cat("[SJ156] gene_counts_sj built. dim = ",
+#         paste(dim(gene_counts_sj), collapse=" × "), "\n")
+# }
+# 
+# # ---------------------------------------------------------------------
+# # 2) Build peak-level SJ156 matrices if missing
+# # ---------------------------------------------------------------------
+# if (!exists("peak_counts_sj") ||
+#     !exists("promoter_counts_sj") ||
+#     !exists("enhancer_counts_sj") ||
+#     !exists("peak_anno")) {
+#     
+#     stopifnot(exists("counts_annot"), exists("anno_df"))
+#     
+#     peak_counts_sj <- counts_annot
+#     
+#     # annotation aligned to peak order
+#     peak_anno <- anno_df %>%
+#         filter(peak_id %in% rownames(peak_counts_sj)) %>%
+#         arrange(match(peak_id, rownames(peak_counts_sj)))
+#     
+#     stopifnot(identical(peak_anno$peak_id, rownames(peak_counts_sj)))
+#     
+#     base_cat <- sub(" \\(.*\\)$", "", peak_anno$annotation)
+#     
+#     promoter_ids <- peak_anno$peak_id[base_cat == "Promoter"]
+#     enhancer_ids <- peak_anno$peak_id[base_cat != "Promoter"]
+#     
+#     promoter_counts_sj <- peak_counts_sj[promoter_ids, , drop = FALSE]
+#     enhancer_counts_sj <- peak_counts_sj[enhancer_ids, , drop = FALSE]
+#     
+#     cat("[SJ156] Peak matrices built.\n")
+# }
+# 
+# # ---------------------------------------------------------------------
+# # 3) Bundle ALL SJ156 objects into RDS-safe state list
+# # ---------------------------------------------------------------------
+# sj156_state <- list(
+#     
+#     # ---- GENOTYPE / SNP ----
+#     combined_batches = combined_batches,
+#     ct_only          = ct_only,
+#     geno_qc_table    = geno_qc_table,
+#     meta             = meta,
+#     meta_sj          = meta_sj,
+#     allele_cols      = allele_cols,
+#     geno_cols        = geno_cols,
+#     
+#     # ---- ATAC PEAK LEVEL ----
+#     counts        = counts,
+#     counts_annot  = counts_annot,
+#     anno          = anno,
+#     anno_df       = anno_df,
+#     gr            = gr,
+#     gene_anno_min = gene_anno_min,
+#     
+#     peak_counts_sj     = peak_counts_sj,
+#     promoter_counts_sj = promoter_counts_sj,
+#     enhancer_counts_sj = enhancer_counts_sj,
+#     peak_anno          = peak_anno,
+#     
+#     # ---- PCA / PARAMETERS ----
+#     MIN_READS_PCA   = MIN_READS_PCA,
+#     MIN_SAMPLES_PCA = MIN_SAMPLES_PCA,
+#     N_TOP_VAR_PCA   = N_TOP_VAR_PCA,
+#     
+#     # ---- ILARIA PANEL ----
+#     panel_long       = panel_long,
+#     ct_levels        = ct_levels,
+#     cell_type_colors = cell_type_colors,
+#     margin_colors    = margin_colors,
+#     
+#     mods_all             = mods_all,
+#     mods_prom            = mods_prom,
+#     avg_z_by_ct_ord_all  = avg_z_by_ct_ord_all,
+#     ann_col_all          = ann_col_all,
+#     avg_z_by_ct_ord_prom = avg_z_by_ct_ord_prom,
+#     ann_col_prom         = ann_col_prom,
+#     
+#     # ---- GENE LEVEL ----
+#     gene_counts_sj = gene_counts_sj
+# )
+# 
+# # ---------------------------------------------------------------------
+# # 4) SAVE
+# # ---------------------------------------------------------------------
+# saveRDS(
+#     sj156_state,
+#     file = file.path(combined_dir, "sj156_atac_core_state.rds")
+# )
+# 
+# cat("\n[SAVED] sj156_atac_core_state.rds stored at:\n",
+#     file.path(combined_dir, "sj156_atac_core_state.rds"), "\n\n")
+
+
+```
+
+# 10. Integrating SJ156 and Spain (Ilaria modules)
+## 10.1 Minimal annotation heatmap SJ156 + Spain
+
+```{r}
+# ================================================================
+# 10. Integrating SJ156 and Spain (Ilaria modules)
+# 10.1 Minimal annotation heatmap (cohort + margin + top_ct)
+# ================================================================
+
+suppressPackageStartupMessages({
+    library(dplyr)
+    library(edgeR)
+    library(pheatmap)
+    library(RColorBrewer)
+})
+
+# ---------------------------------------------------------------
+# 1) Load core states
+# ---------------------------------------------------------------
+combined_dir <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Clarissa/snp_cell_lines_public_datasets_project/stjudes_156/atacseq/peaks_sj_156_exploration/combined_sj156_spain"
+
+sj156_state  <- readRDS(file.path(combined_dir, "sj156_atac_core_state.rds"))
+spain_state  <- readRDS(file.path(combined_dir, "spain_atac_core_state.rds"))
+
+# Extract Ilaria module definitions
+panel_long       <- sj156_state$panel_long
+ct_levels        <- sj156_state$ct_levels
+cell_type_colors <- sj156_state$cell_type_colors
+margin_colors    <- sj156_state$margin_colors
+
+avg_z_sj_all <- sj156_state$mods_all$avg_z_by_ct  # lineages × samples
+panel_long$cell_type <- factor(panel_long$cell_type, levels = ct_levels)
+
+# ---------------------------------------------------------------
+# 2) Helper: compute modules from gene-level counts
+# ---------------------------------------------------------------
+build_modules_from_gene_counts <- function(gene_counts,
+                                           panel_long,
+                                           ct_levels,
+                                           min_counts  = 10,
+                                           min_samples = 5,
+                                           clip_z      = 2) {
+    
+    keep <- rowSums(gene_counts >= min_counts) >= min_samples
+    gene_counts_filt <- gene_counts[keep, , drop = FALSE]
+    
+    logcpm <- edgeR::cpm(gene_counts_filt, log = TRUE, prior.count = 1)
+    
+    z_gene <- t(scale(t(logcpm)))
+    z_gene[is.na(z_gene)] <- 0
+    if (!is.null(clip_z)) {
+        z_gene <- pmin(pmax(z_gene, -clip_z), clip_z)
+    }
+    
+    avg_list <- lapply(ct_levels, function(ct) {
+        g_ct <- panel_long$gene[panel_long$cell_type == ct]
+        g_ct <- intersect(unique(g_ct), rownames(z_gene))
+        if (length(g_ct) == 0L) rep(NA_real_, ncol(z_gene))
+        else colMeans(z_gene[g_ct, , drop = FALSE])
+    })
+    
+    avg_z_by_ct <- do.call(rbind, avg_list)
+    rownames(avg_z_by_ct) <- ct_levels
+    colnames(avg_z_by_ct) <- colnames(z_gene)
+    
+    list(avg_z_by_ct = avg_z_by_ct, z_gene = z_gene)
+}
+
+# ---------------------------------------------------------------
+# 3) Spain — gene-level modules
+# ---------------------------------------------------------------
+gene_counts_spain <- spain_state$gene_counts_spain_prom  # solo promotores
+meta_spain        <- spain_state$meta_spain_coding %>%
+    transmute(
+        Sample    = as.character(Sample),
+        genotype  = factor(genotype, levels = c("TT", "TC", "CC")),
+        cell_type = as.character(cell_type)
+    )
+
+# Align samples
+samples_spain <- intersect(colnames(gene_counts_spain), meta_spain$Sample)
+gene_counts_spain <- gene_counts_spain[, samples_spain, drop = FALSE]
+meta_spain        <- meta_spain %>% filter(Sample %in% samples_spain)
+gene_counts_spain <- gene_counts_spain[, meta_spain$Sample, drop = FALSE]
+
+mods_spain      <- build_modules_from_gene_counts(
+    gene_counts = gene_counts_spain,
+    panel_long  = panel_long,
+    ct_levels   = ct_levels,
+    min_counts  = 10,
+    min_samples = 3,
+    clip_z      = 2
+)
+avg_z_spain_all <- mods_spain$avg_z_by_ct
+
+# ---------------------------------------------------------------
+# 4) Combine SJ156 + Spain
+# ---------------------------------------------------------------
+common_ct <- intersect(ct_levels, rownames(avg_z_sj_all))
+
+avg_z_sj_all    <- avg_z_sj_all[common_ct, , drop = FALSE]
+avg_z_spain_all <- avg_z_spain_all[common_ct, , drop = FALSE]
+
+mat_combined <- cbind(avg_z_sj_all, avg_z_spain_all)
+
+# ---------------------------------------------------------------
+# 5) Build annotation: cohort + top_ct + margin score
+# ---------------------------------------------------------------
+samples_sj    <- colnames(avg_z_sj_all)
+samples_spain <- colnames(avg_z_spain_all)
+
+ann_all <- data.frame(
+    Sample = c(samples_sj, samples_spain),
+    cohort = c(rep("SJ156", length(samples_sj)),
+               rep("Spain", length(samples_spain))),
+    stringsAsFactors = FALSE
+)
+rownames(ann_all) <- ann_all$Sample
+ann_all <- ann_all[colnames(mat_combined), , drop = FALSE]
+
+# ---- Compute top lineage and numerical margin ----
+top_idx <- apply(mat_combined, 2, which.max)
+top_ct  <- rownames(mat_combined)[top_idx]
+
+second_idx <- apply(mat_combined, 2, function(v) order(v, decreasing = TRUE)[2])
+
+margin_numeric <- mat_combined[cbind(top_idx, seq_along(top_idx))] -
+    mat_combined[cbind(second_idx, seq_along(second_idx))]
+
+ann_all$top_ct <- factor(top_ct, levels = common_ct)
+
+# ---- Use labels EXACTLY matching names(margin_colors) ----
+ann_all$margin <- cut(
+    margin_numeric,
+    breaks = quantile(margin_numeric, probs = seq(0, 1, 0.25), na.rm = TRUE),
+    include.lowest = TRUE,
+    labels = names(margin_colors)   # <── SOLUCIÓN CLAVE
+)
+
+# ---------------------------------------------------------------
+# 6) Column ordering (winner lineage, then by margin)
+# ---------------------------------------------------------------
+winner_factor <- factor(top_ct, levels = common_ct)
+col_order <- order(winner_factor, -margin_numeric)
+
+mat_ord  <- mat_combined[, col_order, drop = FALSE]
+ann_all  <- ann_all[colnames(mat_ord), , drop = FALSE]
+
+# ---------------------------------------------------------------
+# 7) Colors: only cohort + margin + top_ct
+# ---------------------------------------------------------------
+annotation_colors <- list(
+    cohort = c(SJ156 = "#1f78b4", Spain = "#33a02c"),
+    margin = margin_colors,
+    top_ct = cell_type_colors[names(cell_type_colors) %in% common_ct]
+)
+
+gaps_row <- if (length(common_ct) > 1) seq_len(length(common_ct) - 1)
+
+# ---------------------------------------------------------------
+# 8) Clean Heatmap
+# ---------------------------------------------------------------
+pheatmap(
+    mat_ord,
+    cluster_rows   = FALSE,
+    cluster_cols   = FALSE,
+    annotation_col = ann_all,
+    annotation_colors = annotation_colors,
+    gaps_row       = gaps_row,
+    show_colnames  = FALSE,
+    show_rownames  = TRUE,
+    border_color   = NA,
+    main = "SJ156 + Spain — Ilaria lineage module heatmap (clean)"
+)
+
+
+
+
+```
+## 10.2 Integration Heatmap (SJ→Spain ordering inside each lineage)
+
+```{r}
+# 8) Integration of SJ156 and Spain Ilaria modules
+# ================================================================
+# Assumes sj156_state and spain_state are already in the environment
+# from previous chunks (no readRDS here).
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(edgeR)
+  library(pheatmap)
+  library(RColorBrewer)
+})
+
+# ------------------------------------------------
+# 1) Extract core objects from existing state
+# ------------------------------------------------
+panel_long       <- sj156_state$panel_long
+ct_levels        <- sj156_state$ct_levels
+cell_type_colors <- sj156_state$cell_type_colors
+
+# SJ156 lineage modules (already computed upstream)
+avg_z_sj_all <- sj156_state$mods_all$avg_z_by_ct   # lineages × SJ156 samples
+
+panel_long$cell_type <- factor(panel_long$cell_type, levels = ct_levels)
+
+# ------------------------------------------------
+# 2) Build modules-from-genes for Spain (reuse function if defined)
+# ------------------------------------------------
+if (!exists("build_modules_from_gene_counts")) {
+  build_modules_from_gene_counts <- function(gene_counts,
+                                             panel_long,
+                                             ct_levels,
+                                             min_counts   = 10,
+                                             min_samples  = 5,
+                                             clip_z       = 2) {
+
+    keep <- rowSums(gene_counts >= min_counts) >= min_samples
+    gene_counts_filt <- gene_counts[keep, , drop = FALSE]
+
+    logcpm <- edgeR::cpm(gene_counts_filt, log = TRUE, prior.count = 1)
+
+    z_gene <- t(scale(t(logcpm)))
+    z_gene[is.na(z_gene)] <- 0
+    if (!is.null(clip_z)) {
+      z_gene <- pmin(pmax(z_gene, -clip_z), clip_z)
+    }
+
+    avg_list <- lapply(ct_levels, function(ct) {
+      g_ct <- panel_long$gene[panel_long$cell_type == ct]
+      g_ct <- intersect(unique(g_ct), rownames(z_gene))
+      if (length(g_ct) == 0L) {
+        rep(NA_real_, ncol(z_gene))
+      } else {
+        colMeans(z_gene[g_ct, , drop = FALSE])
+      }
+    })
+
+    avg_z_by_ct <- do.call(rbind, avg_list)
+    rownames(avg_z_by_ct) <- ct_levels
+    colnames(avg_z_by_ct) <- colnames(z_gene)
+
+    list(avg_z_by_ct = avg_z_by_ct, z_gene = z_gene)
+  }
+}
+
+# Spain gene-level counts and metadata from spain_state
+gene_counts_spain <- spain_state$gene_counts_spain
+meta_spain_coding <- spain_state$meta_spain_coding
+
+spain_meta <- meta_spain_coding %>%
+  transmute(
+    Sample    = as.character(Sample),
+    genotype  = factor(genotype, levels = c("TT", "TC", "CC")),
+    cell_type = as.character(cell_type)
+  )
+
+samples_spain <- intersect(colnames(gene_counts_spain), spain_meta$Sample)
+gene_counts_spain <- gene_counts_spain[, samples_spain, drop = FALSE]
+spain_meta <- spain_meta %>% filter(Sample %in% samples_spain)
+
+gene_counts_spain <- gene_counts_spain[, spain_meta$Sample, drop = FALSE]
+
+mods_spain <- build_modules_from_gene_counts(
+  gene_counts = gene_counts_spain,
+  panel_long  = panel_long,
+  ct_levels   = ct_levels,
+  min_counts  = 10,
+  min_samples = 3,
+  clip_z      = 2
+)
+
+avg_z_spain_all <- mods_spain$avg_z_by_ct   # lineages × Spain samples
+
+# ------------------------------------------------
+# 3) Harmonize lineages and combine cohorts
+# ------------------------------------------------
+common_ct <- intersect(ct_levels,
+                       intersect(rownames(avg_z_sj_all), rownames(avg_z_spain_all)))
+
+avg_z_sj_all    <- avg_z_sj_all[common_ct, , drop = FALSE]
+avg_z_spain_all <- avg_z_spain_all[common_ct, , drop = FALSE]
+
+mat_combined <- cbind(avg_z_sj_all, avg_z_spain_all)
+
+# ------------------------------------------------
+# 4) Annotation: ONLY cohort + top_ct
+# ------------------------------------------------
+samples_sj    <- colnames(avg_z_sj_all)
+samples_spain <- colnames(avg_z_spain_all)
+
+ann_all <- data.frame(
+  cohort = c(rep("SJ156", length(samples_sj)),
+             rep("Spain", length(samples_spain))),
+  stringsAsFactors = FALSE
+)
+rownames(ann_all) <- c(samples_sj, samples_spain)
+ann_all <- ann_all[colnames(mat_combined), , drop = FALSE]
+
+ann_all$cohort <- factor(ann_all$cohort, levels = c("SJ156", "Spain"))
+
+# Top Ilaria lineage per sample
+top_idx <- apply(mat_combined, 2, which.max)
+top_ct  <- rownames(mat_combined)[top_idx]
+ann_all$top_ct <- factor(top_ct, levels = common_ct)
+
+# ------------------------------------------------
+# 5) Custom column ordering:
+#    within each lineage: SJ156 samples first, then Spain samples
+# ------------------------------------------------
+col_order <- character(0)
+for (ct in common_ct) {
+  cols_ct_sj <- rownames(ann_all)[ann_all$top_ct == ct & ann_all$cohort == "SJ156"]
+  cols_ct_spain <- rownames(ann_all)[ann_all$top_ct == ct & ann_all$cohort == "Spain"]
+  col_order <- c(col_order, cols_ct_sj, cols_ct_spain)
+}
+# keep only columns that actually exist
+col_order <- col_order[col_order %in% colnames(mat_combined)]
+
+mat_ord <- mat_combined[, col_order, drop = FALSE]
+ann_all <- ann_all[col_order, , drop = FALSE]
+
+# Column gaps between lineage blocks (for vertical separators)
+r <- rle(as.character(ann_all$top_ct))
+gaps_col <- if (length(r$lengths) > 1L) cumsum(r$lengths)[-length(r$lengths)] else NULL
+
+# Row gaps between Ilaria lineages
+gaps_row <- if (length(common_ct) > 1L) seq_len(length(common_ct) - 1L) else NULL
+
+# ------------------------------------------------
+# 6) Annotation colors — ONLY cohort + top_ct
+# ------------------------------------------------
+annotation_colors <- list(
+  cohort = c(SJ156 = "#1f78b4", Spain = "#33a02c"),
+  top_ct = cell_type_colors[names(cell_type_colors) %in% common_ct]
+)
+
+# ------------------------------------------------
+# 7) Plot clean heatmap
+# ------------------------------------------------
+pheatmap(
+  mat_ord,
+  cluster_rows   = FALSE,
+  cluster_cols   = FALSE,
+  annotation_col = ann_all,
+  annotation_colors = annotation_colors,
+  gaps_row       = gaps_row,
+  gaps_col       = gaps_col,
+  show_colnames  = FALSE,
+  show_rownames  = TRUE,
+  border_color   = NA,
+  main = "SJ156 + Spain — Ilaria lineage module heatmap (SJ→Spain within each lineage)"
+)
+
+
+```
+
+
+# 11. Task 1 — Using Ilaria’s markers + Spain TRUE cell types
+### 11.1 Add Spain TRUE cell-type annotation
+
+```{r}
+# ------------------------------------------------------------------
+# 5c) Add Spain TRUE cell-type annotation (from Spain metadata)
+# ------------------------------------------------------------------
+ann_all$spain_cell_type <- NA_character_
+
+# We expect metadata in spain_state$meta_spain with cols: Sample, cell_type
+meta_spain <- NULL
+if (!is.null(spain_state$meta_spain)) {
+    meta_spain <- spain_state$meta_spain
+}
+
+if (!is.null(meta_spain)) {
+    if (!all(c("Sample", "cell_type") %in% colnames(meta_spain))) {
+        warning("Spain metadata found but lacks 'Sample' and/or 'cell_type' columns; spain_cell_type will remain NA.")
+    } else {
+        meta_spain <- meta_spain %>%
+            mutate(Sample = as.character(Sample)) %>%
+            dplyr::select(Sample, cell_type)
+        
+        idx_spain <- ann_all$cohort == "Spain"
+        
+        ann_all$spain_cell_type[idx_spain] <- meta_spain$cell_type[
+            match(rownames(ann_all)[idx_spain], meta_spain$Sample)
+        ]
+        
+        # Ensure factor levels are exactly the distinct Spain cell types
+        spain_ct_levels <- sort(unique(na.omit(as.character(ann_all$spain_cell_type))))
+        ann_all$spain_cell_type <- factor(ann_all$spain_cell_type,
+                                          levels = spain_ct_levels)
+        
+        cat("[5c] Spain cell-type annotation added for ",
+            sum(idx_spain & !is.na(ann_all$spain_cell_type)),
+            " Spain samples.\n", sep = "")
+        cat("     Table of spain_cell_type by cohort:\n")
+        print(table(ann_all$spain_cell_type, ann_all$cohort, useNA = "ifany"))
+    }
+} else {
+    warning("No Spain sample metadata (meta_spain) found in spain_state; spain_cell_type annotation will be NA.")
+}
+
+# ------------------------------------------------------------------
+# 6) Heatmap: build annotation_colors with proper Spain colors
+# ------------------------------------------------------------------
+annotation_colors <- list(
+    cohort = c(SJ156 = "#1f78b4", Spain = "#33a02c"),
+    # Ilaria lineage colors (SJ156 panel)
+    top_ct = cell_type_colors[names(cell_type_colors) %in% common_ct]
+)
+
+# Add colors for Spain true cell-type (use spain_state$cell_type_colors if available)
+if ("spain_cell_type" %in% colnames(ann_all)) {
+    spain_ct_levels <- levels(ann_all$spain_cell_type)
+    
+    if (length(spain_ct_levels) > 0L) {
+        
+        spain_colors <- NULL
+        if (!is.null(spain_state$cell_type_colors)) {
+            spain_colors <- spain_state$cell_type_colors
+        }
+        
+        if (!is.null(spain_colors)) {
+            # If some Spain levels are missing in the color vector, create new colors
+            missing_spain <- setdiff(spain_ct_levels, names(spain_colors))
+            if (length(missing_spain) > 0L) {
+                warning("Spain cell types missing from spain_state$cell_type_colors: ",
+                        paste(missing_spain, collapse = ", "),
+                        "\nAssigning new colors for these.")
+                extra_cols <- setNames(
+                    grDevices::hcl.colors(length(missing_spain), "Set2"),
+                    missing_spain
+                )
+                spain_colors <- c(spain_colors, extra_cols)
+            }
+            
+            # Final color vector must have one color per factor level
+            annotation_colors$spain_cell_type <- spain_colors[spain_ct_levels]
+        } else {
+            # Fallback: create a palette from scratch
+            annotation_colors$spain_cell_type <- setNames(
+                grDevices::hcl.colors(length(spain_ct_levels), "Set2"),
+                spain_ct_levels
+            )
+        }
+    }
+}
+
+pheatmap::pheatmap(
+    mat_ord,
+    cluster_rows   = FALSE,
+    cluster_cols   = FALSE,
+    annotation_col = ann_all,
+    annotation_colors = annotation_colors,
+    gaps_row       = gaps_row,
+    gaps_col       = gaps_col,
+    show_colnames  = FALSE,
+    show_rownames  = TRUE,
+    border_color   = NA,
+    main = "Ilaria lineage modules — SJ156 + Spain (gene-level)"
+)
+
+```
+
+### 11.2 Rank samples within each lineage (Spain + SJ156)
+#### Within each Ilaria lineage block (HSCMPP, GMP, pDC, EarlyLymphoid, ProB, PreB, B), take only the samples whose top_ct is that lineage and then rank those columns from highest to lowest based on that lineage’s module score (the row value for that lineage), so that, for example, the ProB block shows samples ordered from “most ProB-like” to “least ProB-like,” regardless of cohort, while still keeping the same row structure and Spain TRUE cell-type annotation.
+
+```{r}
+# ================================================================
+# X.X – Ilaria PROMOTER modules for SJ156 + Spain (margin-ordered)
+#       All samples in one heatmap, using Ilaria markers
+#       (PROM-only para ambos cohortes, Q1 → Q4 a la izquierda)
+# ================================================================
+
+suppressPackageStartupMessages({
+    library(dplyr)
+    library(edgeR)
+    library(pheatmap)
+})
+
+# ------------------------------------------------
+# 1) Cargar estados SJ156 y Spain
+# ------------------------------------------------
+combined_dir <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Clarissa/snp_cell_lines_public_datasets_project/stjudes_156/atacseq/peaks_sj_156_exploration/combined_sj156_spain"
+
+if (!exists("sj156_state") || !exists("spain_state")) {
+    cat("[1] Cargando sj156_state y spain_state desde:\n   ", combined_dir, "\n")
+    sj156_state <- readRDS(file.path(combined_dir, "sj156_atac_core_state.rds"))
+    spain_state <- readRDS(file.path(combined_dir, "spain_atac_core_state.rds"))
+} else {
+    cat("[1] Usando sj156_state y spain_state ya presentes en memoria.\n")
+}
+
+# ------------------------------------------------
+# 2) Extraer definiciones de Ilaria + módulos PROM SJ156
+# ------------------------------------------------
+panel_long       <- sj156_state$panel_long
+ct_levels        <- sj156_state$ct_levels
+cell_type_colors <- sj156_state$cell_type_colors
+margin_colors    <- sj156_state$margin_colors
+
+# Módulos "promoters only" de Ilaria para SJ156
+avg_z_sj_prom <- sj156_state$mods_prom$avg_z_by_ct  # lineages × SJ samples
+
+cat("\n[2] SJ156 Ilaria PROM modules (avg_z_sj_prom):\n")
+cat("    dim =", paste(dim(avg_z_sj_prom), collapse = " × "), "\n")
+cat("    lineages:", paste(rownames(avg_z_sj_prom), collapse = ", "), "\n")
+
+panel_long$cell_type <- factor(panel_long$cell_type, levels = ct_levels)
+
+# ------------------------------------------------
+# 3) Módulos de Ilaria para Spain usando gene_counts_spain_prom
+#    (PROM-only por gen)
+# ------------------------------------------------
+gene_counts_spain_prom <- spain_state$gene_counts_spain_prom
+meta_spain_coding      <- spain_state$meta_spain_coding
+
+cat("\n[3] gene_counts_spain_prom (PROM-only):\n")
+cat("    dim =", paste(dim(gene_counts_spain_prom), collapse = " × "), "\n")
+
+meta_spain <- meta_spain_coding %>%
+    transmute(
+        Sample    = as.character(Sample),
+        genotype  = factor(genotype, levels = c("TT", "TC", "CC")),
+        cell_type = as.character(cell_type)
+    )
+
+# Alinear muestras Spain entre counts y metadata
+samples_spain <- intersect(colnames(gene_counts_spain_prom), meta_spain$Sample)
+gene_counts_spain_prom <- gene_counts_spain_prom[, samples_spain, drop = FALSE]
+meta_spain <- meta_spain %>% filter(Sample %in% samples_spain)
+gene_counts_spain_prom <- gene_counts_spain_prom[, meta_spain$Sample, drop = FALSE]
+
+cat("    Samples Spain alineados:", ncol(gene_counts_spain_prom), "\n")
+
+# Helper si no existe todavía
+if (!exists("build_modules_from_gene_counts")) {
+    cat("[3b] Definiendo build_modules_from_gene_counts()...\n")
+    build_modules_from_gene_counts <- function(gene_counts,
+                                               panel_long,
+                                               ct_levels,
+                                               min_counts  = 10,
+                                               min_samples = 5,
+                                               clip_z      = 2) {
+        stopifnot(is.matrix(gene_counts))
+        
+        keep <- rowSums(gene_counts >= min_counts) >= min_samples
+        gene_counts_filt <- gene_counts[keep, , drop = FALSE]
+        cat("    - build_modules: keeping", nrow(gene_counts_filt),
+            "genes after min_counts/min_samples\n")
+        
+        logcpm <- edgeR::cpm(gene_counts_filt, log = TRUE, prior.count = 1)
+        
+        z_gene <- t(scale(t(logcpm)))
+        z_gene[is.na(z_gene)] <- 0
+        if (!is.null(clip_z)) {
+            z_gene <- pmin(pmax(z_gene, -clip_z), clip_z)
+        }
+        
+        avg_list <- lapply(ct_levels, function(ct) {
+            g_ct <- panel_long$gene[panel_long$cell_type == ct]
+            g_ct <- intersect(unique(g_ct), rownames(z_gene))
+            if (length(g_ct) == 0L) {
+                rep(NA_real_, ncol(z_gene))
+            } else {
+                colMeans(z_gene[g_ct, , drop = FALSE])
+            }
+        })
+        
+        avg_z_by_ct <- do.call(rbind, avg_list)
+        rownames(avg_z_by_ct) <- ct_levels
+        colnames(avg_z_by_ct) <- colnames(z_gene)
+        
+        invisible(list(avg_z_by_ct = avg_z_by_ct, z_gene = z_gene))
+    }
+} else {
+    cat("[3b] Reutilizando build_modules_from_gene_counts() ya definido.\n")
+}
+
+mods_spain_prom_ilaria <- build_modules_from_gene_counts(
+    gene_counts = gene_counts_spain_prom,
+    panel_long  = panel_long,
+    ct_levels   = ct_levels,
+    min_counts  = 10,
+    min_samples = 3,
+    clip_z      = 2
+)
+avg_z_spain_prom <- mods_spain_prom_ilaria$avg_z_by_ct
+
+cat("\n[3c] Spain Ilaria modules (avg_z_spain_prom, PROM-only):\n")
+cat("    dim =", paste(dim(avg_z_spain_prom), collapse = " × "), "\n")
+cat("    lineages:", paste(rownames(avg_z_spain_prom), collapse = ", "), "\n")
+
+# ------------------------------------------------
+# 4) Unir SJ156 + Spain usando sólo linajes comunes (PROM)
+# ------------------------------------------------
+common_ct <- intersect(rownames(avg_z_sj_prom), rownames(avg_z_spain_prom))
+avg_z_sj_prom    <- avg_z_sj_prom[common_ct, , drop = FALSE]
+avg_z_spain_prom <- avg_z_spain_prom[common_ct, , drop = FALSE]
+
+mat_combined_prom <- cbind(avg_z_sj_prom, avg_z_spain_prom)
+
+cat("\n[4] Matriz combinada PROM (SJ156 + Spain):\n")
+cat("    dim =", paste(dim(mat_combined_prom), collapse = " × "), "\n")
+cat("    lineages comunes:", paste(common_ct, collapse = ", "), "\n")
+cat("    rango global =", paste(range(mat_combined_prom, na.rm = TRUE),
+                                collapse = " to "), "\n")
+
+# ------------------------------------------------
+# 5) Anotación: cohorte + top_ct + margin
+# ------------------------------------------------
+samples_sj    <- colnames(avg_z_sj_prom)
+samples_spain <- colnames(avg_z_spain_prom)
+
+ann_all <- data.frame(
+    Sample = c(samples_sj, samples_spain),
+    cohort = c(rep("SJ156", length(samples_sj)),
+               rep("Spain", length(samples_spain))),
+    stringsAsFactors = FALSE
+)
+rownames(ann_all) <- ann_all$Sample
+ann_all <- ann_all[colnames(mat_combined_prom), , drop = FALSE]
+
+# Top linaje Ilaria por muestra
+top_idx <- apply(mat_combined_prom, 2, which.max)
+top_ct  <- rownames(mat_combined_prom)[top_idx]
+ann_all$top_ct <- factor(top_ct, levels = common_ct)
+
+# Segundo mejor linaje y margin numérico
+second_idx <- apply(mat_combined_prom, 2, function(v) order(v, decreasing = TRUE)[2])
+margin_numeric <- mat_combined_prom[cbind(top_idx,   seq_along(top_idx))] -
+    mat_combined_prom[cbind(second_idx, seq_along(second_idx))]
+
+# Queremos Q1 (más bajo) a la izquierda → definimos niveles explícitos
+margin_levels <- c("Q1 (lowest)", "Q2", "Q3", "Q4 (highest)")
+
+ann_all$margin <- cut(
+    margin_numeric,
+    breaks = quantile(margin_numeric, probs = seq(0, 1, 0.25), na.rm = TRUE),
+    include.lowest = TRUE,
+    labels = margin_levels
+)
+
+# Aseguramos que el factor tenga exactamente ese orden
+ann_all$margin <- factor(as.character(ann_all$margin),
+                         levels = margin_levels)
+
+cat("\n[5] Top_ct y margin (cuartiles, Q1→Q4):\n")
+print(table(ann_all$top_ct, ann_all$cohort, useNA = "ifany"))
+cat("\n    summary(margin_numeric):\n")
+print(summary(margin_numeric))
+
+# ------------------------------------------------
+# 6) Orden de columnas:
+#    1) por linaje ganador (top_ct),
+#    2) luego margin Q1 → Q4,
+#    3) dentro de cada grupo por score del linaje (descendente)
+# ------------------------------------------------
+top_score <- mat_combined_prom[cbind(top_idx, seq_along(top_idx))]
+
+col_order <- order(
+    ann_all$top_ct,      # linaje (HSCMPP → ... → B)
+    ann_all$margin,      # Q1 (lowest) → Q4 (highest)
+    -top_score           # dentro de cada grupo, mayor score primero
+)
+
+mat_ord  <- mat_combined_prom[, col_order, drop = FALSE]
+ann_all  <- ann_all[col_order, , drop = FALSE]
+
+# Gaps entre bloques de linaje (verticales) y entre filas
+r <- rle(as.character(ann_all$top_ct))
+gaps_col <- if (length(r$lengths) > 1L) cumsum(r$lengths)[-length(r$lengths)] else NULL
+gaps_row <- if (length(common_ct) > 1L) seq_len(length(common_ct) - 1L) else NULL
+
+cat("\n[6] Orden final de columnas por top_ct, margin (Q1→Q4) y score:\n")
+print(table(ann_all$top_ct, ann_all$cohort, useNA = "ifany"))
+
+# ------------------------------------------------
+# 7) Colores de anotación (cohort + top_ct + margin)
+# ------------------------------------------------
+annotation_colors <- list(
+    cohort = c(SJ156 = "#1f78b4", Spain = "#33a02c"),
+    top_ct = cell_type_colors[names(cell_type_colors) %in% common_ct],
+    margin = margin_colors
+)
+
+# (Opcional) Aquí puedes añadir spain_cell_type reciclado del otro bloque
+
+# ------------------------------------------------
+# 8) Heatmap final
+# ------------------------------------------------
+pheatmap::pheatmap(
+    mat_ord,
+    cluster_rows   = FALSE,
+    cluster_cols   = FALSE,
+    annotation_col = ann_all,
+    annotation_colors = annotation_colors,
+    gaps_row       = gaps_row,
+    gaps_col       = gaps_col,
+    show_colnames  = FALSE,
+    show_rownames  = TRUE,
+    border_color   = NA,
+    main = "Ilaria PROM modules — SJ156 + Spain (PROM-only, margin Q1→Q4)"
+)
+
+```
+
+
+
+# 12. Task 2 — Using Spain-derived promoter/enhancer markers
+
+###  12.1 Load SJ156 + Spain core states Using the markers you generated from the Spanish Data using promoters and enhancer, plot the Spanish and SJ samples
+
+```{r}
+# ================================================================
+# TASK 2 — Spain-derived PROMOTER / ENHANCER markers on SJ156 + Spain
+# ================================================================
+suppressPackageStartupMessages({
+    library(dplyr)
+    library(edgeR)
+    library(pheatmap)
+})
+
+# 1) Load core states (SJ156 + Spain) ------------------------------------
+combined_dir <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Clarissa/snp_cell_lines_public_datasets_project/stjudes_156/atacseq/peaks_sj_156_exploration/combined_sj156_spain"
+
+if (!exists("sj156_state") || !exists("spain_state")) {
+    cat("[1] Loading sj156_state and spain_state from:\n  ", combined_dir, "\n")
+    
+    if (!file.exists(file.path(combined_dir, "sj156_atac_core_state.rds"))) {
+        stop("sj156_atac_core_state.rds not found in combined_dir.\n",
+             "  → Please run the SJ156 saving chunk that creates sj156_atac_core_state.rds.")
+    }
+    if (!file.exists(file.path(combined_dir, "spain_atac_core_state.rds"))) {
+        stop("spain_atac_core_state.rds not found in combined_dir.\n",
+             "  → Please run the Spain saving chunk that creates spain_atac_core_state.rds.")
+    }
+    
+    sj156_state <- readRDS(file.path(combined_dir, "sj156_atac_core_state.rds"))
+    spain_state <- readRDS(file.path(combined_dir, "spain_atac_core_state.rds"))
+} else {
+    cat("[1] Using existing sj156_state and spain_state in memory.\n")
+}
+
+# 2) Extract Spain marker panels + gene-level counts ---------------------
+# 2) Extract Spain marker panels + gene-level counts ---------------------
+panel_spain_prom_long <- spain_state$panel_spain_prom_long
+panel_spain_enh_long  <- spain_state$panel_spain_enh_long
+ct_spain_order        <- spain_state$ct_spain_order
+
+if (is.null(panel_spain_prom_long) || is.null(panel_spain_enh_long)) {
+    stop("panel_spain_prom_long or panel_spain_enh_long not found in spain_state.\n",
+         "  → Make sure Spain marker panels are stored in spain_atac_core_state.rds.")
+}
+
+gene_counts_sj    <- sj156_state$gene_counts_sj
+gene_counts_spain <- spain_state$gene_counts_spain
+
+if (is.null(gene_counts_sj) || is.null(gene_counts_spain)) {
+    stop("gene_counts_sj or gene_counts_spain is NULL.\n",
+         "  → Make sure both RDS files contain gene-level matrices.")
+}
+
+gene_counts_sj    <- as.matrix(gene_counts_sj)
+gene_counts_spain <- as.matrix(gene_counts_spain)
+
+cat("[2] Spain marker panels (long format):\n")
+cat("    PROMOTER rows:", nrow(panel_spain_prom_long),
+    " | unique genes:", length(unique(panel_spain_prom_long$gene)), "\n")
+cat("    ENHANCER rows:", nrow(panel_spain_enh_long),
+    " | unique genes:", length(unique(panel_spain_enh_long$gene)), "\n")
+
+cat("[2b] Gene-level counts dimensions:\n")
+cat("    SJ156: ", paste(dim(gene_counts_sj),    collapse = " × "), "\n")
+cat("    Spain: ", paste(dim(gene_counts_spain), collapse = " × "), "\n")
+
+if (is.null(rownames(gene_counts_sj)) || is.null(rownames(gene_counts_spain))) {
+    stop("gene_counts_sj or gene_counts_spain lack rownames (gene IDs). Please fix before proceeding.")
+}
+
+panel_spain_prom_long$cell_type <- factor(panel_spain_prom_long$cell_type,
+                                          levels = ct_spain_order)
+panel_spain_enh_long$cell_type  <- factor(panel_spain_enh_long$cell_type,
+                                          levels = ct_spain_order)
+
+# 3) Helper: modules from gene counts (reuse if already defined) ---------
+if (!exists("build_modules_from_gene_counts")) {
+    cat("[3] Defining helper build_modules_from_gene_counts().\n")
+    build_modules_from_gene_counts <- function(gene_counts,
+                                               panel_long,
+                                               ct_levels,
+                                               min_counts  = 10,
+                                               min_samples = 3,
+                                               clip_z      = 2) {
+        stopifnot(is.matrix(gene_counts))
+        
+        keep <- rowSums(gene_counts >= min_counts) >= min_samples
+        gene_counts_filt <- gene_counts[keep, , drop = FALSE]
+        if (nrow(gene_counts_filt) == 0L) {
+            stop("All genes filtered out by min_counts/min_samples in build_modules_from_gene_counts().")
+        }
+        cat("    - keeping", nrow(gene_counts_filt), "genes after min_counts/min_samples filter\n")
+        
+        logcpm <- edgeR::cpm(gene_counts_filt, log = TRUE, prior.count = 1)
+        
+        z_gene <- t(scale(t(logcpm)))
+        z_gene[is.na(z_gene)] <- 0
+        if (!is.null(clip_z)) {
+            z_gene <- pmin(pmax(z_gene, -clip_z), clip_z)
+        }
+        
+        avg_list <- lapply(ct_levels, function(ct) {
+            g_ct <- panel_long$gene[panel_long$cell_type == ct]
+            g_ct <- intersect(unique(g_ct), rownames(z_gene))
+            if (length(g_ct) == 0L) {
+                rep(NA_real_, ncol(z_gene))
+            } else {
+                colMeans(z_gene[g_ct, , drop = FALSE])
+            }
+        })
+        
+        avg_z_by_ct <- do.call(rbind, avg_list)
+        rownames(avg_z_by_ct) <- ct_levels
+        colnames(avg_z_by_ct) <- colnames(z_gene)
+        
+        invisible(list(avg_z_by_ct = avg_z_by_ct, z_gene = z_gene))
+    }
+} else {
+    cat("[3] Reusing existing build_modules_from_gene_counts().\n")
+}
+
+# Spain-specific colors for the early B-cell ladder
+cell_type_colors_spain <- c(
+    HSC         = "#fb8072",
+    CLP         = "#bebada",
+    ProB        = "#ff33ff",
+    PreB        = "#00e5c0",
+    `Immature-B` = "#00bfff"
+)
+
+# 4) Helper to build a joint Spain-marker heatmap ------------------------
+build_spain_joint_heatmap <- function(panel_long_spain,
+                                      panel_label = c("PROMOTER", "ENHANCER")) {
+    panel_label <- match.arg(panel_label)
+    cat("\n[4] Building joint modules for Spain ", panel_label, " markers...\n", sep = "")
+    
+    mods_sj <- build_modules_from_gene_counts(
+        gene_counts = gene_counts_sj,
+        panel_long  = panel_long_spain,
+        ct_levels   = ct_spain_order,
+        min_counts  = 10,
+        min_samples = 3,
+        clip_z      = 2
+    )
+    mods_sp <- build_modules_from_gene_counts(
+        gene_counts = gene_counts_spain,
+        panel_long  = panel_long_spain,
+        ct_levels   = ct_spain_order,
+        min_counts  = 10,
+        min_samples = 3,
+        clip_z      = 2
+    )
+    
+    mat_sj <- mods_sj$avg_z_by_ct  # lineages × SJ samples
+    mat_sp <- mods_sp$avg_z_by_ct  # lineages × Spain samples
+    
+    common_ct <- intersect(rownames(mat_sj), rownames(mat_sp))
+    mat_sj <- mat_sj[common_ct, , drop = FALSE]
+    mat_sp <- mat_sp[common_ct, , drop = FALSE]
+    
+    mat_combined <- cbind(mat_sj, mat_sp)
+    cat("[4] ", panel_label, " combined matrix: ",
+        paste(dim(mat_combined), collapse = " × "),
+        " (lineages × samples)\n", sep = "")
+    
+    # Drop lineages with all NA
+    all_na <- apply(mat_combined, 1, function(x) all(is.na(x)))
+    if (any(all_na)) {
+        cat("    - dropping lineages with no genes in either cohort: ",
+            paste(rownames(mat_combined)[all_na], collapse = ", "), "\n", sep = "")
+        mat_combined <- mat_combined[!all_na, , drop = FALSE]
+        common_ct <- rownames(mat_combined)
+    }
+    
+    samples_sj    <- colnames(mat_sj)
+    samples_spain <- colnames(mat_sp)
+    
+    ann_all <- data.frame(
+        cohort = factor(c(rep("SJ156", length(samples_sj)),
+                          rep("Spain", length(samples_spain))),
+                        levels = c("SJ156", "Spain")),
+        row.names = c(samples_sj, samples_spain)
+    )
+    ann_all <- ann_all[colnames(mat_combined), , drop = FALSE]
+    
+    # Top lineage per sample + ordering
+    top_idx <- apply(mat_combined, 2, function(v) {
+        if (all(is.na(v))) return(NA_integer_)
+        which.max(v)
+    })
+    top_ct <- ifelse(is.na(top_idx), NA_character_, rownames(mat_combined)[top_idx])
+    ann_all$top_ct <- factor(top_ct, levels = common_ct)
+    
+    col_order <- character(0)
+    for (ct in common_ct) {
+        col_ct_sj    <- rownames(ann_all)[ann_all$top_ct == ct & ann_all$cohort == "SJ156"]
+        col_ct_spain <- rownames(ann_all)[ann_all$top_ct == ct & ann_all$cohort == "Spain"]
+        col_order    <- c(col_order, col_ct_sj, col_ct_spain)
+    }
+    col_order <- col_order[col_order %in% colnames(mat_combined)]
+    
+    mat_ord <- mat_combined[, col_order, drop = FALSE]
+    ann_all <- ann_all[col_order, , drop = FALSE]
+    
+    r <- rle(as.character(ann_all$top_ct))
+    gaps_col <- if (length(r$lengths) > 1L) cumsum(r$lengths)[-length(r$lengths)] else NULL
+    gaps_row <- if (length(common_ct) > 1L) seq_len(length(common_ct) - 1L) else NULL
+    
+    cat("[4b] top_ct distribution (", panel_label, " markers):\n", sep = "")
+    print(table(ann_all$top_ct, ann_all$cohort, useNA = "ifany"))
+    
+    annotation_colors <- list(
+        cohort = c(SJ156 = "#1f78b4", Spain = "#33a02c"),
+        top_ct = cell_type_colors_spain[names(cell_type_colors_spain) %in% common_ct]
+    )
+    
+    pheatmap::pheatmap(
+        mat_ord,
+        cluster_rows   = FALSE,
+        cluster_cols   = FALSE,
+        annotation_col = ann_all,
+        annotation_colors = annotation_colors,
+        gaps_row       = gaps_row,
+        gaps_col       = gaps_col,
+        show_colnames  = FALSE,
+        show_rownames  = TRUE,
+        border_color   = NA,
+        main = paste0("Spain ", panel_label,
+                      " markers — SJ156 + Spain (gene-level modules)")
+    )
+}
+
+# 5) Run for PROMOTER and ENHANCER Spain marker panels -------------------
+build_spain_joint_heatmap(panel_spain_prom_long, panel_label = "PROMOTER")
+build_spain_joint_heatmap(panel_spain_enh_long,  panel_label = "ENHANCER")
+
+```
+
+
+
+
+```{r}
+
+
+
+```
+

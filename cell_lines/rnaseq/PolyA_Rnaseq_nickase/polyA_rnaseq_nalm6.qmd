@@ -2,37 +2,48 @@
 # Load required libraries
 suppressMessages(library(tidyverse))
 
-# Define base directory containing sample folders
+# Define base directory
 base_dir <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Clarissa/snp_cell_lines_public_datasets_project/cell_lines/rnaseq/PolyA_Rnaseq_nickase/polyA_sf_files"
 
-# Get full paths to sample directories (each folder = one clone)
-sample_dirs <- list.dirs(base_dir, recursive = FALSE, full.names = TRUE)
-
-# Extract sample folder names (e.g., NALM6_TT_Clone1)
+# Get full paths and sample names
+sample_dirs  <- list.dirs(base_dir, recursive = FALSE, full.names = TRUE)
 sample_names <- basename(sample_dirs)
 
-# Construct metadata dataframe
+# Construct metadata
 sample_metadata <- tibble(
     sample = sample_names,
     path   = file.path(sample_dirs, "quant.sf")
 ) %>%
     mutate(
-        cell_line = "NALM6",   # all samples are NALM6
+        cell_line = "NALM6",
         genotype  = case_when(
             str_detect(sample, "TT") ~ "TT",
             str_detect(sample, "TC") ~ "TC",
             str_detect(sample, "CC") ~ "CC",
             TRUE ~ NA_character_
         ),
-        clone     = str_extract(sample, "Clone[0-9]+") %>%
+        clone = str_extract(sample, "Clone[0-9]+") %>%
             str_remove("Clone") %>%
             as.integer(),
-        replicate = 1,
-        sample_id_full = paste(cell_line, genotype, ifelse(is.na(clone), "NA", clone), sep = "_")
+        replicate = str_extract(sample, "REP[0-9]+") %>%
+            str_remove("REP") %>%
+            as.integer(),
+        batch = case_when(
+            str_detect(sample, "REP1") ~ "Batch1",
+            str_detect(sample, "REP2") ~ "Batch2",
+            TRUE ~ "Unknown"
+        ),
+        sample_id_full = paste(cell_line, genotype,
+                               paste0("C", clone),
+                               paste0("R", replicate),
+                               sep = "_")
     )
 
-# Set rownames to match combined sample ID
+# Assign rownames
 rownames(sample_metadata) <- sample_metadata$sample_id_full
+
+# Preview
+print(sample_metadata)
 
 ```
 
@@ -263,149 +274,518 @@ ggplot(arid5b_expr, aes(x = genotype, y = FPKM, color = genotype)) +
 ```
 
 # 🔹 PCA for NALM6
-
+## PCA Before correction
 ```{r}
-# ==============================================
-# PCA for NALM6 samples
-# ==============================================
-suppressMessages(library(tidyverse))
-suppressMessages(library(tidybulk))
-suppressMessages(library(ggrepel))
+# ===============================================================
+# PCA BEFORE batch correction (raw CPM-filtered counts)
+# ===============================================================
+suppressMessages({
+  library(tidyverse)
+  library(tidybulk)
+  library(ggrepel)
+})
 
-# 1. Filter metadata for NALM6 samples
+# --- 1. Restrict to NALM6 samples
 nalm6_coldata <- human_coldata %>%
   filter(cell_line == "NALM6")
 
-# 2. Filter expression matrix to match NALM6 samples
+# --- 2. Subset expression matrix
 nalm6_expr <- sf.df.data[, nalm6_coldata$Sample, drop = FALSE] %>%
-  as.data.frame() %>% 
+  as.data.frame() %>%
   tibble::rownames_to_column("gene_id")
 
-# 3. Reshape to tidy format
+# --- 3. Long / tidy format for tidybulk
 nalm6_expr_tidy <- nalm6_expr %>%
-  pivot_longer(
-    cols = -gene_id,
-    names_to = "Sample",
-    values_to = "abundance"
-  ) %>%
-  rename(gene = gene_id)
-
-# 4. Merge with metadata
-nalm6_tidy <- nalm6_expr_tidy %>%
+  pivot_longer(-gene_id, names_to = "Sample", values_to = "abundance") %>%
+  rename(gene = gene_id) %>%
   left_join(nalm6_coldata, by = "Sample")
 
-# 5. Tidybulk PCA
-pca_nalm6 <- nalm6_tidy %>%
-  tidybulk(
-    .sample = Sample,
-    .transcript = gene,
-    .abundance = abundance
-  ) %>%
+# --- 4. PCA using tidybulk (no batch correction)
+pca_raw <- nalm6_expr_tidy %>%
+  tidybulk(.sample = Sample, .transcript = gene, .abundance = abundance) %>%
   keep_abundant() %>%
   scale_abundance() %>%
   reduce_dimensions(method = "PCA", .dims = 8)
 
-# 6. PCA plot: color by genotype, shape by clone
-pca_nalm6 %>%
+# --- 5. Plot: genotype colour, batch fill, clone shape
+pca_raw %>%
   pivot_sample() %>%
-  ggplot(aes(
-    x = PC1, y = PC2,
-    color = genotype,
-    shape = as.factor(clone),
-    label = Sample
-  )) +
-  geom_point(size = 3) +
-  ggrepel::geom_text_repel(max.overlaps = 5, size = 3, show.legend = FALSE) +
+  ggplot(aes(x = PC1, y = PC2,
+             color = genotype,
+             shape = as.factor(clone),
+             fill = batch,
+             label = Sample)) +
+  geom_point(size = 3, alpha = 0.9) +
+  ggrepel::geom_text_repel(max.overlaps = 6, size = 3, show.legend = FALSE) +
   theme_minimal() +
   labs(
-    title = "PCA of NALM6 Gene Expression",
-    subtitle = "Colored by Genotype, Shaped by Clone",
-    x = "Principal Component 1",
-    y = "Principal Component 2"
+    title = "PCA before batch correction (raw CPM-filtered counts)",
+    subtitle = "Colored by genotype, shaped by clone, filled by batch",
+    x = "PC1", y = "PC2"
   )
 
 ```
+
+## PCA after correction
+```{r}
+# ===============================================================
+# PCA AFTER batch correction using ComBat-seq (sva >= 3.36.0)
+# Reference: Zhang Y. et al., NAR Genomics & Bioinformatics 2020
+# ===============================================================
+suppressMessages({
+  library(sva)        # For ComBat_seq
+  library(tidyverse)
+  library(tidybulk)
+  library(ggrepel)
+})
+
+# --- 1. Prepare inputs for ComBat-seq
+# Counts must be raw integers; matrix rows = genes, columns = samples
+nalm6_counts <- sf.df.data[, nalm6_coldata$Sample, drop = FALSE]
+nalm6_batches <- nalm6_coldata$batch
+
+# Optionally preserve biological grouping (genotype) during adjustment
+nalm6_groups <- nalm6_coldata$genotype
+
+# --- 2. Run ComBat-seq
+# (ComBat_seq expects a matrix, not a data frame)
+combat_corrected <- ComBat_seq(
+  as.matrix(nalm6_counts),
+  batch = nalm6_batches,
+  group = nalm6_groups
+)
+
+# --- 3. Convert corrected counts to tidy format
+combat_tidy <- as.data.frame(combat_corrected) %>%
+  tibble::rownames_to_column("gene_id") %>%
+  pivot_longer(-gene_id, names_to = "Sample", values_to = "abundance") %>%
+  rename(gene = gene_id) %>%
+  left_join(nalm6_coldata, by = "Sample")
+
+# --- 4. PCA on ComBat-seq adjusted counts
+pca_combat <- combat_tidy %>%
+  tidybulk(.sample = Sample, .transcript = gene, .abundance = abundance) %>%
+  keep_abundant() %>%
+  scale_abundance() %>%
+  reduce_dimensions(method = "PCA", .dims = 8)
+
+# --- 5. Plot comparison
+pca_combat %>%
+  pivot_sample() %>%
+  ggplot(aes(x = PC1, y = PC2,
+             color = genotype,
+             shape = as.factor(clone),
+             fill = batch,
+             label = Sample)) +
+  geom_point(size = 3, alpha = 0.9) +
+  ggrepel::geom_text_repel(max.overlaps = 6, size = 3, show.legend = FALSE) +
+  theme_minimal() +
+  labs(
+    title = "PCA after batch correction (ComBat-seq)",
+    subtitle = "Batch effects adjusted; genotype structure preserved",
+    x = "PC1", y = "PC2"
+  )
+
+```
+
 
 # ✅ Updated QC Suite (SummarizedExperiment + plots)
 
 ```{r}
-# ==============================================
-# Build SummarizedExperiment with filtered counts
-# ==============================================
-suppressMessages(library(SummarizedExperiment))
+# ============================================================
+# ✅ Updated QC Suite — NALM6 (18 samples, with batches)
+# ============================================================
 
-# Ensure colData matches sample order
+suppressMessages({
+  library(SummarizedExperiment)
+  library(tidyverse)
+  library(reshape2)
+  library(scales)
+})
+
+# ------------------------------------------------------------
+# 1. Build SummarizedExperiment with filtered counts
+# ------------------------------------------------------------
+# Ensure colData matches the column order of sf.df.data
 sf.df.se <- SummarizedExperiment(
-  assays = list(counts = as.matrix(sf.df.data)),
+  assays  = list(counts = as.matrix(sf.df.data)),
   colData = human_coldata[colnames(sf.df.data), ]
 )
 
-# Add detailed sample names
+# Add descriptive sample names including clone, replicate, and batch
 sf.df.se$detailed_name <- paste(
   sf.df.se$cell_line,
   sf.df.se$genotype,
-  sf.df.se$clone,
+  paste0("C", sf.df.se$clone),
+  paste0("R", sf.df.se$replicate),
+  sf.df.se$batch,
   sep = "_"
 )
 
-# ==============================================
-# Library size plot
-# ==============================================
+# ------------------------------------------------------------
+# 2. Library size (raw counts per sample)
+# ------------------------------------------------------------
 library_sizes <- colSums(assay(sf.df.se))
 
 ggplot(
-  data.frame(Sample = sf.df.se$detailed_name, LibrarySize = library_sizes),
-  aes(x = Sample, y = LibrarySize)
+  data.frame(
+    Sample      = sf.df.se$detailed_name,
+    Genotype    = sf.df.se$genotype,
+    Batch       = sf.df.se$batch,
+    LibrarySize = library_sizes
+  ),
+  aes(x = Sample, y = LibrarySize, fill = Batch)
 ) +
-  geom_bar(stat = "identity", fill = "skyblue") +
+  geom_bar(stat = "identity", color = "black", width = 0.75) +
+  scale_fill_manual(values = c("Batch1" = "#fdae61", "Batch2" = "#2b83ba")) +
   scale_y_continuous(labels = scales::comma) +
-  theme_minimal() +
+  theme_minimal(base_size = 13) +
   theme(
-    axis.text.x = element_text(angle = 90, hjust = 1, size = 10),
-    axis.title.x = element_text(size = 13),
-    axis.title.y = element_text(size = 13),
-    plot.title = element_text(size = 15, face = "bold")
+    axis.text.x  = element_text(angle = 90, hjust = 1, size = 10),
+    plot.title   = element_text(size = 15, face = "bold"),
+    legend.position = "top"
   ) +
   labs(
-    title = "Library Size Distribution",
-    x = "Sample (cell_line_genotype_clone)",
-    y = "Library Size (Raw Counts)"
+    title = "Library Size Distribution (18 NALM6 samples)",
+    subtitle = "Colored by sequencing batch",
+    x = "Sample (cell_line_genotype_clone_replicate_batch)",
+    y = "Library Size (Raw Counts)",
+    fill = "Batch"
   )
 
-# ==============================================
-# Log2 expression distributions per sample
-# ==============================================
-suppressMessages(library(reshape2))
-
-# Log-transform
+# ------------------------------------------------------------
+# 3. Log2 expression distributions per sample
+# ------------------------------------------------------------
+# Log-transform counts (+1 to avoid log(0))
 log_counts <- log2(assay(sf.df.se) + 1)
 
-# Melt to long format
+# Reshape into long format
 log_counts_long <- reshape2::melt(log_counts)
 colnames(log_counts_long) <- c("Gene", "Sample", "LogExpression")
 
-# Annotate by detailed name
+# Annotate samples with detailed labels
 log_counts_long <- log_counts_long %>%
-  mutate(Group = sf.df.se$detailed_name[match(Sample, colnames(log_counts))])
-
-# Density plot by sample
-ggplot(log_counts_long, aes(x = LogExpression, color = Group)) +
-  geom_density(size = 1, alpha = 0.7) +
-  theme_minimal() +
-  labs(
-    title = "Log2 Gene Expression Distribution by Sample",
-    x = "Log2(Counts + 1)",
-    y = "Density"
-  ) +
-  theme(
-    axis.title = element_text(size = 13),
-    plot.title = element_text(size = 15, face = "bold"),
-    legend.title = element_blank(),
-    legend.text = element_text(size = 9)
+  mutate(
+    Group = sf.df.se$detailed_name[match(Sample, colnames(log_counts))],
+    Genotype = sf.df.se$genotype[match(Sample, colnames(log_counts))],
+    Batch = sf.df.se$batch[match(Sample, colnames(log_counts))]
   )
 
+# Density plot by sample
+ggplot(log_counts_long, aes(x = LogExpression, color = Genotype, linetype = Batch)) +
+  geom_density(size = 1, alpha = 0.8) +
+  theme_minimal(base_size = 13) +
+  scale_color_manual(values = c("TT" = "#D55E00", "TC" = "#009E73", "CC" = "#0072B2")) +
+  scale_linetype_manual(values = c("Batch1" = "solid", "Batch2" = "dashed")) +
+  labs(
+    title = "Log2 Gene Expression Distributions (18 NALM6 samples)",
+    subtitle = "Color = Genotype, Linetype = Batch",
+    x = "Log2(Counts + 1)",
+    y = "Density",
+    color = "Genotype",
+    linetype = "Batch"
+  ) +
+  theme(
+    axis.title  = element_text(size = 13),
+    plot.title  = element_text(size = 15, face = "bold"),
+    legend.text = element_text(size = 10)
+  )
 
 ```
+## Checking ARID5B expression pre Combat
+
+```{r}
+# ============================================================
+# ARID5B (ENSG00000150347) Expression BEFORE ComBat-seq correction
+# ============================================================
+
+suppressMessages({
+    library(edgeR)
+    library(tidyverse)
+    library(scales)
+})
+
+# --- 1. Compute CPM (Counts Per Million) from pre-correction counts ---
+y <- DGEList(counts = sf.df.data)
+cpm_matrix <- cpm(y, log = FALSE)
+
+# --- 2. Extract ARID5B CPM values ---
+arid5b_cpm <- as.data.frame(cpm_matrix["ENSG00000150347", , drop = FALSE]) %>%
+    rownames_to_column("gene_id") %>%
+    pivot_longer(-gene_id, names_to = "Sample", values_to = "CPM") %>%
+    left_join(human_coldata, by = c("Sample" = "Sample"))
+
+# --- 3. Order and relabel samples ---
+arid5b_cpm <- arid5b_cpm %>%
+    mutate(
+        genotype = factor(genotype, levels = c("TT", "TC", "CC")),
+        batch = factor(batch, levels = c("Batch1", "Batch2")),
+        clone = as.factor(clone),
+        replicate = as.factor(replicate),
+        sample_label = paste0(genotype, "_C", clone, "_R", replicate),
+        batch_linetype = ifelse(batch == "Batch2", "dashed", "solid")
+    ) %>%
+    arrange(genotype, clone, replicate)
+
+# --- 4. Define color palette ---
+genotype_colors <- c("TT" = "#E41A1C", "TC" = "#377EB8", "CC" = "#4DAF4A")
+
+# --- 5. Build barplot ---
+pre_comb_arid_plot <- ggplot(arid5b_cpm, aes(x = sample_label, y = CPM,
+                                             fill = genotype, linetype = batch_linetype)) +
+    geom_col(width = 0.7, color = "black", size = 0.5,
+             position = position_dodge(width = 0.8)) +
+    scale_fill_manual(values = genotype_colors) +
+    scale_linetype_identity(guide = guide_legend(title = "Batch")) +
+    theme_minimal(base_size = 14) +
+    theme(
+        axis.text.x  = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 11),
+        axis.title   = element_text(face = "bold"),
+        plot.title   = element_text(face = "bold", size = 16),
+        plot.subtitle= element_text(size = 13),
+        legend.position = "top",
+        legend.title = element_text(face = "bold"),
+        panel.grid.major.x = element_blank()
+    ) +
+    labs(
+        title    = "ARID5B Expression (CPM-normalized counts)",
+        subtitle = "Pre–ComBat-seq | Color = Genotype, dashed outline = Batch2",
+        x = "Sample (Genotype_Clone_Replicate)",
+        y = "CPM (Counts per Million)",
+        fill = "Genotype"
+    )
+
+```
+
+###Checking ARID5B postcomb
+```{r}
+# ============================================================
+# ARID5B (ENSG00000150347) Expression AFTER ComBat-seq correction
+# ============================================================
+
+suppressMessages({
+    library(edgeR)
+    library(tidyverse)
+    library(scales)
+})
+
+# --- 1. Compute CPM from batch-corrected counts ---
+y_combat <- DGEList(counts = combat_corrected)
+cpm_combat <- cpm(y_combat, log = FALSE)
+
+# --- 2. Extract ARID5B CPM values ---
+arid5b_cpm_combat <- as.data.frame(cpm_combat["ENSG00000150347", , drop = FALSE]) %>%
+    rownames_to_column("gene_id") %>%
+    pivot_longer(-gene_id, names_to = "Sample", values_to = "CPM") %>%
+    left_join(human_coldata, by = c("Sample" = "Sample"))
+
+# --- 3. Reorder and relabel ---
+arid5b_cpm_combat <- arid5b_cpm_combat %>%
+    mutate(
+        genotype  = factor(genotype, levels = c("TT", "TC", "CC")),
+        batch     = factor(batch, levels = c("Batch1", "Batch2")),
+        clone     = as.factor(clone),
+        replicate = as.factor(replicate),
+        sample_label = paste0(genotype, "_C", clone, "_R", replicate),
+        batch_linetype = ifelse(batch == "Batch2", "dashed", "solid")
+    ) %>%
+    arrange(genotype, clone, replicate)
+
+# --- 4. Barplot ---
+post_comb_arid_plot <- ggplot(arid5b_cpm_combat, aes(x = sample_label, y = CPM,
+                                                     fill = genotype, linetype = batch_linetype)) +
+    geom_col(width = 0.7, color = "black", size = 0.5,
+             position = position_dodge(width = 0.8)) +
+    scale_fill_manual(values = genotype_colors) +
+    scale_linetype_identity(guide = guide_legend(title = "Batch")) +
+    theme_minimal(base_size = 14) +
+    theme(
+        axis.text.x  = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 11),
+        axis.title   = element_text(face = "bold"),
+        plot.title   = element_text(face = "bold", size = 16),
+        plot.subtitle= element_text(size = 13),
+        legend.position = "top",
+        legend.title = element_text(face = "bold"),
+        panel.grid.major.x = element_blank()
+    ) +
+    labs(
+        title    = "ARID5B Expression (CPM-normalized, after ComBat-seq correction)",
+        subtitle = "Post–ComBat-seq | Color = Genotype, dashed outline = Batch2",
+        x = "Sample (Genotype_Clone_Replicate)",
+        y = "CPM (Counts per Million)",
+        fill = "Genotype"
+    )
+
+```
+
+### Cowplot both
+
+```{r}
+# ============================================================
+# ARID5B (ENSG00000150347) — FPKM before vs after ComBat-seq
+# Same y-axis in both panels (uses global max across both)
+# ============================================================
+
+suppressMessages({
+    library(tidyverse)
+    library(GenomicRanges)
+    library(cowplot)
+})
+
+# -----------------------------
+# 0) Gene lengths (kb) per gene
+# -----------------------------
+if (exists("gtf")) {
+    exons_gr <- gtf[gtf$type == "exon"]
+} else {
+    stopifnot(exists("gtf_df"))
+    exons_gr <- makeGRangesFromDataFrame(
+        gtf_df %>% filter(type == "exon"),
+        seqnames.field = "seqnames",
+        start.field    = "start",
+        end.field      = "end",
+        strand.field   = "strand",
+        keep.extra.columns = TRUE
+    )
+}
+exons_by_gene <- split(exons_gr, exons_gr$gene_id)
+exonic_union  <- reduce(exons_by_gene)
+gene_len_bp   <- vapply(exonic_union, function(gr) sum(width(gr)), numeric(1))
+gene_len_kb   <- gene_len_bp / 1000
+rm(exons_gr, exons_by_gene, exonic_union, gene_len_bp)
+
+genes_with_len <- intersect(rownames(sf.df.data), names(gene_len_kb))
+if (!"ENSG00000150347" %in% genes_with_len)
+    stop("ARID5B (ENSG00000150347) not found among genes with lengths; check GTF IDs/row names.")
+
+# --------------------------------------
+# 1) Helper: counts -> FPKM (per sample)
+# --------------------------------------
+counts_to_fpkm <- function(counts_mat, length_kb_vec) {
+    length_kb_vec <- length_kb_vec[rownames(counts_mat)]
+    rpk <- sweep(counts_mat, 1, length_kb_vec, "/")
+    lib_million <- colSums(counts_mat) / 1e6
+    fpkm <- sweep(rpk, 2, lib_million, "/")
+    return(fpkm)
+}
+
+# --------------------------------------
+# 2) Pre- and post-ComBat count matrices
+# --------------------------------------
+counts_pre  <- sf.df.data[genes_with_len, , drop = FALSE]
+counts_post <- combat_corrected[genes_with_len, colnames(counts_pre), drop = FALSE]
+
+# --------------------------------------
+# 3) Compute FPKM matrices
+# --------------------------------------
+fpkm_pre  <- counts_to_fpkm(counts_pre,  gene_len_kb)
+fpkm_post <- counts_to_fpkm(counts_post, gene_len_kb)
+
+# --------------------------------------
+# 4) Extract ARID5B row and tidy for plotting
+# --------------------------------------
+prep_arid_df <- function(fpkm_mat, coldata) {
+    as.data.frame(fpkm_mat["ENSG00000150347", , drop = FALSE]) %>%
+        rownames_to_column("gene_id") %>%
+        pivot_longer(-gene_id, names_to = "Sample", values_to = "FPKM") %>%
+        left_join(coldata, by = c("Sample" = "Sample")) %>%
+        mutate(
+            genotype      = factor(genotype, levels = c("TT", "TC", "CC")),
+            batch         = factor(batch, levels = c("Batch1", "Batch2")),
+            clone         = as.factor(clone),
+            replicate     = as.factor(replicate),
+            sample_label  = paste0(genotype, "_C", clone, "_R", replicate),
+            batch_linetype = ifelse(batch == "Batch2", "dashed", "solid")
+        ) %>%
+        arrange(genotype, clone, replicate)
+}
+
+arid5b_pre  <- prep_arid_df(fpkm_pre,  human_coldata)
+arid5b_post <- prep_arid_df(fpkm_post, human_coldata)
+
+# Ensure identical x order across panels
+sample_order <- arid5b_pre$sample_label
+arid5b_pre$sample_label  <- factor(arid5b_pre$sample_label,  levels = sample_order)
+arid5b_post$sample_label <- factor(arid5b_post$sample_label, levels = sample_order)
+
+# --------------------------------------
+# 5) Global y-limit shared by both plots
+# --------------------------------------
+y_max <- max(c(arid5b_pre$FPKM, arid5b_post$FPKM), na.rm = TRUE)
+
+genotype_colors <- c("TT" = "#E41A1C", "TC" = "#377EB8", "CC" = "#4DAF4A")
+
+pre_comb_arid_fpkm_plot <- ggplot(arid5b_pre, aes(x = sample_label, y = FPKM,
+                                                  fill = genotype, linetype = batch_linetype)) +
+    geom_col(width = 0.7, color = "black", size = 0.5,
+             position = position_dodge(width = 0.8)) +
+    scale_fill_manual(values = genotype_colors) +
+    scale_linetype_identity(guide = guide_legend(title = "Batch")) +
+    scale_y_continuous(limits = c(0, y_max)) +
+    theme_minimal(base_size = 14) +
+    theme(
+        axis.text.x   = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 11),
+        axis.title    = element_text(face = "bold"),
+        plot.title    = element_text(face = "bold", size = 16),
+        plot.subtitle = element_text(size = 13),
+        legend.position = "top",
+        legend.title = element_text(face = "bold"),
+        panel.grid.major.x = element_blank()
+    ) +
+    labs(
+        title    = "ARID5B Expression (FPKM)",
+        subtitle = "Pre–ComBat-seq | Fill = Genotype, dashed outline = Batch2",
+        x = "Sample (Genotype_Clone_Replicate)",
+        y = "FPKM",
+        fill = "Genotype"
+    )
+
+post_comb_arid_fpkm_plot <- ggplot(arid5b_post, aes(x = sample_label, y = FPKM,
+                                                    fill = genotype, linetype = batch_linetype)) +
+    geom_col(width = 0.7, color = "black", size = 0.5,
+             position = position_dodge(width = 0.8)) +
+    scale_fill_manual(values = genotype_colors) +
+    scale_linetype_identity(guide = guide_legend(title = "Batch")) +
+    scale_y_continuous(limits = c(0, y_max)) +
+    theme_minimal(base_size = 14) +
+    theme(
+        axis.text.x   = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 11),
+        axis.title    = element_text(face = "bold"),
+        plot.title    = element_text(face = "bold", size = 16),
+        plot.subtitle = element_text(size = 13),
+        legend.position = "top",
+        legend.title = element_text(face = "bold"),
+        panel.grid.major.x = element_blank()
+    ) +
+    labs(
+        title    = "ARID5B Expression (FPKM)",
+        subtitle = "Post–ComBat-seq | Fill = Genotype, dashed outline = Batch2",
+        x = "Sample (Genotype_Clone_Replicate)",
+        y = "FPKM",
+        fill = "Genotype"
+    )
+
+# --------------------------------------
+# 6) Stack with cowplot
+# --------------------------------------
+combined_arid5b_fpkm <- plot_grid(
+    pre_comb_arid_fpkm_plot,
+    post_comb_arid_fpkm_plot,
+    ncol = 1,
+    labels = c("A", "B"),
+    label_size = 18,
+    label_fontface = "bold",
+    align = "v",
+    rel_heights = c(1, 1)
+)
+
+print(combined_arid5b_fpkm)
+# ggsave("ARID5B_FPKM_Pre_vs_Post_ComBat_sameY.pdf", combined_arid5b_fpkm,
+#        width = 10, height = 10, units = "in")
+
+```
+
+
 # # Doing DE, only one comparison
 
 ```{r}
@@ -748,12 +1128,13 @@ nalm6_tpm_tt_vs_cc$plot
 ```
 
 # DEG analysis for NALM6 (TT, TC, CC) using limma-trend on TPM
-## Excluding TT Clone 1 and non-coding genes
+
 
 ```{r}
 # ==============================================================
 # DEG analysis for NALM6 (TT, TC, CC) using limma-trend on TPM
-# Excluding TT Clone 1 and non-coding genes
+# Including all clones; excluding non-coding genes only
+# Thresholds: p ≤ 0.05, |log2FC| ≥ 0.5
 # ==============================================================
 
 suppressPackageStartupMessages({
@@ -764,25 +1145,25 @@ suppressPackageStartupMessages({
     library(ggrepel)
 })
 
-# 📂 1. Create output folder
-nalm6_polyA_outdir <- "PolyA_TPM_deg_results_NALM6_filtered"
+# 📂 1. Create output directory
+nalm6_polyA_outdir <- "PolyA_TPM_deg_results_NALM6"
 if (!dir.exists(nalm6_polyA_outdir)) dir.create(nalm6_polyA_outdir)
 
 # 🧮 Helper: counts → TPM
-counts_to_tpm <- function(counts, gene_lengths) {
-    rpk <- sweep(counts, 1, gene_lengths, "/")        
+counts_to_tpm <- function(counts, gene_length_kb) {
+    rpk <- sweep(counts, 1, gene_length_kb, "/")  # Reads per kilobase
     tpm <- apply(rpk, 2, function(x) x / sum(x, na.rm = TRUE) * 1e6)
     return(tpm)
 }
 
 # 🧬 2. Function for limma-trend DEG on TPM
-run_deg_tpm_nalm6_filtered <- function(count_matrix, metadata, ref_genotype, test_genotype, out_prefix) {
+run_deg_tpm_nalm6 <- function(count_matrix, metadata, ref_genotype, test_genotype, out_prefix,
+                              p_cutoff = 0.05, fc_cutoff = 0.5) {
     
-    # ---- Filter metadata ----
+    # ---- Filter metadata (include all clones, no exclusions) ----
     meta_data <- metadata %>%
         filter(cell_line == "NALM6",
-               genotype %in% c(ref_genotype, test_genotype),
-               sample_id_full != "NALM6_TT_1") %>%       # remove TT Clone 1
+               genotype %in% c(ref_genotype, test_genotype)) %>%
         mutate(genotype = factor(genotype, levels = c(ref_genotype, test_genotype)))
     
     rownames(meta_data) <- meta_data$sample_id_full
@@ -790,14 +1171,14 @@ run_deg_tpm_nalm6_filtered <- function(count_matrix, metadata, ref_genotype, tes
     # ---- Subset count matrix ----
     filtered_counts <- count_matrix[, meta_data$sample_id_full, drop = FALSE]
     
-    # ---- Keep only coding genes ----
+    # ---- Keep only coding (protein-coding) genes ----
     coding_genes <- gtf_df %>%
         filter(type == "gene", gene_biotype == "protein_coding") %>%
         pull(gene_id) %>% unique()
     
     filtered_counts <- filtered_counts[rownames(filtered_counts) %in% coding_genes, ]
     
-    # ---- Gene lengths ----
+    # ---- Compute gene lengths (kb) from exon union ----
     gene_lengths <- gtf_df %>%
         filter(type == "exon") %>%
         group_by(gene_id) %>%
@@ -808,13 +1189,13 @@ run_deg_tpm_nalm6_filtered <- function(count_matrix, metadata, ref_genotype, tes
     
     # ---- Counts → TPM ----
     tpm_matrix <- counts_to_tpm(filtered_counts, lengths_vec)
-    expr_log   <- log2(tpm_matrix + 1)
+    expr_log <- log2(tpm_matrix + 1)
     
-    # ---- Design ----
+    # ---- Design matrix ----
     design <- model.matrix(~ genotype, data = meta_data)
-    colnames(design) <- c("Intercept", paste0(test_genotype,"_vs_",ref_genotype))
+    colnames(design) <- c("Intercept", paste0(test_genotype, "_vs_", ref_genotype))
     
-    # ---- limma-trend ----
+    # ---- Fit limma-trend model ----
     fit <- lmFit(expr_log, design)
     fit <- eBayes(fit, trend = TRUE)
     coef_name <- colnames(design)[2]
@@ -825,8 +1206,8 @@ run_deg_tpm_nalm6_filtered <- function(count_matrix, metadata, ref_genotype, tes
         left_join(tx2gene_df %>% distinct(gene_id, gene_name), by = "gene_id") %>%
         mutate(
             significance = case_when(
-                P.Value <= 0.05 & logFC >=  0.2 ~ "up",
-                P.Value <= 0.05 & logFC <= -0.2 ~ "down",
+                P.Value <= p_cutoff & logFC >=  fc_cutoff  ~ "up",
+                P.Value <= p_cutoff & logFC <= -fc_cutoff  ~ "down",
                 TRUE ~ "ns"
             )
         ) %>%
@@ -845,8 +1226,8 @@ run_deg_tpm_nalm6_filtered <- function(count_matrix, metadata, ref_genotype, tes
     volcano_plot <- ggplot(tpm_res, aes(x = logFC, y = -log10(P.Value),
                                         fill = significance, alpha = significance)) +
         geom_point(shape = 21, colour = "black", size = 2) +
-        geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "grey50") +
-        geom_vline(xintercept = c(-0.2, 0.2), linetype = "dashed", colour = "grey50") +
+        geom_hline(yintercept = -log10(p_cutoff), linetype = "dashed", colour = "grey50") +
+        geom_vline(xintercept = c(-fc_cutoff, fc_cutoff), linetype = "dashed", colour = "grey50") +
         scale_fill_manual(values = c(up = "#D55E00", down = "#0072B2", ns = "grey80")) +
         scale_alpha_manual(values = c(up = 0.9, down = 0.9, ns = 0.5), guide = "none") +
         coord_cartesian(xlim = c(-x_max, x_max), ylim = c(0, y_max)) +
@@ -868,8 +1249,13 @@ run_deg_tpm_nalm6_filtered <- function(count_matrix, metadata, ref_genotype, tes
         ) +
         theme_minimal(base_size = 14) +
         labs(
-            title = paste0("PolyA Volcano (coding genes only; removed TT Clone 1): NALM6 ", test_genotype, " vs ", ref_genotype),
-            x = "log2 Fold Change", y = "-log10(p-value)", fill = "Significance"
+            title = paste0(
+                "PolyA Volcano (coding genes only, thresholds: p ≤ ", p_cutoff,
+                ", |log₂FC| ≥ ", fc_cutoff, "): NALM6 ", test_genotype, " vs ", ref_genotype
+            ),
+            x = "log₂ Fold Change",
+            y = expression(-log[10](p~value)),
+            fill = "Significance"
         )
     
     # 💾 Save plot
@@ -882,16 +1268,24 @@ run_deg_tpm_nalm6_filtered <- function(count_matrix, metadata, ref_genotype, tes
     list(results = tpm_res, plot = volcano_plot)
 }
 
-# 🚀 Run filtered comparisons
-nalm6_polyA_tt_vs_tc <- run_deg_tpm_nalm6_filtered(sf.df.data, sample_metadata, "TC", "TT", "PolyA_TPM_NALM6_TT_vs_TC")
-nalm6_polyA_tc_vs_cc <- run_deg_tpm_nalm6_filtered(sf.df.data, sample_metadata, "CC", "TC", "PolyA_TPM_NALM6_TC_vs_CC")
-nalm6_polyA_tt_vs_cc <- run_deg_tpm_nalm6_filtered(sf.df.data, sample_metadata, "CC", "TT", "PolyA_TPM_NALM6_TT_vs_CC")
+# 🚀 Run pairwise comparisons (include all clones)
+nalm6_polyA_tt_vs_tc <- run_deg_tpm_nalm6(sf.df.data, sample_metadata, "TC", "TT", "PolyA_TPM_NALM6_TT_vs_TC")
+nalm6_polyA_tc_vs_cc <- run_deg_tpm_nalm6(sf.df.data, sample_metadata, "CC", "TC", "PolyA_TPM_NALM6_TC_vs_CC")
+nalm6_polyA_tt_vs_cc <- run_deg_tpm_nalm6(sf.df.data, sample_metadata, "CC", "TT", "PolyA_TPM_NALM6_TT_vs_CC")
 
-# 📊 Print plots
+# 📊 Display volcano plots
 nalm6_polyA_tt_vs_tc$plot
 nalm6_polyA_tc_vs_cc$plot
 nalm6_polyA_tt_vs_cc$plot
 
+
 ```
+
+## Venn diagrams with Wenjians results
+
+```{r}
+
+```
+
 
 

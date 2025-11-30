@@ -1,0 +1,2937 @@
+
+---
+## Clean approach
+
+```{r}
+# ================================================================
+# 0. Libraries
+# ================================================================
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(readr)
+library(GenomicRanges)
+library(GenomeInfoDb)
+library(ChIPseeker)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+library(org.Hs.eg.db)
+library(DESeq2)
+library(edgeR)
+library(ggplot2)
+library(ggrepel)
+library(matrixStats)
+
+set.seed(17)
+
+# Shared aesthetics / orders
+geno_cols <- c(TT = "#E4007C", TC = "darkgreen", CC = "#D3AF37")
+base_cols <- c(T = "#E4007C", C = "#D3AF37")
+
+celltype_order <- c(
+  "HSC", "CLP", "ProB", "PreB", "Immature-B",
+  "Transitional-B", "Naive-CD5-", "Naive-CD5--"
+)
+
+donor_order <- c("D200", "D201", "D210", "D211", "D213",
+                 "D215", "D202", "D206", "D212", "D214")
+
+```
+
+# 1. SNP summary → parse sample / donor / genotype groups
+
+```{r}
+# ================================================================
+# 1. SNP summary for Spain ATAC-seq (4 batches)
+# ================================================================
+cat("Step 1: Reading SNP summary file...\n")
+
+snp_data <- read_csv(
+  "snp_summary_with_flags_4batches.csv",
+  na = c("", "NA", ".", "NaN"),
+  show_col_types = FALSE
+)
+
+cat("✓ Raw dimensions:", nrow(snp_data), "rows ×", ncol(snp_data), "columns\n")
+
+snp_data_clean <- snp_data %>%
+  dplyr::select(-matches("^X$|^Unnamed")) %>%
+  mutate(across(c(A, C, G, T, N, Total, `ALT%`), as.numeric))
+
+cat("✓ Cleaned dimensions:", nrow(snp_data_clean), "rows\n")
+
+# ------------------------------------------------
+# Parse Sample → sample_number / cell_type / donor
+# ------------------------------------------------
+cat("Step 2: Parsing sample_number, cell_type, and donor...\n")
+
+snp_data_parsed <- snp_data_clean %>%
+  mutate(
+    sample_number = str_extract(Sample, "^[0-9]+"),
+    cell_type = case_when(
+      str_detect(Sample, "Naive-CD5--") ~ "Naive-CD5--",
+      str_detect(Sample, "Naive-CD5-")  ~ "Naive-CD5-",
+      TRUE ~ str_extract(Sample, "(?<=_).*?(?=-ATAC)")
+    ),
+    donor = str_extract(Sample, "(?<=-)D[0-9]+")
+  ) %>%
+  mutate(
+    cell_type = str_replace_all(cell_type, c(
+      "^preB$" = "PreB",
+      "^proB$" = "ProB"
+    ))
+  )
+
+cat("✓ Parsed cell types:\n")
+print(table(snp_data_parsed$cell_type, useNA = "ifany"))
+
+cat("✓ Parsed donors:\n")
+print(table(snp_data_parsed$donor, useNA = "ifany"))
+
+# ------------------------------------------------
+# Add donor from donor_celltype_matching.csv
+# ------------------------------------------------
+cat("Step 3: Reading donor_celltype_matching.csv...\n")
+
+donor_matching <- read.csv(
+  "donor_celltype_matching.csv",
+  stringsAsFactors = FALSE
+) %>%
+  mutate(
+    sample_number = str_extract(Filename, "(?<=_)[0-9]{4}(?=_)")
+  )
+
+cat("✓ Unique donors in matching file:\n")
+print(table(donor_matching$Donor))
+
+cat("Step 4: Joining donor information...\n")
+
+snp_data_matched <- snp_data_parsed %>%
+  left_join(
+    donor_matching %>% dplyr::select(sample_number, Donor),
+    by = "sample_number"
+  ) %>%
+  mutate(donor = if_else(is.na(donor), Donor, donor)) %>%
+  dplyr::select(-Donor)
+
+cat("✓ Join complete. Dimensions:", nrow(snp_data_matched), "rows\n")
+cat("✓ Unique donors in merged table:\n")
+print(table(snp_data_matched$donor))
+
+cat("Step 5: Quality check summary...\n")
+cat("  Total rows:", nrow(snp_data_matched), "\n")
+cat("  Unique donors:", length(unique(snp_data_matched$donor)), "\n")
+cat("  Unique cell types:", length(unique(snp_data_matched$cell_type)), "\n")
+str(snp_data_matched)
+
+```
+
+# 2. Genotype groups + C/T barplots
+
+```{r}
+# ================================================================
+# 2. Genotype groups at rs7090445-ish SNP
+# ================================================================
+ct_only <- snp_data_matched %>%
+  transmute(
+    Sample, donor, cell_type, C, T,
+    group = case_when(
+      T > 0 & C == 0 ~ "TT",
+      T > 0 & C > 0  ~ "TC",
+      C > 0 & T == 0 ~ "CC",
+      TRUE           ~ "NoCov"
+    ),
+    Tfrac = if_else(C + T > 0, T / (C + T), NA_real_)
+  )
+
+# Order samples TT → TC → CC → NoCov by T fraction
+sample_levels <- ct_only %>%
+  arrange(factor(group, levels = c("TT","TC","CC","NoCov")),
+          desc(Tfrac)) %>%
+  pull(Sample)
+
+snp_long <- ct_only %>%
+  dplyr::select(Sample, donor, cell_type, C, T) %>%
+  pivot_longer(cols = c(C, T), names_to = "Base", values_to = "Count") %>%
+  mutate(
+    Sample = factor(Sample, levels = sample_levels),
+    Base   = factor(Base, levels = c("T", "C"))
+  )
+
+ggplot(snp_long, aes(x = Sample, y = Count, fill = Base)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = base_cols) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 12),
+    panel.grid.major.x = element_blank()
+  ) +
+  labs(
+    title = "C vs T Counts per Sample (TT → TC → CC → NoCov)",
+    x = "Sample",
+    y = "Read Count",
+    fill = "Allele"
+  )
+
+# ------------------------------------------------
+# Faceted barplot by donor × cell type (excluding Naive/Transitional)
+# ------------------------------------------------
+cat("Step: Preparing barplots grouped by donor and faceted by cell type...\n")
+
+snp_data_faceted <- snp_data_matched %>%
+  mutate(cell_type = factor(cell_type, levels = celltype_order)) %>%
+  filter(!cell_type %in% c("Transitional-B", "Naive-CD5-", "Naive-CD5--")) %>%
+  left_join(ct_only %>% dplyr::select(Sample, group), by = "Sample") %>%
+  mutate(
+    group = factor(group, levels = c("TT", "TC", "CC", "NoCov")),
+    donor = factor(donor, levels = donor_order)
+  )
+
+cat("✓ Fixed donor order:\n")
+print(levels(snp_data_faceted$donor))
+cat("✓ Cell types retained:\n")
+print(levels(snp_data_faceted$cell_type))
+
+snp_long_faceted <- snp_data_faceted %>%
+  dplyr::select(Sample, donor, cell_type, group, C, T) %>%
+  pivot_longer(cols = c(C, T), names_to = "Base", values_to = "Count")
+
+facet_plot_boxes <- ggplot(snp_long_faceted, aes(x = donor, y = Count, fill = Base)) +
+  geom_bar(stat = "identity", position = "stack") +
+  facet_wrap(~ cell_type, nrow = 1, scales = "free_x") +
+  scale_fill_manual(values = base_cols) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "C vs T Allelic Counts by Donor",
+    subtitle = "Single row of facets with boxed panels",
+    x = "Donor",
+    y = "Read Count",
+    fill = "Allele"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+    strip.text   = element_text(size = 13, face = "bold"),
+    panel.spacing.x = unit(1.5, "lines"),
+    strip.background = element_rect(fill = "#F0F0F0", color = "gray50", size = 0.8),
+    panel.background = element_rect(fill = "#FFFFFF", color = "gray50", size = 1.2)
+  )
+
+facet_plot_boxes
+
+```
+
+# 3. TOBIAS data dictionary join
+
+```{r}
+# ================================================================
+# 3. Build TOBIAS-compatible data dictionary (ct_joined)
+# ================================================================
+tobias_dict <- read_csv("tobias_data_dictionary.csv", show_col_types = FALSE)
+
+tobias_dict_clean <- tobias_dict %>%
+  mutate(
+    m = str_match(sample, "_19_(\\d{4})_([A-Za-z0-9-]+-ATAC(?:-D\\d{3})?)"),
+    id_num  = m[, 2],
+    id_desc = m[, 3],
+    clean_sample = case_when(
+      str_detect(sample, "^\\d{4}_[A-Za-z0-9-]+-ATAC(?:-D\\d{3})?_REP1$") ~ sample,
+      !is.na(id_num) & !is.na(id_desc) ~ paste0(id_num, "_", id_desc, "_REP1"),
+      TRUE ~ sample
+    )
+  ) %>%
+  dplyr::select(-m, -id_num, -id_desc)
+
+# Join SNP-level genotypes with TOBIAS paths
+ct_joined <- ct_only %>%
+  mutate(Sample_clean = str_replace(Sample, "-D\\d{3}", "")) %>%
+  left_join(
+    tobias_dict_clean %>%
+      mutate(clean_sample = str_replace(clean_sample, "-D\\d{3}", "")),
+    by = c("Sample_clean" = "clean_sample")
+  )
+
+ct_joined %>%
+  summarise(
+    total     = n(),
+    matched   = sum(!is.na(bam_path)),
+    unmatched = sum(is.na(bam_path))
+  )
+
+ct_joined %>%
+  filter(is.na(bam_path)) %>%
+  dplyr::select(Sample) %>%
+  arrange(Sample)
+
+ct_joined %>%
+  dplyr::select(Sample, Sample_clean, sample, bam_path, broadPeak_path) %>%
+  head()
+
+ct_joined %>%
+  dplyr::select(-Sample_clean, -sample) %>%
+  write_csv("data_dict_ct_joined_final.csv")
+
+```
+
+# 4. consensus_featureCounts: load & annotate once
+
+```{r}
+# ================================================================
+# 4. consensus_featureCounts: clean sample names & annotation
+# ================================================================
+# NOTE: Heavy renaming step from raw txt → cleaned .rds:
+# kept here as COMMENT only; main code just loads the RDS.
+#
+# Run ONCE if you ever need to regenerate the cleaned file:
+#
+# fc_raw <- read.delim(
+#   "consensus_featureCounts.txt",
+#   comment.char = "#", check.names = FALSE,
+#   sep = "\t", quote = ""
+# )
+# ... [your extract_clean_from_bam + rename_key machinery here] ...
+# write_tsv(fc, "consensus_featureCounts.cleaned.tsv")
+# saveRDS(fc, "consensus_featureCounts.cleaned.rds")
+
+fc <- readRDS("consensus_featureCounts.cleaned.rds")
+ct_joined <- readr::read_csv("data_dict_ct_joined_final.csv", show_col_types = FALSE)
+
+# ---- split anno vs counts (once) --------------------------------
+anno_raw_all <- fc[, 1:6]
+counts_all   <- as.matrix(fc[, -(1:6)])
+rownames(counts_all) <- anno_raw_all$Geneid
+storage.mode(counts_all) <- "integer"
+
+# ---- build GRanges & keep canonical autosomes/sex Chr (drop chrM) ----------
+gr_all <- GRanges(
+  seqnames = anno_raw_all$Chr,
+  ranges   = IRanges::IRanges(start = anno_raw_all$Start, end = anno_raw_all$End),
+  strand   = ifelse(anno_raw_all$Strand %in% c("+","-"), anno_raw_all$Strand, "*")
+)
+names(gr_all) <- anno_raw_all$Geneid
+seqlevelsStyle(gr_all) <- "UCSC"
+
+gr_all <- keepStandardChromosomes(gr_all, pruning.mode = "coarse")
+gr_all <- keepSeqlevels(gr_all,
+                        setdiff(seqlevels(gr_all), "chrM"),
+                        pruning.mode = "coarse")
+gr_all <- keepSeqlevels(gr_all, seqlevelsInUse(gr_all), pruning.mode = "coarse")
+
+valid_ids <- names(gr_all)
+
+# canonical-only counts & annotation
+counts <- counts_all[intersect(rownames(counts_all), valid_ids), , drop = FALSE]
+anno   <- anno_raw_all[match(rownames(counts), anno_raw_all$Geneid), , drop = FALSE]
+
+# ---- ChIPseeker annotation (±1 kb TSS) -------------------------
+txdb <- TxDb.Hsapiens.UCSC.hg38.knownGene
+
+peakAnno <- ChIPseeker::annotatePeak(
+  gr_all[names(gr_all) %in% rownames(counts)],
+  TxDb      = txdb,
+  tssRegion = c(-1000, 1000),
+  annoDb    = "org.Hs.eg.db",
+  level     = "gene"
+)
+
+# map annotation back to peak IDs
+anno_df0 <- as.data.frame(peakAnno) %>%
+  mutate(coord_key = paste0(seqnames, ":", start, "-", end))
+
+bed_key <- anno %>%
+  transmute(
+    peak_id  = Geneid,
+    Chr, Start, End, Strand, Length,
+    coord_key = paste0("chr", Chr, ":", Start, "-", End)
+  )
+
+# anno_df <- anno_df0 %>%
+#   left_join(bed_key, by = "coord_key")
+# 
+# # collapsed gene annotation (closest to TSS; WITHOUT ENSEMBL)
+# gene_anno_min <- anno_df %>%
+#   filter(!is.na(peak_id)) %>%
+#   group_by(peak_id) %>%
+#   slice_min(order_by = abs(distanceToTSS), n = 1, with_ties = FALSE) %>%
+#   ungroup() %>%
+#   transmute(
+#     peak_id,
+#     SYMBOL = na_if(SYMBOL, ""),
+#     annotation,
+#     distanceToTSS
+#   )
+# 
+# # extended annotation WITH ENSEMBL (for coding-only volcano)
+# gene_anno_min_ext <- anno_df %>%
+#   filter(!is.na(peak_id)) %>%
+#   group_by(peak_id) %>%
+#   slice_min(order_by = abs(distanceToTSS), n = 1, with_ties = FALSE) %>%
+#   ungroup() %>%
+#   transmute(
+#     peak_id,
+#     SYMBOL  = na_if(SYMBOL, ""),
+#     ENSEMBL = na_if(ENSEMBL, ""),
+#     annotation,
+#     distanceToTSS
+#   )
+# 
+# # global promoter / enhancer sets
+# promoter_ids <- gene_anno_min %>%
+#   mutate(base_cat = sub(" \\(.*\\)$", "", annotation)) %>%
+#   filter(base_cat == "Promoter") %>%
+#   pull(peak_id) %>%
+#   unique()
+# 
+# enhancer_ids <- gene_anno_min %>%
+#   mutate(base_cat = sub(" \\(.*\\)$", "", annotation)) %>%
+#   filter(!base_cat %in% c("Promoter", "5' UTR", "3' UTR", "Exon", "Intron")) %>%
+#   pull(peak_id) %>%
+#   unique()
+
+# saveRDS(
+#   list(
+#     anno_df          = anno_df,
+#     gene_anno_min    = gene_anno_min,
+#     gene_anno_min_ext = gene_anno_min_ext,
+#     promoter_ids     = promoter_ids,
+#     enhancer_ids     = enhancer_ids
+#   ),
+#   file = "peak_annotations.hg38.tss1kb.rds",
+#   compress = "xz"
+# )
+
+
+annot <- readRDS("peak_annotations.hg38.tss1kb.rds")
+
+anno_df           <- annot$anno_df
+gene_anno_min     <- annot$gene_anno_min
+gene_anno_min_ext <- annot$gene_anno_min_ext
+promoter_ids      <- annot$promoter_ids
+enhancer_ids      <- annot$enhancer_ids
+
+
+
+
+
+```
+
+
+# 5. PCA: all peaks / promoters / enhancers / ProB
+
+All PCA chunks now use the same counts (canonical) and ct_joined.
+
+## 5.1 PCA – all cell types (excluding Naive/Transitional)
+
+
+```{r}
+# ================================================================
+# 5.1 PCA of consensus peaks (all canonical; exclude Naive/Transitional)
+# ================================================================
+meta_all <- ct_joined %>%
+  dplyr::select(Sample, donor, cell_type, group) %>%
+  dplyr::rename(genotype = group) %>%
+  filter(!cell_type %in% c("Transitional-B", "Naive-CD5-", "Naive-CD5--")) %>%
+  mutate(
+    genotype = factor(genotype, levels = c("TT", "TC", "CC")),
+    Sample   = as.character(Sample)
+  ) %>%
+  distinct(Sample, .keep_all = TRUE)
+
+samples_in_counts <- intersect(colnames(counts), meta_all$Sample)
+
+meta_sub_all <- meta_all %>%
+  filter(Sample %in% samples_in_counts) %>%
+  arrange(match(Sample, colnames(counts)))
+counts_sub_all <- counts[, meta_sub_all$Sample, drop = FALSE]
+
+keep_all <- rowSums(counts_sub_all >= 10) >= 5
+counts_filt_all <- counts_sub_all[keep_all, , drop = FALSE]
+
+if (nrow(counts_filt_all) > 50000) {
+  v <- matrixStats::rowVars(counts_filt_all)
+  o <- order(v, decreasing = TRUE)[seq_len(50000)]
+  counts_filt_all <- counts_filt_all[o, , drop = FALSE]
+}
+
+dds_all <- DESeqDataSetFromMatrix(
+  countData = counts_filt_all,
+  colData   = as.data.frame(meta_sub_all),
+  design    = ~ 1
+)
+dds_all <- estimateSizeFactors(dds_all)
+vsd_all <- vst(dds_all, blind = TRUE)
+mat_all <- assay(vsd_all)
+
+pca_all <- prcomp(t(mat_all), center = TRUE)
+var_expl_all <- (pca_all$sdev^2) / sum(pca_all$sdev^2) * 100
+
+pca_df_all <- data.frame(
+  Sample    = meta_sub_all$Sample,
+  genotype  = meta_sub_all$genotype,
+  donor     = meta_sub_all$donor,
+  cell_type = meta_sub_all$cell_type,
+  PC1 = pca_all$x[, 1],
+  PC2 = pca_all$x[, 2]
+)
+
+ggplot(pca_df_all, aes(x = PC1, y = PC2, color = genotype, shape = cell_type)) +
+  geom_point(size = 3, alpha = 0.9) +
+  scale_color_manual(values = geno_cols) +
+  labs(
+    title = "PCA of ATAC-seq consensus peaks (canonical only)",
+    subtitle = "Excluding Transitional-B and Naive subsets",
+    x = paste0("PC1 (", round(var_expl_all[1], 1), "%)"),
+    y = paste0("PC2 (", round(var_expl_all[2], 1), "%)")
+  ) +
+  theme_bw(base_size = 14) +
+  theme(plot.title = element_text(face = "bold"))
+
+```
+
+
+## 5.2 PCA – promoters only
+
+```{r}
+# ================================================================
+# 5.2 PCA – promoter peaks only (all cell types)
+# ================================================================
+counts_prom <- counts[rownames(counts) %in% promoter_ids, , drop = FALSE]
+
+samples_in_counts <- intersect(colnames(counts_prom), meta_all$Sample)
+
+meta_sub_prom <- meta_all %>%
+  filter(Sample %in% samples_in_counts) %>%
+  arrange(match(Sample, colnames(counts_prom)))
+counts_sub_prom <- counts_prom[, meta_sub_prom$Sample, drop = FALSE]
+
+keep_prom <- rowSums(counts_sub_prom >= 10) >= 5
+counts_filt_prom <- counts_sub_prom[keep_prom, , drop = FALSE]
+
+dds_prom <- DESeq2::DESeqDataSetFromMatrix(
+  countData = counts_filt_prom,
+  colData   = as.data.frame(meta_sub_prom),
+  design    = ~ 1
+)
+dds_prom <- estimateSizeFactors(dds_prom)
+vsd_prom <- vst(dds_prom, blind = TRUE)
+mat_prom <- assay(vsd_prom)
+
+pca_prom <- prcomp(t(mat_prom), center = TRUE)
+var_expl_prom <- (pca_prom$sdev^2) / sum(pca_prom$sdev^2) * 100
+
+pca_df_prom <- data.frame(
+  Sample    = meta_sub_prom$Sample,
+  genotype  = meta_sub_prom$genotype,
+  donor     = meta_sub_prom$donor,
+  cell_type = meta_sub_prom$cell_type,
+  PC1 = pca_prom$x[, 1],
+  PC2 = pca_prom$x[, 2]
+)
+
+ggplot(pca_df_prom, aes(x = PC1, y = PC2, color = genotype, shape = cell_type)) +
+  geom_point(size = 3, alpha = 0.9) +
+  scale_color_manual(values = geno_cols) +
+  labs(
+    title = "PCA of Promoter Peaks (ATAC-seq)",
+    subtitle = "Excluding Transitional-B and Naive subsets",
+    x = paste0("PC1 (", round(var_expl_prom[1], 1), "%)"),
+    y = paste0("PC2 (", round(var_expl_prom[2], 1), "%)")
+  ) +
+  theme_bw(base_size = 14) +
+  theme(plot.title = element_text(face = "bold"))
+
+```
+
+
+## 5.3 PCA – enhancers only
+
+```{r}
+# ================================================================
+# 5.3 PCA – enhancer-like peaks only (all cell types)
+# ================================================================
+counts_enh <- counts[rownames(counts) %in% enhancer_ids, , drop = FALSE]
+
+samples_in_counts <- intersect(colnames(counts_enh), meta_all$Sample)
+
+meta_sub_enh <- meta_all %>%
+  filter(Sample %in% samples_in_counts) %>%
+  arrange(match(Sample, colnames(counts_enh)))
+counts_sub_enh <- counts_enh[, meta_sub_enh$Sample, drop = FALSE]
+
+keep_enh <- rowSums(counts_sub_enh >= 10) >= 5
+counts_filt_enh <- counts_sub_enh[keep_enh, , drop = FALSE]
+
+dds_enh <- DESeq2::DESeqDataSetFromMatrix(
+  countData = counts_filt_enh,
+  colData   = as.data.frame(meta_sub_enh),
+  design    = ~ 1
+)
+dds_enh <- estimateSizeFactors(dds_enh)
+vsd_enh <- vst(dds_enh, blind = TRUE)
+mat_enh <- assay(vsd_enh)
+
+pca_enh <- prcomp(t(mat_enh), center = TRUE)
+var_expl_enh <- (pca_enh$sdev^2) / sum(pca_enh$sdev^2) * 100
+
+pca_df_enh <- data.frame(
+  Sample    = meta_sub_enh$Sample,
+  genotype  = meta_sub_enh$genotype,
+  donor     = meta_sub_enh$donor,
+  cell_type = meta_sub_enh$cell_type,
+  PC1 = pca_enh$x[, 1],
+  PC2 = pca_enh$x[, 2]
+)
+
+ggplot(pca_df_enh, aes(x = PC1, y = PC2, color = genotype, shape = cell_type)) +
+  geom_point(size = 3, alpha = 0.9) +
+  scale_color_manual(values = geno_cols) +
+  labs(
+    title = "PCA of Enhancer Peaks (ATAC-seq)",
+    subtitle = "Excluding Transitional-B and Naive subsets",
+    x = paste0("PC1 (", round(var_expl_enh[1], 1), "%)"),
+    y = paste0("PC2 (", round(var_expl_enh[2], 1), "%)")
+  ) +
+  theme_bw(base_size = 14) +
+  theme(plot.title = element_text(face = "bold"))
+
+```
+
+## 5.4–5.6 PCA – ProB only (all peaks / promoters / enhancers)
+
+These are the ProB-only variants; they reuse the same pattern but with ProB-only metadata and slightly looser peak filter (>=3 samples).
+
+
+```{r}
+# ================================================================
+# 5.4 PCA – ProB only, all canonical peaks
+# ================================================================
+meta_prob <- ct_joined %>%
+  dplyr::select(Sample, donor, cell_type, group) %>%
+  dplyr::rename(genotype = group) %>%
+  filter(cell_type == "ProB") %>%
+  mutate(
+    genotype = factor(genotype, levels = c("TT", "TC", "CC")),
+    Sample   = as.character(Sample)
+  ) %>%
+  distinct(Sample, .keep_all = TRUE)
+
+samples_in_counts <- intersect(colnames(counts), meta_prob$Sample)
+
+meta_sub_prob <- meta_prob %>%
+  filter(Sample %in% samples_in_counts) %>%
+  arrange(match(Sample, colnames(counts)))
+counts_sub_prob <- counts[, meta_sub_prob$Sample, drop = FALSE]
+
+keep_prob <- rowSums(counts_sub_prob >= 10) >= 3
+counts_filt_prob <- counts_sub_prob[keep_prob, , drop = FALSE]
+
+if (nrow(counts_filt_prob) > 50000) {
+  v <- matrixStats::rowVars(counts_filt_prob)
+  o <- order(v, decreasing = TRUE)[seq_len(50000)]
+  counts_filt_prob <- counts_filt_prob[o, , drop = FALSE]
+}
+
+dds_prob <- DESeqDataSetFromMatrix(
+  countData = counts_filt_prob,
+  colData   = as.data.frame(meta_sub_prob),
+  design    = ~ 1
+)
+dds_prob <- estimateSizeFactors(dds_prob)
+vsd_prob <- vst(dds_prob, blind = TRUE)
+mat_prob <- assay(vsd_prob)
+
+pca_prob <- prcomp(t(mat_prob), center = TRUE)
+var_expl_prob <- (pca_prob$sdev^2) / sum(pca_prob$sdev^2) * 100
+
+pca_df_prob <- data.frame(
+  Sample    = meta_sub_prob$Sample,
+  genotype  = meta_sub_prob$genotype,
+  donor     = meta_sub_prob$donor,
+  PC1 = pca_prob$x[, 1],
+  PC2 = pca_prob$x[, 2]
+)
+
+ggplot(pca_df_prob, aes(x = PC1, y = PC2, color = genotype, label = donor)) +
+  geom_point(size = 4, alpha = 0.9) +
+  geom_text(vjust = -1.1, size = 3) +
+  scale_color_manual(values = geno_cols) +
+  labs(
+    title = "PCA of ATAC-seq peaks (ProB only)",
+    subtitle = "VST-transformed counts; canonical peaks",
+    x = paste0("PC1 (", round(var_expl_prob[1], 1), "%)"),
+    y = paste0("PC2 (", round(var_expl_prob[2], 1), "%)")
+  ) +
+  theme_bw(base_size = 14) +
+  theme(plot.title = element_text(face = "bold"))
+
+```
+
+## 5.5 Promoter-only ProB PCA:
+
+```{r}
+# ================================================================
+# 5.5 PCA – ProB only, promoter peaks
+# ================================================================
+counts_prom_prob <- counts[rownames(counts) %in% promoter_ids, , drop = FALSE]
+
+samples_in_counts <- intersect(colnames(counts_prom_prob), meta_prob$Sample)
+
+meta_sub_prom_prob <- meta_prob %>%
+  filter(Sample %in% samples_in_counts) %>%
+  arrange(match(Sample, colnames(counts_prom_prob)))
+counts_sub_prom_prob <- counts_prom_prob[, meta_sub_prom_prob$Sample, drop = FALSE]
+
+keep_prom_prob <- rowSums(counts_sub_prom_prob >= 10) >= 3
+counts_filt_prom_prob <- counts_sub_prom_prob[keep_prom_prob, , drop = FALSE]
+
+dds_prom_prob <- DESeq2::DESeqDataSetFromMatrix(
+  countData = counts_filt_prom_prob,
+  colData   = as.data.frame(meta_sub_prom_prob),
+  design    = ~ 1
+)
+dds_prom_prob <- DESeq2::estimateSizeFactors(dds_prom_prob)
+vsd_prom_prob <- DESeq2::vst(dds_prom_prob, blind = TRUE)
+mat_prom_prob <- assay(vsd_prom_prob)
+
+pca_prom_prob <- prcomp(t(mat_prom_prob), center = TRUE)
+var_expl_prom_prob <- (pca_prom_prob$sdev^2) / sum(pca_prom_prob$sdev^2) * 100
+
+pca_df_prom_prob <- data.frame(
+  Sample    = meta_sub_prom_prob$Sample,
+  genotype  = meta_sub_prom_prob$genotype,
+  donor     = meta_sub_prom_prob$donor,
+  PC1 = pca_prom_prob$x[, 1],
+  PC2 = pca_prom_prob$x[, 2]
+)
+
+ggplot2::ggplot(pca_df_prom_prob, aes(x = PC1, y = PC2, color = genotype, label = donor)) +
+  geom_point(size = 4, alpha = 0.9) +
+  geom_text(vjust = -1.1, size = 3) +
+  scale_color_manual(values = geno_cols) +
+  labs(
+    title = "PCA of Promoter Peaks (ProB only)",
+    subtitle = "VST-transformed canonical promoter peaks",
+    x = paste0("PC1 (", round(var_expl_prom_prob[1], 1), "%)"),
+    y = paste0("PC2 (", round(var_expl_prom_prob[2], 1), "%)")
+  ) +
+  theme_bw(base_size = 14) +
+  theme(plot.title = element_text(face = "bold"))
+
+```
+
+
+## 5.6 PCA – ProB only, enhancer peaks
+
+
+```{r}
+# ================================================================
+# 5.6 PCA – ProB only, enhancer peaks
+# ================================================================
+counts_enh_prob <- counts[rownames(counts) %in% enhancer_ids, , drop = FALSE]
+
+samples_in_counts <- intersect(colnames(counts_enh_prob), meta_prob$Sample)
+
+meta_sub_enh_prob <- meta_prob %>%
+  filter(Sample %in% samples_in_counts) %>%
+  arrange(match(Sample, colnames(counts_enh_prob)))
+counts_sub_enh_prob <- counts_enh_prob[, meta_sub_enh_prob$Sample, drop = FALSE]
+
+keep_enh_prob <- rowSums(counts_sub_enh_prob >= 10) >= 3
+counts_filt_enh_prob <- counts_sub_enh_prob[keep_enh_prob, , drop = FALSE]
+
+dds_enh_prob <- DESeq2::DESeqDataSetFromMatrix(
+  countData = counts_filt_enh_prob,
+  colData   = as.data.frame(meta_sub_enh_prob),
+  design    = ~ 1
+)
+dds_enh_prob <- DESeq2::estimateSizeFactors(dds_enh_prob)
+vsd_enh_prob <- DESeq2::vst(dds_enh_prob, blind = TRUE)
+mat_enh_prob <- assay(vsd_enh_prob)
+
+pca_enh_prob <- prcomp(t(mat_enh_prob), center = TRUE)
+var_expl_enh_prob <- (pca_enh_prob$sdev^2) / sum(pca_enh_prob$sdev^2) * 100
+
+pca_df_enh_prob <- data.frame(
+  Sample    = meta_sub_enh_prob$Sample,
+  genotype  = meta_sub_enh_prob$genotype,
+  donor     = meta_sub_enh_prob$donor,
+  PC1 = pca_enh_prob$x[, 1],
+  PC2 = pca_enh_prob$x[, 2]
+)
+
+ggplot2::ggplot(pca_df_enh_prob, aes(x = PC1, y = PC2, color = genotype, label = donor)) +
+  geom_point(size = 4, alpha = 0.9) +
+  geom_text(vjust = -1.1, size = 3) +
+  scale_color_manual(values = geno_cols) +
+  labs(
+    title = "PCA of Enhancer Peaks (ProB only)",
+    subtitle = "VST-transformed canonical enhancer peaks",
+    x = paste0("PC1 (", round(var_expl_enh_prob[1], 1), "%)"),
+    y = paste0("PC2 (", round(var_expl_enh_prob[2], 1), "%)")
+  ) +
+  theme_bw(base_size = 14) +
+  theme(plot.title = element_text(face = "bold"))
+
+```
+
+# 6. Differential accessibility – ProB TT vs CC
+
+```{r}
+# ================================================================
+# 6. Differential accessibility – ProB TT vs CC
+# ================================================================
+# Metadata: ProB only, TT vs CC, CC baseline
+meta_proB <- ct_joined %>%
+  transmute(
+    Sample    = as.character(Sample),
+    donor     = factor(donor),
+    cell_type = tolower(cell_type),
+    genotype  = factor(group, levels = c("CC","TT","TC"))
+  ) %>%
+  filter(cell_type == "prob", genotype %in% c("CC","TT")) %>%
+  distinct(Sample, .keep_all = TRUE) %>%
+  droplevels()
+
+keep_samples <- intersect(colnames(counts), meta_proB$Sample)
+stopifnot(length(keep_samples) >= 4)
+
+meta_proB <- meta_proB[match(keep_samples, meta_proB$Sample), , drop = FALSE]
+cts       <- counts[, keep_samples, drop = FALSE]
+
+## ------------------------------------------------
+## Presence-based filter (your rule)
+## ------------------------------------------------
+n_samp <- ncol(cts)
+
+if (n_samp == 2L) {
+  min_present <- 2L              # present in both samples
+} else if (n_samp == 3L) {
+  min_present <- 2L              # present in ≥2 of 3 samples
+} else {
+  # General rule: present in at least ~2/3 of samples
+  min_present <- ceiling(2 * n_samp / 3)
+}
+
+keep_rows <- rowSums(cts > 0) >= min_present
+cts       <- cts[keep_rows, , drop = FALSE]
+
+## ------------------------------------------------
+## DESeq2 model
+## ------------------------------------------------
+design_try <- model.matrix(~ donor + genotype, data = meta_proB)
+
+design_formula <- ~ donor + genotype
+if (qr(design_try)$rank < ncol(design_try)) {
+  message("Design not full rank; using ~ genotype.")
+  design_formula <- ~ genotype
+}
+
+dds <- DESeq2::DESeqDataSetFromMatrix(
+  countData = cts,
+  colData   = as.data.frame(meta_proB),
+  design    = design_formula
+)
+dds <- DESeq2::DESeq(dds, test = "Wald", fitType = "parametric")
+
+coef_name <- "genotype_TT_vs_CC"
+if (coef_name %in% DESeq2::resultsNames(dds)) {
+  res <- DESeq2::lfcShrink(dds, coef = coef_name, type = "apeglm")
+} else {
+  res <- DESeq2::lfcShrink(dds, contrast = c("genotype","TT","CC"), type = "apeglm")
+}
+
+res_df <- as.data.frame(res)
+res_df$peak_id <- rownames(res_df)
+
+res_df <- res_df %>%
+  left_join(
+    anno %>% transmute(peak_id = Geneid, Chr, Start, End, Strand, Length),
+    by = "peak_id"
+  ) %>%
+  left_join(gene_anno_min, by = "peak_id")
+
+alpha_thr <- 0.05
+lfc_thr   <- 1
+
+volcano.data <- res_df %>%
+  transmute(
+    PeakID        = peak_id,
+    GeneSymbol    = coalesce(SYMBOL, peak_id),
+    TT_CC_change  = log2FoldChange,
+    TT_CC_pvalue  = if_else(is.na(padj), NA_real_, pmax(padj, .Machine$double.xmin)),
+    GeneType      = case_when(
+      !is.na(padj) & padj <= alpha_thr & log2FoldChange >=  lfc_thr ~ "up",
+      !is.na(padj) & padj <= alpha_thr & log2FoldChange <= -lfc_thr ~ "down",
+      TRUE ~ "ns"
+    )
+  ) %>%
+  filter(!is.na(TT_CC_change), !is.na(TT_CC_pvalue))
+
+top_hits_sig <- volcano.data %>%
+  filter(GeneType != "ns") %>%
+  arrange(TT_CC_pvalue) %>%
+  mutate(GeneSymbol = ifelse(is.na(GeneSymbol) | GeneSymbol == "", PeakID, GeneSymbol)) %>%
+  distinct(GeneSymbol, .keep_all = TRUE) %>%
+  dplyr::slice(1:20)
+
+top_hits <- if (nrow(top_hits_sig) >= 1) {
+  top_hits_sig
+} else {
+  volcano.data %>%
+    arrange(TT_CC_pvalue) %>%
+    mutate(GeneSymbol = ifelse(is.na(GeneSymbol) | GeneSymbol == "", PeakID, GeneSymbol)) %>%
+    distinct(GeneSymbol, .keep_all = TRUE) %>%
+    dplyr::slice(1:10)
+}
+
+sizes  <- c("up" = 2, "down" = 2, "ns" = 1)
+alphas <- c("up" = 1, "down" = 1, "ns" = 0.5)
+
+x_max <- max(abs(volcano.data$TT_CC_change), na.rm = TRUE)
+y_max <- max(-log10(volcano.data$TT_CC_pvalue), na.rm = TRUE) + 2
+
+ggplot(
+  volcano.data,
+  ggplot2::aes(x = TT_CC_change, y = -log10(TT_CC_pvalue),
+               fill = GeneType, size = GeneType, alpha = GeneType)
+) +
+  geom_point(shape = 21, colour = "black") +
+  geom_hline(yintercept = -log10(alpha_thr), linetype = "dashed", colour = "darkgrey") +
+  geom_vline(xintercept = c(-lfc_thr, lfc_thr), linetype = "dashed", colour = "darkgrey") +
+  ggrepel::geom_text_repel(
+    data = top_hits,
+    aes(label = GeneSymbol, color = GeneType),
+    size = 3, max.overlaps = Inf, seed = 17
+  ) +
+  scale_fill_manual(
+    values = c("up" = "#D55E00", "down" = "#0072B2", "ns" = "grey80"),
+    labels = c("up" = "Higher in TT clones",
+               "down" = "Higher in CC clones",
+               "ns" = "Not significant")
+  ) +
+  scale_color_manual(values = c("up" = "#D55E00", "down" = "#0072B2", "ns" = "grey50")) +
+  scale_size_manual(values = sizes) +
+  scale_alpha_manual(values = alphas) +
+  guides(fill = guide_legend(title = "Differential accessibility"),
+         size = "none", alpha = "none", color = "none") +
+  coord_cartesian(xlim = c(-x_max, x_max), ylim = c(0, y_max), clip = "off") +
+  theme(plot.margin = margin(20, 70, 20, 20)) +
+  theme_minimal(base_size = 18) +
+  theme(
+    plot.title   = element_text(size = 22, face = "bold"),
+    axis.title   = element_text(size = 20, face = "bold"),
+    axis.text    = element_text(size = 16),
+    legend.title = element_text(size = 18, face = "bold"),
+    legend.text  = element_text(size = 16)
+  ) +
+  labs(
+    title = "Volcano: ProB — TT vs CC (all canonical peaks)",
+    x = "log2 fold-change (TT − CC)",
+    y = "-log10(FDR)"
+  )
+
+```
+
+## 6.1 Promoter-only subset (ProB TT vs CC) → Volcano
+
+```{r}
+# ================================================================
+# 6.1 Promoter-only subset (ProB TT vs CC) → Volcano
+# ================================================================
+res_prom <- res_df %>%
+  filter(peak_id %in% promoter_ids)
+
+alpha_thr_prom <- 0.05
+lfc_thr_prom   <- 1
+
+volcano_prom.data <- res_prom %>%
+  transmute(
+    PeakID        = peak_id,
+    GeneSymbol    = coalesce(SYMBOL, peak_id),
+    TT_CC_change  = log2FoldChange,
+    TT_CC_pvalue  = if_else(is.na(padj), NA_real_, pmax(padj, .Machine$double.xmin)),
+    GeneType      = case_when(
+      !is.na(padj) & padj <= alpha_thr_prom & log2FoldChange >=  lfc_thr_prom ~ "up",
+      !is.na(padj) & padj <= alpha_thr_prom & log2FoldChange <= -lfc_thr_prom ~ "down",
+      TRUE ~ "ns"
+    )
+  ) %>%
+  filter(!is.na(TT_CC_change), !is.na(TT_CC_pvalue))
+
+top_hits_prom_sig <- volcano_prom.data %>%
+  filter(GeneType != "ns") %>%
+  arrange(TT_CC_pvalue) %>%
+  mutate(GeneSymbol = ifelse(is.na(GeneSymbol) | GeneSymbol == "", PeakID, GeneSymbol)) %>%
+  distinct(GeneSymbol, .keep_all = TRUE) %>%
+  dplyr::slice(1:20)
+
+top_hits_prom <- if (nrow(top_hits_prom_sig) >= 1) {
+  top_hits_prom_sig
+} else {
+  volcano_prom.data %>%
+    arrange(TT_CC_pvalue) %>%
+    mutate(GeneSymbol = ifelse(is.na(GeneSymbol) | GeneSymbol == "", PeakID, GeneSymbol)) %>%
+    distinct(GeneSymbol, .keep_all = TRUE) %>%
+    dplyr::slice(1:10)
+}
+
+sizes_prom  <- c("up" = 2, "down" = 2, "ns" = 1)
+alphas_prom <- c("up" = 1, "down" = 1, "ns" = 0.5)
+x_max_prom  <- max(abs(volcano_prom.data$TT_CC_change), na.rm = TRUE)
+y_max_prom  <- max(-log10(volcano_prom.data$TT_CC_pvalue), na.rm = TRUE) + 2
+
+ggplot2::ggplot(
+  volcano_prom.data,
+  aes(x = TT_CC_change, y = -log10(TT_CC_pvalue),
+      fill = GeneType, size = GeneType, alpha = GeneType)
+) +
+  geom_point(shape = 21, colour = "black") +
+  geom_hline(yintercept = -log10(alpha_thr_prom), linetype = "dashed", colour = "darkgrey") +
+  geom_vline(xintercept = c(-lfc_thr_prom, lfc_thr_prom), linetype = "dashed", colour = "darkgrey") +
+  ggrepel::geom_text_repel(
+    data = top_hits_prom,
+    aes(label = GeneSymbol, color = GeneType),
+    size = 3, max.overlaps = Inf, seed = 17
+  ) +
+  scale_fill_manual(values = c("up" = "#D55E00", "down" = "#0072B2", "ns" = "grey80"),
+                    labels = c("up" = "Higher in TT clones",
+                               "down" = "Higher in CC clones",
+                               "ns" = "Not significant")) +
+  scale_color_manual(values = c("up" = "#D55E00", "down" = "#0072B2", "ns" = "grey50")) +
+  scale_size_manual(values = sizes_prom) +
+  scale_alpha_manual(values = alphas_prom) +
+  guides(fill = guide_legend(title = "Differential accessibility"),
+         size = "none", alpha = "none", color = "none") +
+  xlim(-x_max_prom, x_max_prom) +
+  ylim(0, y_max_prom) +
+  theme_minimal(base_size = 18) +
+  theme(
+    plot.title   = element_text(size = 22, face = "bold"),
+    axis.title   = element_text(size = 20, face = "bold"),
+    axis.text    = element_text(size = 16),
+    legend.title = element_text(size = 18, face = "bold"),
+    legend.text  = element_text(size = 16)
+  ) +
+  labs(
+    title = "Volcano: ProB — TT vs CC (Promoter peaks only)",
+    x = "log2 fold-change (TT − CC)",
+    y = "-log10(FDR)"
+  )
+
+```
+
+## 6.2 Protein-coding genes only → Volcano
+
+```{r}
+# ================================================================
+# 6.2 Protein-coding genes only → Volcano
+# ================================================================
+coding_ensembl_ids <- local({
+  ids <- unique(stats::na.omit(gene_anno_min_ext$ENSEMBL))
+  if (length(ids) == 0) return(character(0))
+
+  if (requireNamespace("EnsDb.Hsapiens.v86", quietly = TRUE) &&
+      requireNamespace("ensembldb", quietly = TRUE)) {
+    edb <- EnsDb.Hsapiens.v86::EnsDb.Hsapiens.v86
+    bt <- ensembldb::select(
+      edb,
+      keys     = ids,
+      keytype  = "GENEID",
+      columns  = c("GENEID","GENEBIOTYPE")
+    )
+    unique(bt$GENEID[bt$GENEBIOTYPE == "protein_coding"])
+  } else if (requireNamespace("biomaRt", quietly = TRUE)) {
+    mart <- biomaRt::useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl")
+    bt   <- biomaRt::getBM(
+      attributes = c("ensembl_gene_id", "gene_biotype"),
+      filters    = "ensembl_gene_id",
+      values     = ids,
+      mart       = mart
+    )
+    unique(bt$ensembl_gene_id[bt$gene_biotype == "protein_coding"])
+  } else {
+    warning("No gene-biotype source available. Install EnsDb.Hsapiens.v86/ensembldb or enable biomaRt.")
+    character(0)
+  }
+})
+
+coding_peak_ids <- gene_anno_min_ext %>%
+  filter(!is.na(ENSEMBL), ENSEMBL %in% coding_ensembl_ids) %>%
+  pull(peak_id) %>%
+  unique()
+
+res_pc <- res_df %>%
+  filter(peak_id %in% coding_peak_ids)
+
+alpha_thr_pc <- 0.05
+lfc_thr_pc   <- 1
+
+volcano_pc.data <- res_pc %>%
+  transmute(
+    PeakID        = peak_id,
+    GeneSymbol    = coalesce(SYMBOL, peak_id),
+    TT_CC_change  = log2FoldChange,
+    TT_CC_pvalue  = if_else(is.na(padj), NA_real_, pmax(padj, .Machine$double.xmin)),
+    GeneType      = case_when(
+      !is.na(padj) & padj <= alpha_thr_pc & log2FoldChange >=  lfc_thr_pc ~ "up",
+      !is.na(padj) & padj <= alpha_thr_pc & log2FoldChange <= -lfc_thr_pc ~ "down",
+      TRUE ~ "ns"
+    )
+  ) %>%
+  filter(!is.na(TT_CC_change), !is.na(TT_CC_pvalue))
+
+top_hits_pc_sig <- volcano_pc.data %>%
+  filter(GeneType != "ns") %>%
+  arrange(TT_CC_pvalue) %>%
+  mutate(GeneSymbol = ifelse(is.na(GeneSymbol) | GeneSymbol == "", PeakID, GeneSymbol)) %>%
+  distinct(GeneSymbol, .keep_all = TRUE) %>%
+  dplyr::slice(1:20)
+
+top_hits_pc <- if (nrow(top_hits_pc_sig) >= 1) {
+  top_hits_pc_sig
+} else {
+  volcano_pc.data %>%
+    arrange(TT_CC_pvalue) %>%
+    mutate(GeneSymbol = ifelse(is.na(GeneSymbol) | GeneSymbol == "", PeakID, GeneSymbol)) %>%
+    distinct(GeneSymbol, .keep_all = TRUE) %>%
+    dplyr::slice(1:10)
+}
+
+sizes_pc  <- c("up" = 2, "down" = 2, "ns" = 1)
+alphas_pc <- c("up" = 1, "down" = 1, "ns" = 0.5)
+x_max_pc  <- max(abs(volcano_pc.data$TT_CC_change), na.rm = TRUE)
+y_max_pc  <- max(-log10(volcano_pc.data$TT_CC_pvalue), na.rm = TRUE) + 2
+
+ggplot2::ggplot(
+  volcano_pc.data,
+  ggplot2::aes(x = TT_CC_change, y = -log10(TT_CC_pvalue),
+               fill = GeneType, size = GeneType, alpha = GeneType)
+) +
+  geom_point(shape = 21, colour = "black") +
+  geom_hline(yintercept = -log10(alpha_thr_pc), linetype = "dashed", colour = "darkgrey") +
+  geom_vline(xintercept = c(-lfc_thr_pc, lfc_thr_pc), linetype = "dashed", colour = "darkgrey") +
+  ggrepel::geom_text_repel(
+    data = top_hits_pc,
+    aes(label = GeneSymbol, color = GeneType),
+    size = 3, max.overlaps = Inf, seed = 17
+  ) +
+  scale_fill_manual(values = c("up" = "#D55E00", "down" = "#0072B2", "ns" = "grey80"),
+                    labels = c("up" = "Higher in TT clones",
+                               "down" = "Higher in CC clones",
+                               "ns" = "Not significant")) +
+  scale_color_manual(values = c("up" = "#D55E00", "down" = "#0072B2", "ns" = "grey50")) +
+  scale_size_manual(values = sizes_pc) +
+  scale_alpha_manual(values = alphas_pc) +
+  guides(fill = guide_legend(title = "Differential accessibility"),
+         size = "none", alpha = "none", color = "none") +
+  xlim(-x_max_pc, x_max_pc) +
+  ylim(0, y_max_pc) +
+  theme_minimal(base_size = 18) +
+  theme(
+    plot.title   = element_text(size = 22, face = "bold"),
+    axis.title   = element_text(size = 20, face = "bold"),
+    axis.text    = element_text(size = 16),
+    legend.title = element_text(size = 18, face = "bold"),
+    legend.text  = element_text(size = 16)
+  ) +
+  labs(
+    title = "Volcano: ProB — TT vs CC (Protein-coding genes only)",
+    x = "log2 fold-change (TT − CC)",
+    y = "-log10(FDR)"
+  )
+
+```
+
+# Function Starting the loop:
+
+```{r}
+
+# ================================================================
+# Build ENHANCED enhancer definitions (distal intergenic + intronic + downstream)
+# ================================================================
+build_peak_groups <- function(annot_df) {
+
+  annot_df <- annot_df %>%
+    dplyr::mutate(
+      base_cat = sub(" \\(.*\\)$", "", annotation)
+    )
+
+  promoter_ids <- annot_df %>%
+    dplyr::filter(base_cat == "Promoter") %>%
+    dplyr::pull(peak_id) %>% unique()
+
+  coding_peak_ids <- gene_anno_min_ext %>%
+    dplyr::filter(!is.na(ENSEMBL),
+                  ENSEMBL %in% coding_ensembl_ids) %>%
+    dplyr::pull(peak_id) %>% unique()
+
+  # === Enhanced enhancer components ===
+  intergenic_ids <- annot_df %>%
+    dplyr::filter(base_cat == "Distal Intergenic") %>%
+    dplyr::pull(peak_id)
+
+  intronic_ids <- annot_df %>%
+    dplyr::filter(base_cat == "Intron") %>%
+    dplyr::pull(peak_id)
+
+  downstream_ids <- annot_df %>%
+    dplyr::filter(base_cat == "Downstream") %>%
+    dplyr::pull(peak_id)
+
+  enhancer_ids <- unique(c(intergenic_ids,
+                           intronic_ids,
+                           downstream_ids))
+
+  list(
+    promoter_ids  = promoter_ids,
+    coding_ids    = coding_peak_ids,
+    enhancer_ids  = enhancer_ids
+  )
+}
+
+peak_sets <- build_peak_groups(annot$anno_df)
+promoter_ids <- peak_sets$promoter_ids
+coding_peak_ids <- peak_sets$coding_ids
+enhancer_ids <- peak_sets$enhancer_ids
+
+
+# ================================================================
+# Restrict universe to peaks linked to protein-coding genes only
+# (based on gene_anno_min_ext / coding_ensembl_ids)
+# ================================================================
+
+# 1) Keep only peaks that are in the coding_peak_ids universe
+coding_universe <- intersect(rownames(counts), coding_peak_ids)
+
+message("Original peaks in counts: ", nrow(counts))
+message("Coding-linked peaks in counts: ", length(coding_universe))
+
+counts <- counts[coding_universe, , drop = FALSE]
+
+# 2) Make promoter/enhancer/coding ID sets consistent with the new counts
+promoter_ids    <- intersect(promoter_ids,    rownames(counts))
+enhancer_ids    <- intersect(enhancer_ids,    rownames(counts))
+coding_peak_ids <- intersect(coding_peak_ids, rownames(counts))  # mostly redundant, but safe
+
+message("After coding filter:")
+message("  promoter_ids: ", length(promoter_ids))
+message("  enhancer_ids: ", length(enhancer_ids))
+message("  coding_peak_ids: ", length(coding_peak_ids))
+
+
+# ================================================================
+# VST for coding-only peaks across all samples (needed for heatmap)
+# ================================================================
+meta_all_coding <- ct_joined %>%
+  dplyr::select(Sample, donor, cell_type, group) %>%
+  dplyr::rename(genotype = group) %>%
+  dplyr::mutate(
+    genotype = factor(genotype, levels = c("TT", "TC", "CC")),
+    Sample   = as.character(Sample)
+  ) %>%
+  dplyr::distinct(Sample, .keep_all = TRUE)
+
+samples_in_counts_coding <- intersect(colnames(counts), meta_all_coding$Sample)
+
+meta_all_coding <- meta_all_coding %>%
+  dplyr::filter(Sample %in% samples_in_counts_coding) %>%
+  dplyr::arrange(match(Sample, samples_in_counts_coding))
+
+counts_coding <- counts[, meta_all_coding$Sample, drop = FALSE]
+
+dds_coding <- DESeq2::DESeqDataSetFromMatrix(
+  countData = counts_coding,
+  colData   = as.data.frame(meta_all_coding),
+  design    = ~ 1
+)
+dds_coding <- DESeq2::estimateSizeFactors(dds_coding)
+vsd_coding <- DESeq2::vst(dds_coding, blind = TRUE)
+
+mat_coding <- assay(vsd_coding)
+
+
+# ================================================================
+# Save state for heatmaps (run ONCE after mat_coding is created)
+# ================================================================
+heatmap_state <- list(
+  mat_coding      = mat_coding,
+  ct_joined       = ct_joined,
+  geno_cols       = geno_cols,
+  promoter_ids    = promoter_ids,
+  enhancer_ids    = enhancer_ids,
+  coding_peak_ids = coding_peak_ids,
+  gene_anno_min   = gene_anno_min
+)
+
+saveRDS(heatmap_state, file = "tian_heatmap_state.rds")
+
+
+
+# ================================================================
+#  ATAC-seq differential accessibility: DESeq2 + volcano + export
+#  - Uses enhanced enhancer sets (Distal Intergenic + Intron + Downstream)
+#  - Generic for any cell_type1/genotype1 vs cell_type2/genotype2
+#  - Volcano:
+#      • symmetric x-axis (± max |log2FC| * 1.05)
+#      • coloured points with custom legend
+#      • ggrepel labels for top hits
+# ================================================================
+run_atac_volcano <- function(
+        cell_type1,
+        genotype1,
+        cell_type2,
+        genotype2,
+        peak_group  = c("all","promoter","enhancer","coding"),
+        lfc_thr     = 1,
+        alpha_thr   = 0.05,
+        min_frac_present = 2/3,
+        shrink_type = "apeglm",
+        base_size   = 12,      # smaller base text
+        label_top_n = 15       # fewer labels for cleaner panel
+) {
+    
+    peak_group <- match.arg(peak_group)
+    
+    # 1) Metadata
+    meta <- ct_joined %>%
+        dplyr::transmute(
+            Sample    = as.character(Sample),
+            donor     = factor(donor),
+            cell_type = cell_type,
+            genotype  = group
+        ) %>%
+        dplyr::filter(
+            !is.na(cell_type), !is.na(genotype),
+            genotype %in% c("TT","TC","CC")
+        ) %>%
+        dplyr::distinct(Sample, .keep_all = TRUE)
+    
+    g1 <- paste(cell_type1, genotype1, sep = "_")
+    g2 <- paste(cell_type2, genotype2, sep = "_")
+    
+    meta <- meta %>% dplyr::mutate(contrast_group = paste(cell_type, genotype, sep = "_"))
+    meta_sub <- meta %>% dplyr::filter(contrast_group %in% c(g1, g2))
+    if (nrow(meta_sub) == 0L) stop("No samples for contrast: ", g1, " vs ", g2)
+    
+    meta_sub$contrast_group <- factor(meta_sub$contrast_group, levels = c(g2, g1))
+    
+    # 2) Subset counts
+    keep_samples <- intersect(colnames(counts), meta_sub$Sample)
+    if (length(keep_samples) < 2L) stop("Fewer than 2 samples for DESeq2.")
+    meta_sub <- meta_sub[match(keep_samples, meta_sub$Sample), , drop = FALSE]
+    cts      <- counts[, keep_samples, drop = FALSE]
+    
+    # 3) Peak subset
+    peak_ids <- switch(
+        peak_group,
+        all      = rownames(cts),
+        promoter = intersect(rownames(cts), promoter_ids),
+        enhancer = intersect(rownames(cts), enhancer_ids),
+        coding   = intersect(rownames(cts), coding_peak_ids)
+    )
+    if (length(peak_ids) == 0L) stop("No peaks for peak_group = ", peak_group)
+    cts <- cts[peak_ids, , drop = FALSE]
+    
+    # 4) Presence filter
+    n_samp <- ncol(cts)
+    min_present <- if (n_samp <= 3L) 2L else max(2L, ceiling(min_frac_present * n_samp))
+    keep_rows <- rowSums(cts > 0) >= min_present
+    cts       <- cts[keep_rows, , drop = FALSE]
+    if (nrow(cts) == 0L) stop("Presence filter removed all peaks.")
+    
+    # 5) DESeq2
+    design_try <- stats::model.matrix(~ donor + contrast_group, data = meta_sub)
+    design_formula <- if (qr(design_try)$rank < ncol(design_try)) ~ contrast_group else ~ donor + contrast_group
+    
+    dds <- DESeq2::DESeqDataSetFromMatrix(countData = cts, colData = meta_sub, design = design_formula)
+    dds <- DESeq2::DESeq(dds, test = "Wald", fitType = "parametric")
+    
+    rn <- DESeq2::resultsNames(dds)
+    coef_name <- rn[grepl("contrast_group.*_vs_", rn)]
+    if (length(coef_name) != 1L) stop("Could not uniquely identify coefficient: ", paste(rn, collapse = ", "))
+    res <- DESeq2::lfcShrink(dds, coef = coef_name, type = shrink_type)
+    
+    # 6) Annotate peaks
+    res_df <- as.data.frame(res)
+    res_df$peak_id <- rownames(res_df)
+    res_df <- res_df %>%
+        dplyr::left_join(
+            anno %>% dplyr::transmute(peak_id = Geneid, Chr, Start, End, Strand, Length),
+            by = "peak_id"
+        ) %>%
+        dplyr::left_join(gene_anno_min, by = "peak_id")
+    
+    # 7) Volcano DF + labels
+    volcano_df <- res_df %>%
+        dplyr::transmute(
+            PeakID     = peak_id,
+            GeneSymbol = dplyr::coalesce(SYMBOL, peak_id),
+            log2FC     = log2FoldChange,
+            padj_safe  = ifelse(is.na(padj), NA_real_, pmax(padj, .Machine$double.xmin)),
+            GeneType   = dplyr::case_when(
+                !is.na(padj_safe) & padj_safe <= alpha_thr & log2FC >=  lfc_thr ~ "up",
+                !is.na(padj_safe) & padj_safe <= alpha_thr & log2FC <= -lfc_thr ~ "down",
+                TRUE ~ "ns"
+            )
+        ) %>%
+        dplyr::filter(!is.na(log2FC)) %>%
+        dplyr::mutate(neg_log10 = -log10(padj_safe))
+    
+    top_hits_sig <- volcano_df %>%
+        dplyr::filter(GeneType != "ns") %>%
+        dplyr::arrange(padj_safe) %>%
+        dplyr::mutate(GeneSymbol = ifelse(is.na(GeneSymbol) | GeneSymbol == "", PeakID, GeneSymbol)) %>%
+        dplyr::distinct(GeneSymbol, .keep_all = TRUE) %>%
+        dplyr::slice(1:label_top_n)
+    
+    top_hits <- if (nrow(top_hits_sig) >= 1L) top_hits_sig else {
+        volcano_df %>%
+            dplyr::arrange(padj_safe) %>%
+            dplyr::mutate(GeneSymbol = ifelse(is.na(GeneSymbol) | GeneSymbol == "", PeakID, GeneSymbol)) %>%
+            dplyr::distinct(GeneSymbol, .keep_all = TRUE) %>%
+            dplyr::slice(1:label_top_n)
+    }
+    
+    # Symmetric axes
+    x_max <- max(abs(volcano_df$log2FC), na.rm = TRUE) * 1.05
+    y_max <- max(volcano_df$neg_log10[is.finite(volcano_df$neg_log10)], na.rm = TRUE) + 1.5
+    
+    sizes  <- c("up" = 1.4, "down" = 1.4, "ns" = 0.9)   # smaller points
+    alphas <- c("up" = 1, "down" = 1, "ns" = 0.5)
+    
+    up_label   <- paste0("Higher in ", genotype1)
+    down_label <- paste0("Higher in ", genotype2)
+    
+    # 8) Plot — smaller fonts, legend at bottom, tighter margins
+    p <- ggplot2::ggplot(
+        volcano_df,
+        ggplot2::aes(x = log2FC, y = neg_log10, fill = GeneType, size = GeneType, alpha = GeneType)
+    ) +
+        ggplot2::geom_point(shape = 21, colour = "black") +
+        ggplot2::geom_hline(yintercept = -log10(alpha_thr), linetype = "dashed", colour = "darkgrey") +
+        ggplot2::geom_vline(xintercept = c(-lfc_thr, lfc_thr), linetype = "dashed", colour = "darkgrey") +
+        ggrepel::geom_text_repel(
+            data         = top_hits,
+            ggplot2::aes(label = GeneSymbol, color = GeneType),
+            size         = 2.6,              # smaller labels
+            max.overlaps = 20,
+            box.padding  = 0.25,
+            point.padding= 0.15,
+            min.segment.length = 0,
+            segment.size = 0.2,
+            seed         = 17
+        ) +
+        ggplot2::scale_fill_manual(
+            values = c("up" = "#D55E00", "down" = "#0072B2", "ns" = "grey80"),
+            labels = c("up" = up_label, "down" = down_label, "ns" = "Not significant")
+        ) +
+        ggplot2::scale_color_manual(values = c("up" = "#D55E00", "down" = "#0072B2", "ns" = "grey50")) +
+        ggplot2::scale_size_manual(values = sizes) +
+        ggplot2::scale_alpha_manual(values = alphas) +
+        ggplot2::guides(
+            fill  = ggplot2::guide_legend(title = "Differential accessibility", title.position = "top"),
+            size  = "none", alpha = "none", color = "none"
+        ) +
+        ggplot2::coord_cartesian(xlim = c(-x_max, x_max), ylim = c(0, y_max), clip = "on") +
+        ggplot2::theme_minimal(base_size = base_size) +
+        ggplot2::theme(
+            plot.title.position = "plot",
+            plot.title   = ggplot2::element_text(size = base_size + 4, face = "bold"),
+            plot.subtitle= ggplot2::element_text(size = base_size),
+            axis.title   = ggplot2::element_text(size = base_size + 2, face = "bold"),
+            axis.text    = ggplot2::element_text(size = base_size),
+            legend.position = "bottom",  # frees panel width
+            legend.title = ggplot2::element_text(size = base_size, face = "bold"),
+            legend.text  = ggplot2::element_text(size = base_size - 1),
+            legend.key.height = grid::unit(0.35, "cm"),
+            legend.key.width  = grid::unit(0.6, "cm"),
+            panel.grid.minor  = ggplot2::element_blank(),
+            plot.margin  = ggplot2::margin(6, 6, 6, 6)
+        ) +
+        ggplot2::labs(
+            title = paste0("Volcano: ", cell_type1, " ", genotype1, " vs ", cell_type2, " ", genotype2,
+                           " (", peak_group, " peaks)"),
+            subtitle = paste0("FDR ≤ ", alpha_thr, "; |log2FC| ≥ ", lfc_thr),
+            x = paste0("log2 fold-change (", genotype1, " − ", genotype2, ")"),
+            y = "-log10(FDR)"
+        )
+    
+    list(
+        volcano_df   = volcano_df,
+        res_df       = res_df,
+        dds          = dds,
+        volcano_plot = p,
+        peak_group   = peak_group,
+        comparison   = paste(cell_type1, genotype1, "vs", cell_type2, genotype2),
+        top_hits     = top_hits
+    )
+}
+
+
+```
+
+
+## Looping all 3 cell types:
+
+```{r}
+# =============================
+# MASTER LOOP – ProB, CLP, PreB
+# =============================
+
+library(ggplot2)
+library(dplyr)
+library(readr)
+library(stringr)
+
+# -------- 1) Root directory with date ----------
+root_dir <- paste0("results_as_of_", Sys.Date())
+if (!dir.exists(root_dir)) dir.create(root_dir)
+
+# -------- 2) Target cell types ----------
+cell_types <- c("ProB", "CLP", "PreB")
+
+# -------- 3) Genotype contrasts ----------
+genotype_pairs <- list(
+    c("TT", "CC"),
+    c("TT", "TC"),
+    c("TC", "CC")
+)
+
+# -------- 4) Peak groups ----------
+peak_groups <- c("all", "promoter", "enhancer", "coding")
+
+
+# ==================================================
+# MAIN LOOP over cell types
+# ==================================================
+for (cell_type_target in cell_types) {
+    
+    message("\n############################################")
+    message("#####   Processing cell type: ", cell_type_target, "   #####")
+    message("############################################\n")
+    
+    # Create directory for this cell type
+    cell_dir <- file.path(root_dir, cell_type_target)
+    if (!dir.exists(cell_dir)) dir.create(cell_dir)
+    
+    # ==================================================
+    # Loop over genotype pairs
+    # ==================================================
+    for (pair in genotype_pairs) {
+        
+        g1 <- pair[1]
+        g2 <- pair[2]
+        
+        message("\n===================================================")
+        message("Running contrast: ", cell_type_target, "  ", g1, " vs ", g2)
+        message("===================================================\n")
+        
+        # Directory for this contrast
+        contrast_dir <- file.path(cell_dir, paste0(g1, "_vs_", g2))
+        if (!dir.exists(contrast_dir)) dir.create(contrast_dir)
+        
+        # ==================================================
+        # Loop over peak groups
+        # ==================================================
+        for (pg in peak_groups) {
+            
+            message("  → Peak group: ", pg)
+            
+            # Directory for this peak group
+            pg_dir <- file.path(contrast_dir, pg)
+            if (!dir.exists(pg_dir)) dir.create(pg_dir)
+            
+            # ----------------------------------------
+            # RUN THE VOLCANO FUNCTION
+            # ----------------------------------------
+            res_obj <- run_atac_volcano(
+                cell_type1 = cell_type_target,
+                genotype1  = g1,
+                cell_type2 = cell_type_target,
+                genotype2  = g2,
+                peak_group = pg,
+                lfc_thr    = 1,
+                alpha_thr  = 0.05
+            )
+            
+            # ----------------------------------------
+            # SAVE OUTPUTS
+            # ----------------------------------------
+            
+            ## 1) Volcano plot PDF
+            pdf_path <- file.path(
+                pg_dir,
+                paste0("volcano_", cell_type_target, "_", g1, "_vs_", g2, "_", pg, ".pdf")
+            )
+            ggsave(pdf_path, plot = res_obj$volcano_plot, width = 8, height = 6)
+            
+            ## 2) res_df table
+            res_path <- file.path(
+                pg_dir,
+                paste0("res_df_", cell_type_target, "_", g1, "_vs_", g2, "_", pg, ".csv")
+            )
+            write_csv(res_obj$res_df, res_path)
+            
+            ## 3) volcano_df table
+            volcano_path <- file.path(
+                pg_dir,
+                paste0("volcano_df_", cell_type_target, "_", g1, "_vs_", g2, "_", pg, ".csv")
+            )
+            write_csv(res_obj$volcano_df, volcano_path)
+            
+            message("     ✓ Saved volcano, res_df, volcano_df")
+            
+        } # END peak groups
+        
+    } # END genotype pairs
+    
+} # END cell_types
+
+message("\n===========================================")
+message("ALL DONE.")
+message("Results stored under: ", root_dir)
+message("===========================================\n")
+ 
+```
+
+
+# 6.3 Intrer cell type comparisons
+
+```{r}
+# ================================================================
+# Inter-cell-type DA: same genotype, different cell types
+# - Uses global objects: counts, ct_joined, anno, gene_anno_min,
+#   promoter_ids, enhancer_ids, coding_peak_ids
+# ================================================================
+run_atac_volcano_intercelltype <- function(
+  cell_type1,
+  cell_type2,
+  genotype,
+  peak_group      = c("all","promoter","enhancer","coding"),
+  lfc_thr         = 1,
+  alpha_thr       = 0.05,
+  min_frac_present= 2/3,
+  shrink_type     = "apeglm",
+  base_size       = 12,
+  label_top_n     = 15
+) {
+  peak_group <- match.arg(peak_group)
+
+  # ------------------------------------------------------------
+  # 1) Metadata: restrict to TT/TC/CC, build contrast_group
+  # ------------------------------------------------------------
+  meta <- ct_joined %>%
+    dplyr::transmute(
+      Sample    = as.character(Sample),
+      donor     = factor(donor),
+      cell_type = cell_type,
+      genotype  = group
+    ) %>%
+    dplyr::filter(
+      !is.na(cell_type),
+      !is.na(genotype),
+      genotype %in% c("TT", "TC", "CC")
+    ) %>%
+    dplyr::distinct(Sample, .keep_all = TRUE)
+
+  # same genotype on both sides
+  g1 <- paste(cell_type1, genotype, sep = "_")
+  g2 <- paste(cell_type2, genotype, sep = "_")
+
+  meta <- meta %>%
+    dplyr::mutate(contrast_group = paste(cell_type, genotype, sep = "_"))
+
+  meta_sub <- meta %>%
+    dplyr::filter(contrast_group %in% c(g1, g2))
+
+  if (nrow(meta_sub) == 0L) {
+    stop("No samples for contrast: ", cell_type1, " ", genotype,
+         " vs ", cell_type2, " ", genotype)
+  }
+
+  meta_sub$contrast_group <- factor(meta_sub$contrast_group,
+                                    levels = c(g2, g1))  # baseline = cell_type2
+
+  # ------------------------------------------------------------
+  # 2) Subset counts to those samples
+  # ------------------------------------------------------------
+  keep_samples <- intersect(colnames(counts), meta_sub$Sample)
+  if (length(keep_samples) < 2L) {
+    stop("Fewer than 2 samples for DESeq2 in contrast ",
+         cell_type1, " vs ", cell_type2, " (", genotype, ")")
+  }
+
+  meta_sub <- meta_sub[match(keep_samples, meta_sub$Sample), , drop = FALSE]
+  cts      <- counts[, keep_samples, drop = FALSE]
+
+  # ------------------------------------------------------------
+  # 3) Peak subset by group
+  # ------------------------------------------------------------
+  peak_ids <- switch(
+    peak_group,
+    all      = rownames(cts),
+    promoter = intersect(rownames(cts), promoter_ids),
+    enhancer = intersect(rownames(cts), enhancer_ids),
+    coding   = intersect(rownames(cts), coding_peak_ids)
+  )
+
+  if (length(peak_ids) == 0L) {
+    stop("No peaks for peak_group = ", peak_group,
+         " in contrast ", cell_type1, " vs ", cell_type2, " (", genotype, ")")
+  }
+
+  cts <- cts[peak_ids, , drop = FALSE]
+
+  # ------------------------------------------------------------
+  # 4) Presence filter (>= 2/3 of samples, but at least 2)
+  # ------------------------------------------------------------
+  n_samp <- ncol(cts)
+  min_present <- if (n_samp <= 3L) 2L else max(2L, ceiling(min_frac_present * n_samp))
+
+  keep_rows <- rowSums(cts > 0) >= min_present
+  cts       <- cts[keep_rows, , drop = FALSE]
+
+  if (nrow(cts) == 0L) {
+    stop("Presence filter removed all peaks for contrast ",
+         cell_type1, " vs ", cell_type2, " (", genotype, "), peak_group = ", peak_group)
+  }
+
+  # ------------------------------------------------------------
+  # 5) DESeq2 model: donor + contrast_group if full rank
+  # ------------------------------------------------------------
+  design_try <- stats::model.matrix(~ donor + contrast_group, data = meta_sub)
+  design_formula <- if (qr(design_try)$rank < ncol(design_try)) {
+    ~ contrast_group
+  } else {
+    ~ donor + contrast_group
+  }
+
+  dds <- DESeq2::DESeqDataSetFromMatrix(
+    countData = cts,
+    colData   = meta_sub,
+    design    = design_formula
+  )
+
+  dds <- DESeq2::DESeq(dds, test = "Wald", fitType = "parametric")
+
+  rn <- DESeq2::resultsNames(dds)
+  coef_name <- rn[grepl("contrast_group.*_vs_", rn)]
+  if (length(coef_name) != 1L) {
+    stop("Could not uniquely identify coefficient in DESeq2 results: ",
+         paste(rn, collapse = ", "))
+  }
+
+  res <- DESeq2::lfcShrink(dds, coef = coef_name, type = shrink_type)
+
+  # ------------------------------------------------------------
+  # 6) Annotate peaks
+  # ------------------------------------------------------------
+  res_df <- as.data.frame(res)
+  res_df$peak_id <- rownames(res_df)
+
+  res_df <- res_df %>%
+    dplyr::left_join(
+      anno %>% dplyr::transmute(
+        peak_id = Geneid,
+        Chr, Start, End, Strand, Length
+      ),
+      by = "peak_id"
+    ) %>%
+    dplyr::left_join(gene_anno_min, by = "peak_id")
+
+  # ------------------------------------------------------------
+  # 7) Build volcano_df + top labels (label by CELL TYPE)
+  # ------------------------------------------------------------
+  volcano_df <- res_df %>%
+    dplyr::transmute(
+      PeakID     = peak_id,
+      GeneSymbol = dplyr::coalesce(SYMBOL, peak_id),
+      log2FC     = log2FoldChange,
+      padj_safe  = ifelse(is.na(padj),
+                          NA_real_,
+                          pmax(padj, .Machine$double.xmin)),
+      GeneType   = dplyr::case_when(
+        !is.na(padj_safe) & padj_safe <= alpha_thr & log2FC >=  lfc_thr ~ "up",
+        !is.na(padj_safe) & padj_safe <= alpha_thr & log2FC <= -lfc_thr ~ "down",
+        TRUE ~ "ns"
+      )
+    ) %>%
+    dplyr::filter(!is.na(log2FC)) %>%
+    dplyr::mutate(neg_log10 = -log10(padj_safe))
+
+  top_hits_sig <- volcano_df %>%
+    dplyr::filter(GeneType != "ns") %>%
+    dplyr::arrange(padj_safe) %>%
+    dplyr::mutate(
+      GeneSymbol = ifelse(is.na(GeneSymbol) | GeneSymbol == "", PeakID, GeneSymbol)
+    ) %>%
+    dplyr::distinct(GeneSymbol, .keep_all = TRUE) %>%
+    dplyr::slice(1:label_top_n)
+
+  top_hits <- if (nrow(top_hits_sig) >= 1L) {
+    top_hits_sig
+  } else {
+    volcano_df %>%
+      dplyr::arrange(padj_safe) %>%
+      dplyr::mutate(
+        GeneSymbol = ifelse(is.na(GeneSymbol) | GeneSymbol == "", PeakID, GeneSymbol)
+      ) %>%
+      dplyr::distinct(GeneSymbol, .keep_all = TRUE) %>%
+      dplyr::slice(1:label_top_n)
+  }
+
+  # ------------------------------------------------------------
+  # 8) Plot aesthetics
+  # ------------------------------------------------------------
+  x_max <- max(abs(volcano_df$log2FC), na.rm = TRUE) * 1.05
+  y_max <- max(volcano_df$neg_log10[is.finite(volcano_df$neg_log10)], na.rm = TRUE) + 1.5
+
+  sizes  <- c("up" = 1.4, "down" = 1.4, "ns" = 0.9)
+  alphas <- c("up" = 1, "down" = 1, "ns" = 0.5)
+
+  up_label   <- paste0("Higher in ", cell_type1)
+  down_label <- paste0("Higher in ", cell_type2)
+  x_lab      <- paste0("log2 fold-change (", cell_type1, " − ", cell_type2, ")")
+
+  p <- ggplot2::ggplot(
+    volcano_df,
+    ggplot2::aes(
+      x     = log2FC,
+      y     = neg_log10,
+      fill  = GeneType,
+      size  = GeneType,
+      alpha = GeneType
+    )
+  ) +
+    ggplot2::geom_point(shape = 21, colour = "black") +
+    ggplot2::geom_hline(yintercept = -log10(alpha_thr),
+                        linetype = "dashed", colour = "darkgrey") +
+    ggplot2::geom_vline(xintercept = c(-lfc_thr, lfc_thr),
+                        linetype = "dashed", colour = "darkgrey") +
+    ggrepel::geom_text_repel(
+      data         = top_hits,
+      ggplot2::aes(label = GeneSymbol, color = GeneType),
+      size         = 2.6,
+      max.overlaps = 20,
+      box.padding  = 0.25,
+      point.padding= 0.15,
+      min.segment.length = 0,
+      segment.size = 0.2,
+      seed         = 17
+    ) +
+    ggplot2::scale_fill_manual(
+      values = c("up" = "#D55E00", "down" = "#0072B2", "ns" = "grey80"),
+      labels = c("up" = up_label,
+                 "down" = down_label,
+                 "ns" = "Not significant")
+    ) +
+    ggplot2::scale_color_manual(
+      values = c("up" = "#D55E00", "down" = "#0072B2", "ns" = "grey50")
+    ) +
+    ggplot2::scale_size_manual(values = sizes) +
+    ggplot2::scale_alpha_manual(values = alphas) +
+    ggplot2::guides(
+      fill  = ggplot2::guide_legend(
+        title = "Differential accessibility",
+        title.position = "top"
+      ),
+      size  = "none",
+      alpha = "none",
+      color = "none"
+    ) +
+    ggplot2::coord_cartesian(
+      xlim = c(-x_max, x_max),
+      ylim = c(0, y_max),
+      clip = "on"
+    ) +
+    ggplot2::theme_minimal(base_size = base_size) +
+    ggplot2::theme(
+      plot.title.position = "plot",
+      plot.title   = ggplot2::element_text(size = base_size + 4, face = "bold"),
+      plot.subtitle= ggplot2::element_text(size = base_size),
+      axis.title   = ggplot2::element_text(size = base_size + 2, face = "bold"),
+      axis.text    = ggplot2::element_text(size = base_size),
+      legend.position = "bottom",
+      legend.title = ggplot2::element_text(size = base_size, face = "bold"),
+      legend.text  = ggplot2::element_text(size = base_size - 1),
+      legend.key.height = grid::unit(0.35, "cm"),
+      legend.key.width  = grid::unit(0.6, "cm"),
+      panel.grid.minor  = ggplot2::element_blank(),
+      plot.margin  = ggplot2::margin(6, 6, 6, 6)
+    ) +
+    ggplot2::labs(
+      title = paste0(
+        "Volcano: ", cell_type1, " vs ", cell_type2,
+        " (genotype ", genotype, ", ", peak_group, " peaks)"
+      ),
+      subtitle = paste0("FDR ≤ ", alpha_thr, "; |log2FC| ≥ ", lfc_thr),
+      x = x_lab,
+      y = "-log10(FDR)"
+    )
+
+  list(
+    volcano_df   = volcano_df,
+    res_df       = res_df,
+    dds          = dds,
+    volcano_plot = p,
+    peak_group   = peak_group,
+    comparison   = paste(cell_type1, "vs", cell_type2, "genotype", genotype),
+    top_hits     = top_hits
+  )
+}
+
+```
+
+
+### 6.3.1 Looping intercelltype comparisonss
+```{r}
+# =============================
+# INTER-CELLTYPE MASTER LOOP
+# CLP > ProB, ProB > PreB, PreB > Immature-B
+# within each genotype (TT, TC, CC)
+# =============================
+
+library(ggplot2)
+library(dplyr)
+library(readr)
+library(stringr)
+
+# -------- 1) Root directory with date ----------
+root_dir_inter <- paste0("inter_celltype_comparisions_", Sys.Date())
+if (!dir.exists(root_dir_inter)) dir.create(root_dir_inter)
+
+# -------- 2) Cell-type pairs along developmental trajectory -----
+celltype_pairs <- list(
+  c("CLP",        "ProB"),
+  c("ProB",       "PreB"),
+  c("PreB",       "Immature-B")
+)
+
+# -------- 3) Genotypes to analyze ----------
+genotypes <- c("TT", "TC", "CC")
+
+# -------- 4) Peak groups ----------
+peak_groups <- c("all", "promoter", "enhancer", "coding")
+
+
+# ==================================================
+# MAIN LOOP over genotypes and cell-type pairs
+# ==================================================
+for (geno in genotypes) {
+
+  message("\n############################################")
+  message("#####   Inter-celltype comparisons, genotype: ", geno, "   #####")
+  message("############################################\n")
+
+  # Directory for this genotype
+  geno_dir <- file.path(root_dir_inter, paste0("genotype_", geno))
+  if (!dir.exists(geno_dir)) dir.create(geno_dir)
+
+  # ==================================================
+  # Loop over cell-type pairs (e.g., CLP vs ProB)
+  # ==================================================
+  for (pair in celltype_pairs) {
+
+    ct1 <- pair[1]
+    ct2 <- pair[2]
+
+    message("\n===================================================")
+    message("Running contrast: ", ct1, " vs ", ct2, "  (genotype ", geno, ")")
+    message("===================================================\n")
+
+    # Directory for this cell-type contrast
+    ct_contrast_dir <- file.path(
+      geno_dir,
+      paste0(ct1, "_vs_", ct2)
+    )
+    if (!dir.exists(ct_contrast_dir)) dir.create(ct_contrast_dir)
+
+    # ==================================================
+    # Loop over peak groups
+    # ==================================================
+    for (pg in peak_groups) {
+
+      message("  → Peak group: ", pg)
+
+      # Directory for this peak group
+      pg_dir <- file.path(ct_contrast_dir, pg)
+      if (!dir.exists(pg_dir)) dir.create(pg_dir)
+
+      # ----------------------------------------
+      # RUN THE INTER-CELLTYPE VOLCANO FUNCTION
+      # ----------------------------------------
+      res_obj <- run_atac_volcano_intercelltype(
+        cell_type1 = ct1,
+        cell_type2 = ct2,
+        genotype   = geno,
+        peak_group = pg,
+        lfc_thr    = 1,
+        alpha_thr  = 0.05
+      )
+
+      # ----------------------------------------
+      # SAVE OUTPUTS
+      # ----------------------------------------
+
+      ## 1) Volcano plot PDF
+      pdf_path <- file.path(
+        pg_dir,
+        paste0("volcano_", ct1, "_vs_", ct2,
+               "_genotype_", geno, "_", pg, ".pdf")
+      )
+      ggsave(pdf_path, plot = res_obj$volcano_plot, width = 8, height = 6)
+
+      ## 2) res_df table
+      res_path <- file.path(
+        pg_dir,
+        paste0("res_df_", ct1, "_vs_", ct2,
+               "_genotype_", geno, "_", pg, ".csv")
+      )
+      write_csv(res_obj$res_df, res_path)
+
+      ## 3) volcano_df table
+      volcano_path <- file.path(
+        pg_dir,
+        paste0("volcano_df_", ct1, "_vs_", ct2,
+               "_genotype_", geno, "_", pg, ".csv")
+      )
+      write_csv(res_obj$volcano_df, volcano_path)
+
+      message("     ✓ Saved volcano, res_df, volcano_df")
+
+    } # END peak_groups
+
+  } # END celltype_pairs
+
+} # END genotypes
+
+message("\n===========================================")
+message("ALL DONE (inter-celltype comparisons).")
+message("Results stored under: ", root_dir_inter)
+message("===========================================\n")
+
+```
+
+### 7. Heatmap
+
+```{r}
+# ================================================================
+# Reload state to start from Section 7 (heatmaps)
+# ================================================================
+if (!file.exists("tian_heatmap_state.rds")) {
+  stop("tian_heatmap_state.rds not found. Run the full pipeline once to create it.")
+}
+
+heatmap_state <- readRDS("tian_heatmap_state.rds")
+list2env(heatmap_state, envir = .GlobalEnv)
+
+# Now mat_coding, ct_joined, geno_cols, promoter_ids, enhancer_ids,
+# coding_peak_ids, gene_anno_min are all available, so you can run
+# Section 7 heatmaps directly.
+
+```
+
+
+
+```{r}
+# ================================================================
+# Tian-style coding-only marker heatmap
+#   - Cell types: HSC, CLP, ProB, PreB, Immature-B
+#   - Rows = marker peaks grouped by marker_for CT
+#   - Columns = samples grouped by sample CT + genotype
+#   - No peak IDs shown in the plot
+# ================================================================
+library(dplyr)
+library(purrr)
+library(pheatmap)
+
+cat("\n=== Tian-style coding-only marker heatmap (HSC → CLP → ProB → PreB → Immature-B) ===\n")
+
+# We assume 'mat_coding' (VST, coding-only peaks) and 'ct_joined' + 'geno_cols' already exist
+stopifnot(exists("mat_coding"), exists("ct_joined"), exists("geno_cols"))
+
+celltype_levels <- c("HSC", "CLP", "ProB", "PreB", "Immature-B")
+
+# ------------------------------------------------
+# 1) Build meta_marker + mat_marker INCLUDING HSC
+# ------------------------------------------------
+meta_marker <- ct_joined %>%
+    transmute(
+        Sample   = as.character(Sample),
+        donor,
+        cell_type,
+        genotype = group
+    ) %>%
+    filter(cell_type %in% celltype_levels) %>%
+    mutate(
+        cell_type = factor(cell_type, levels = celltype_levels),
+        genotype  = factor(genotype, levels = c("TT","TC","CC"))
+    ) %>%
+    distinct(Sample, .keep_all = TRUE)
+
+cat("  • meta_marker dim:", paste(dim(meta_marker), collapse = " × "), "\n")
+cat("  • Samples per CT:\n")
+print(table(meta_marker$cell_type))
+
+# Align with mat_coding
+samples_in_mat <- intersect(colnames(mat_coding), meta_marker$Sample)
+meta_marker <- meta_marker %>%
+    filter(Sample %in% samples_in_mat) %>%
+    arrange(match(Sample, samples_in_mat))
+
+mat_marker <- mat_coding[, meta_marker$Sample, drop = FALSE]
+
+cat("  • mat_marker dim:", paste(dim(mat_marker), collapse = " × "), "\n")
+
+# ------------------------------------------------
+# 2) Average VST per CT (HSC, CLP, ProB, PreB, Immature-B)
+# ------------------------------------------------
+avg_by_ct <- sapply(celltype_levels, function(ct) {
+    cols_ct <- meta_marker$Sample[meta_marker$cell_type == ct]
+    if (length(cols_ct) == 0L) stop("No samples for cell type: ", ct)
+    rowMeans(mat_marker[, cols_ct, drop = FALSE])
+})
+colnames(avg_by_ct) <- celltype_levels
+
+cat("  • avg_by_ct dim (peaks × CTs):", paste(dim(avg_by_ct), collapse = " × "), "\n")
+
+# ------------------------------------------------
+# 3) Specificity scores and top marker peaks per CT
+# ------------------------------------------------
+delta_by_ct <- lapply(seq_along(celltype_levels), function(j) {
+    focal  <- avg_by_ct[, j]
+    others <- rowMeans(avg_by_ct[, -j, drop = FALSE])
+    focal - others
+})
+names(delta_by_ct) <- celltype_levels
+
+n_markers_per_ct <- 100
+
+markers_by_ct <- lapply(celltype_levels, function(ct) {
+    scores   <- delta_by_ct[[ct]]
+    ord      <- order(scores, decreasing = TRUE)
+    n_take   <- min(n_markers_per_ct, length(ord))
+    rownames(avg_by_ct)[ord][seq_len(n_take)]
+})
+names(markers_by_ct) <- celltype_levels
+
+cat("  • Markers per CT:\n")
+print(sapply(markers_by_ct, length))
+
+marker_union <- unique(unlist(markers_by_ct))
+cat("  • Total unique marker peaks:", length(marker_union), "\n")
+
+# ------------------------------------------------
+# 4) Long (peak_id, marker_for) table + z-scored matrix
+# ------------------------------------------------
+marker_df <- purrr::imap_dfr(
+    markers_by_ct,
+    ~ data.frame(peak_id = .x, marker_for = .y, stringsAsFactors = FALSE)
+)
+
+cat("  • marker_df rows:", nrow(marker_df), "\n")
+cat("  • Unique peak_ids:", length(unique(marker_df$peak_id)), "\n")
+
+unique_peaks <- intersect(unique(marker_df$peak_id), rownames(mat_marker))
+cat("  • Peaks present in mat_marker:", length(unique_peaks), "\n")
+
+heat_mat <- mat_marker[unique_peaks, , drop = FALSE]
+heat_mat_z <- t(scale(t(heat_mat)))
+
+keep_ok <- rowSums(is.na(heat_mat_z)) < ncol(heat_mat_z)
+heat_mat_z <- heat_mat_z[keep_ok, , drop = FALSE]
+
+marker_df <- marker_df %>%
+    filter(peak_id %in% rownames(heat_mat_z))
+
+cat("  • heat_mat_z dim:", paste(dim(heat_mat_z), collapse = " × "), "\n")
+cat("  • marker_df rows after NA filter:", nrow(marker_df), "\n")
+
+# ------------------------------------------------
+# 5) Expand matrix: one row per (peak, marker_for)
+# ------------------------------------------------
+marker_df <- marker_df %>%
+    mutate(row_id = paste0(peak_id, "_", marker_for))
+
+heat_mat_expanded <- do.call(
+    rbind,
+    lapply(seq_len(nrow(marker_df)), function(i) {
+        heat_mat_z[marker_df$peak_id[i], ]
+    })
+)
+rownames(heat_mat_expanded) <- marker_df$row_id
+
+cat("  • Expanded matrix dim:", paste(dim(heat_mat_expanded), collapse = " × "), "\n")
+
+# ------------------------------------------------
+# 6) Row + column annotations (5 CTs in rows AND columns)
+# ------------------------------------------------
+row_anno <- data.frame(
+    celltype = factor(marker_df$marker_for, levels = celltype_levels)
+)
+rownames(row_anno) <- marker_df$row_id
+
+col_anno <- data.frame(
+    cell_type = factor(meta_marker$cell_type, levels = celltype_levels),
+    genotype  = meta_marker$genotype,
+    donor     = meta_marker$donor
+)
+rownames(col_anno) <- meta_marker$Sample
+
+cat("  • row_anno counts (should show 5 CT levels):\n")
+print(table(row_anno$celltype))
+cat("  • col_anno counts (should show 5 CT levels):\n")
+print(table(col_anno$cell_type))
+
+# ------------------------------------------------
+# 7) Order rows & columns into CT blocks (5 × 5)
+# ------------------------------------------------
+col_order <- order(col_anno$cell_type, col_anno$genotype, col_anno$donor)
+row_order <- order(row_anno$celltype)
+
+ct_run_cols <- rle(as.character(col_anno$cell_type[col_order]))
+gaps_col <- cumsum(ct_run_cols$lengths)
+if (length(gaps_col) > 0L) gaps_col <- gaps_col[-length(gaps_col)]
+
+ct_run_rows <- rle(as.character(row_anno$celltype[row_order]))
+gaps_row <- cumsum(ct_run_rows$lengths)
+if (length(gaps_row) > 0L) gaps_row <- gaps_row[-length(gaps_row)]
+
+heat_mat_plot <- heat_mat_expanded[row_order, col_order, drop = FALSE]
+row_anno_plot <- row_anno[row_order, , drop = FALSE]
+col_anno_plot <- col_anno[col_order, , drop = FALSE]
+
+stopifnot(identical(rownames(heat_mat_plot), rownames(row_anno_plot)))
+stopifnot(identical(colnames(heat_mat_plot), rownames(col_anno_plot)))
+
+# ------------------------------------------------
+# 8) Colors + heatmap
+# ------------------------------------------------
+cell_type_colors <- c(
+    HSC         = "#4D9221",
+    CLP         = "#1b9e77",
+    ProB        = "#d95f02",
+    PreB        = "#7570b3",
+    `Immature-B`= "#e7298a"
+)
+
+annotation_colors <- list(
+    celltype  = cell_type_colors,   # row annotation
+    cell_type = cell_type_colors,   # column annotation
+    genotype  = geno_cols
+)
+
+pheatmap::pheatmap(
+    heat_mat_plot,
+    cluster_rows   = FALSE,
+    cluster_cols   = FALSE,
+    show_rownames  = FALSE,
+    show_colnames  = FALSE,
+    annotation_row = row_anno_plot,
+    annotation_col = col_anno_plot,
+    annotation_colors = annotation_colors,
+    gaps_row      = gaps_row,
+    gaps_col      = gaps_col,
+    border_color  = NA,
+    main          = "Coding-only marker peaks (HSC → CLP → ProB → PreB → Immature-B)",
+    fontsize      = 10
+)
+
+cat("=== Done Tian-style coding-only marker heatmap (HSC included; 5×5 CT blocks) ===\n")
+
+```
+
+### 7.1 Promoter and Enhancer
+
+```{r}
+# ================================================================
+# Helper: Tian-style marker heatmap for a given peak subset
+# Returns: list(heat_mat_z, marker_df, marker_genes_wide)
+# ================================================================
+library(dplyr)
+library(purrr)
+library(pheatmap)
+library(tidyr)
+
+make_tian_marker_heatmap <- function(
+  mat_base,
+  ct_joined,
+  geno_cols,
+  gene_anno_min,
+  peak_subset_ids,
+  celltype_levels = c("HSC", "CLP", "ProB", "PreB", "Immature-B"),
+  n_markers_per_ct = 100,
+  main_title       = "Marker heatmap",
+  marker_table_prefix = NULL  # optional CSV export
+) {
+
+  cat("\n=== Tian-style marker heatmap for peak subset ===\n")
+
+  # 1) Metadata for selected CTs
+  meta_marker <- ct_joined %>%
+    transmute(
+      Sample   = as.character(Sample),
+      donor,
+      cell_type,
+      genotype = group
+    ) %>%
+    filter(cell_type %in% celltype_levels) %>%
+    mutate(
+      cell_type = factor(cell_type, levels = celltype_levels),
+      genotype  = factor(genotype, levels = c("TT","TC","CC"))
+    ) %>%
+    distinct(Sample, .keep_all = TRUE)
+
+  cat("  • meta_marker dim:", paste(dim(meta_marker), collapse = " × "), "\n")
+  cat("  • Samples per CT:\n")
+  print(table(meta_marker$cell_type))
+
+  # 2) Subset mat_base to (coding ∩ peak_subset_ids) and align samples
+  peaks_use <- intersect(rownames(mat_base), peak_subset_ids)
+  if (length(peaks_use) == 0L) stop("No overlapping peaks in mat_base vs peak_subset_ids")
+
+  samples_in_mat <- intersect(colnames(mat_base), meta_marker$Sample)
+
+  meta_marker <- meta_marker %>%
+    filter(Sample %in% samples_in_mat) %>%
+    arrange(match(Sample, samples_in_mat))
+
+  heat_mat <- mat_base[peaks_use, meta_marker$Sample, drop = FALSE]
+
+  cat("  • heat_mat dim (subset × samples):", paste(dim(heat_mat), collapse = " × "), "\n")
+
+  # 3) Average VST per CT
+  avg_by_ct <- sapply(celltype_levels, function(ct) {
+    cols_ct <- meta_marker$Sample[meta_marker$cell_type == ct]
+    if (length(cols_ct) == 0L) stop("No samples for cell type: ", ct)
+    rowMeans(heat_mat[, cols_ct, drop = FALSE])
+  })
+  colnames(avg_by_ct) <- celltype_levels
+
+  cat("  • avg_by_ct dim (peaks × CTs):", paste(dim(avg_by_ct), collapse = " × "), "\n")
+
+  # 4) Specificity scores and top marker peaks per CT
+  delta_by_ct <- lapply(seq_along(celltype_levels), function(j) {
+    focal  <- avg_by_ct[, j]
+    others <- rowMeans(avg_by_ct[, -j, drop = FALSE])
+    focal - others
+  })
+  names(delta_by_ct) <- celltype_levels
+
+  markers_by_ct <- lapply(celltype_levels, function(ct) {
+    scores <- delta_by_ct[[ct]]
+    ord    <- order(scores, decreasing = TRUE)
+    n_take <- min(n_markers_per_ct, length(ord))
+    rownames(avg_by_ct)[ord][seq_len(n_take)]
+  })
+  names(markers_by_ct) <- celltype_levels
+
+  cat("  • Markers per CT:\n")
+  print(sapply(markers_by_ct, length))
+
+  marker_union <- unique(unlist(markers_by_ct))
+  cat("  • Total unique marker peaks:", length(marker_union), "\n")
+
+  # 5) Long marker table (peak_id, marker_for)
+  marker_df <- purrr::imap_dfr(
+    markers_by_ct,
+    ~ data.frame(peak_id = .x, marker_for = .y, stringsAsFactors = FALSE)
+  )
+
+  cat("  • marker_df rows:", nrow(marker_df), "\n")
+  cat("  • Unique peak_ids:", length(unique(marker_df$peak_id)), "\n")
+
+  # 6) Z-score and expand matrix one row per (peak, marker_for)
+  peaks_present <- intersect(unique(marker_df$peak_id), rownames(heat_mat))
+  cat("  • Peaks present in heat_mat:", length(peaks_present), "\n")
+
+  heat_mat2 <- heat_mat[peaks_present, , drop = FALSE]
+  heat_mat_z <- t(scale(t(heat_mat2)))
+
+  keep_ok <- rowSums(is.na(heat_mat_z)) < ncol(heat_mat_z)
+  heat_mat_z <- heat_mat_z[keep_ok, , drop = FALSE]
+
+  marker_df <- marker_df %>%
+    filter(peak_id %in% rownames(heat_mat_z))
+
+  cat("  • heat_mat_z dim:", paste(dim(heat_mat_z), collapse = " × "), "\n")
+  cat("  • marker_df rows after NA filter:", nrow(marker_df), "\n")
+
+  marker_df <- marker_df %>%
+    mutate(row_id = paste0(peak_id, "_", marker_for))
+
+  heat_mat_expanded <- do.call(
+    rbind,
+    lapply(seq_len(nrow(marker_df)), function(i) {
+      heat_mat_z[marker_df$peak_id[i], ]
+    })
+  )
+  rownames(heat_mat_expanded) <- marker_df$row_id
+
+  cat("  • Expanded matrix dim:", paste(dim(heat_mat_expanded), collapse = " × "), "\n")
+
+  # 7) Row + column annotations (CTs in rows & columns)
+  row_anno <- data.frame(
+    celltype = factor(marker_df$marker_for, levels = celltype_levels)
+  )
+  rownames(row_anno) <- marker_df$row_id
+
+  col_anno <- data.frame(
+    cell_type = factor(meta_marker$cell_type, levels = celltype_levels),
+    genotype  = meta_marker$genotype,
+    donor     = meta_marker$donor
+  )
+  rownames(col_anno) <- meta_marker$Sample
+
+  # Order rows & cols
+  col_order <- order(col_anno$cell_type, col_anno$genotype, col_anno$donor)
+  row_order <- order(row_anno$celltype)
+
+  ct_run_cols <- rle(as.character(col_anno$cell_type[col_order]))
+  gaps_col <- cumsum(ct_run_cols$lengths)
+  if (length(gaps_col) > 0L) gaps_col <- gaps_col[-length(gaps_col)]
+
+  ct_run_rows <- rle(as.character(row_anno$celltype[row_order]))
+  gaps_row <- cumsum(ct_run_rows$lengths)
+  if (length(gaps_row) > 0L) gaps_row <- gaps_row[-length(gaps_row)]
+
+  heat_mat_plot <- heat_mat_expanded[row_order, col_order, drop = FALSE]
+  row_anno_plot <- row_anno[row_order, , drop = FALSE]
+  col_anno_plot <- col_anno[col_order, , drop = FALSE]
+
+  stopifnot(identical(rownames(heat_mat_plot), rownames(row_anno_plot)))
+  stopifnot(identical(colnames(heat_mat_plot), rownames(col_anno_plot)))
+
+  # 8) Colors
+  cell_type_colors <- c(
+    HSC         = "#4D9221",
+    CLP         = "#1b9e77",
+    ProB        = "#d95f02",
+    PreB        = "#7570b3",
+    `Immature-B`= "#e7298a"
+  )
+
+  annotation_colors <- list(
+    celltype  = cell_type_colors,   # row annotation
+    cell_type = cell_type_colors,   # column annotation
+    genotype  = geno_cols
+  )
+
+  # 9) Heatmap
+  pheatmap::pheatmap(
+    heat_mat_plot,
+    cluster_rows   = FALSE,
+    cluster_cols   = FALSE,
+    show_rownames  = FALSE,
+    show_colnames  = FALSE,
+    annotation_row = row_anno_plot,
+    annotation_col = col_anno_plot,
+    annotation_colors = annotation_colors,
+    gaps_row      = gaps_row,
+    gaps_col      = gaps_col,
+    border_color  = NA,
+    main          = main_title,
+    fontsize      = 10
+  )
+
+  # 10) Build wide marker GENE table: cell types = columns, genes = rows
+  marker_with_gene <- marker_df %>%
+    left_join(
+      gene_anno_min %>% dplyr::select(peak_id, SYMBOL),
+      by = "peak_id"
+    ) %>%
+    mutate(
+      Gene = ifelse(is.na(SYMBOL) | SYMBOL == "", peak_id, SYMBOL)
+    ) %>%
+    dplyr::select(marker_for, Gene)
+
+  marker_genes_by_ct <- marker_with_gene %>%
+    group_by(marker_for) %>%
+    summarise(Gene = list(unique(Gene)), .groups = "drop")
+
+  max_len <- max(lengths(marker_genes_by_ct$Gene))
+
+  marker_genes_wide <- tibble(row = seq_len(max_len))
+  for (i in seq_len(nrow(marker_genes_by_ct))) {
+    ct <- as.character(marker_genes_by_ct$marker_for[i])
+    g  <- marker_genes_by_ct$Gene[[i]]
+    marker_genes_wide[[ct]] <- c(g, rep(NA_character_, max_len - length(g)))
+  }
+  marker_genes_wide <- marker_genes_wide %>% dplyr::select(-row)
+
+  cat("  • marker_genes_wide dim:", paste(dim(marker_genes_wide), collapse = " × "), "\n")
+
+  if (!is.null(marker_table_prefix)) {
+    out_csv <- paste0(marker_table_prefix, "_marker_genes_wide.csv")
+    readr::write_csv(marker_genes_wide, out_csv)
+    cat("  • Marker gene table written to:", out_csv, "\n")
+  }
+
+  invisible(list(
+    heat_mat_z        = heat_mat_z,
+    marker_df         = marker_df,
+    marker_genes_wide = marker_genes_wide
+  ))
+}
+
+```
+
+
+```{r}
+# ================================================================
+# 7.x Marker heatmaps for PROMOTER-only and ENHANCER-only peaks
+#   using coding-only VST matrix (mat_coding)
+# ================================================================
+stopifnot(exists("mat_coding"),
+          exists("ct_joined"),
+          exists("geno_cols"),
+          exists("promoter_ids"),
+          exists("enhancer_ids"),
+          exists("gene_anno_min"))
+
+celltype_levels_5 <- c("HSC", "CLP", "ProB", "PreB", "Immature-B")
+
+# ---------------- PROMOTER-ONLY HEATMAP -------------------------
+promoter_res <- make_tian_marker_heatmap(
+  mat_base           = mat_coding,
+  ct_joined          = ct_joined,
+  geno_cols          = geno_cols,
+  gene_anno_min      = gene_anno_min,
+  peak_subset_ids    = promoter_ids,
+  celltype_levels    = celltype_levels_5,
+  n_markers_per_ct   = 100,
+  main_title         = "Coding promoter marker peaks (HSC → CLP → ProB → PreB → Immature-B)",
+  marker_table_prefix = "promoter_markers_by_celltype"
+)
+
+# This object holds the table you asked for:
+promoter_markers_table <- promoter_res$marker_genes_wide
+head(promoter_markers_table)
+# columns: HSC, CLP, ProB, PreB, Immature-B
+# rows: top marker genes per CT (padded with NA where shorter)
+
+
+# ---------------- ENHANCER-ONLY HEATMAP -------------------------
+enhancer_res <- make_tian_marker_heatmap(
+  mat_base           = mat_coding,
+  ct_joined          = ct_joined,
+  geno_cols          = geno_cols,
+  gene_anno_min      = gene_anno_min,
+  peak_subset_ids    = enhancer_ids,
+  celltype_levels    = celltype_levels_5,
+  n_markers_per_ct   = 100,
+  main_title         = "Coding enhancer marker peaks (HSC → CLP → ProB → PreB → Immature-B)",
+  marker_table_prefix = "enhancer_markers_by_celltype"
+)
+
+enhancer_markers_table <- enhancer_res$marker_genes_wide
+head(enhancer_markers_table)
+# same structure as the promoter table
+
+```
+
+
+### 8 Exploring pro-B peaks
+
+Do ProB-specific regulatory peaks become “primed” earlier (in CLP) or stay restricted to ProB, and does this developmental activation differ by genotype (TT / TC / CC)?
+
+ProB-marker accessibility across CLP → ProB → PreB shows that the CC genotype exhibits early chromatin priming, with elevated accessibility at ProB-specific regulatory elements already in CLP, before these regions normally open. At the ProB stage, accessibility increases in all genotypes but CC remains highest, indicating a genotype-dependent amplification of the ProB regulatory program rather than a mere timing shift.
+
+```{r}
+# ================================================================
+# CHUNK 4
+# ProB marker accessibility along CLP → ProB → PreB, by genotype
+# ================================================================
+{
+  library(dplyr)
+  library(purrr)
+  library(ggplot2)
+
+  cat("\n=== CHUNK 4: ProB marker activation along CLP → ProB → PreB, by genotype ===\n")
+
+  stopifnot(
+    exists("mat_coding"),
+    exists("ct_joined"),
+    exists("gene_anno_min"),
+    exists("geno_cols")
+  )
+
+  celltype_levels <- c("HSC", "CLP", "ProB", "PreB", "Immature-B")
+
+  # ------------------------------------------------
+  # 1) Metadata aligned to mat_coding
+  # ------------------------------------------------
+  meta_marker <- ct_joined %>%
+    dplyr::transmute(
+      Sample   = as.character(Sample),
+      donor,
+      cell_type,
+      genotype = group
+    ) %>%
+    dplyr::filter(cell_type %in% celltype_levels) %>%
+    dplyr::mutate(
+      cell_type = factor(cell_type, levels = celltype_levels),
+      genotype  = factor(genotype, levels = c("TT","TC","CC"))
+    ) %>%
+    dplyr::distinct(Sample, .keep_all = TRUE)
+
+  samples_in_mat <- intersect(colnames(mat_coding), meta_marker$Sample)
+
+  meta_marker <- meta_marker %>%
+    dplyr::filter(Sample %in% samples_in_mat) %>%
+    dplyr::arrange(match(Sample, samples_in_mat))
+
+  mat_marker <- mat_coding[, meta_marker$Sample, drop = FALSE]
+
+  cat("  • meta_marker dim:", paste(dim(meta_marker), collapse = " × "), "\n")
+  cat("  • mat_marker dim:", paste(dim(mat_marker), collapse = " × "), "\n")
+  cat("  • Samples per CT:\n")
+  print(table(meta_marker$cell_type, useNA = "ifany"))
+
+  # ------------------------------------------------
+  # 2) Average VST per CT, derive ProB markers
+  # ------------------------------------------------
+  avg_by_ct <- sapply(celltype_levels, function(ct) {
+    sel <- meta_marker$Sample[meta_marker$cell_type == ct]
+    if (length(sel) == 0L) {
+      rep(NA_real_, nrow(mat_marker))
+    } else {
+      rowMeans(mat_marker[, sel, drop = FALSE])
+    }
+  })
+  colnames(avg_by_ct) <- celltype_levels
+  rownames(avg_by_ct) <- rownames(mat_marker)
+
+  cat("  • avg_by_ct dim (peaks × CTs):", paste(dim(avg_by_ct), collapse = " × "), "\n")
+
+  delta_by_ct <- lapply(seq_along(celltype_levels), function(j) {
+    focal  <- avg_by_ct[, j]
+    others <- rowMeans(avg_by_ct[, -j, drop = FALSE])
+    focal - others
+  })
+  names(delta_by_ct) <- celltype_levels
+
+  n_markers <- 100
+  markers_by_ct <- lapply(celltype_levels, function(ct) {
+    scores <- delta_by_ct[[ct]]
+    ord <- order(scores, decreasing = TRUE)
+    n_take <- min(n_markers, length(ord))
+    rownames(avg_by_ct)[ord][seq_len(n_take)]
+  })
+  names(markers_by_ct) <- celltype_levels
+
+  prob_markers <- unique(markers_by_ct$ProB)
+  prob_markers <- intersect(prob_markers, rownames(mat_marker))
+
+  cat("  • # ProB marker peaks:", length(prob_markers), "\n")
+
+  # ------------------------------------------------
+  # 3) For CLP/ProB/PreB: mean ProB-marker VST per sample
+  # ------------------------------------------------
+  target_ct <- c("CLP", "ProB", "PreB")
+
+  meta_sub <- meta_marker %>%
+    dplyr::filter(cell_type %in% target_ct)
+
+  mat_sub <- mat_marker[prob_markers, meta_sub$Sample, drop = FALSE]
+
+  score_df <- apply(mat_sub, 2, mean, na.rm = TRUE)
+  score_df <- tibble::tibble(
+    Sample   = names(score_df),
+    mean_vst = as.numeric(score_df)
+  ) %>%
+    dplyr::left_join(meta_sub, by = "Sample")
+
+  score_df <- score_df %>%
+    dplyr::mutate(
+      cell_type = droplevels(cell_type),
+      genotype  = droplevels(genotype)
+    )
+
+  cat("  • score_df rows:", nrow(score_df), "\n")
+  cat("  • Samples per CT×genotype:\n")
+  print(table(score_df$cell_type, score_df$genotype))
+
+  # ------------------------------------------------
+  # 4) PLOT
+  # ------------------------------------------------
+  plot4 <- ggplot2::ggplot(
+    score_df,
+    ggplot2::aes(x = cell_type, y = mean_vst, fill = genotype)
+  ) +
+    ggplot2::geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+    ggplot2::geom_jitter(
+      position = ggplot2::position_jitterdodge(
+        jitter.width = 0.15, dodge.width = 0.7
+      ),
+      size = 1.8,
+      alpha = 0.8
+    ) +
+    ggplot2::scale_fill_manual(values = geno_cols) +
+    ggplot2::theme_bw(base_size = 12) +
+    ggplot2::labs(
+      title = "ProB marker accessibility along CLP → ProB → PreB",
+      subtitle = "Mean VST signal at ProB marker peaks, stratified by genotype",
+      x = "Cell type",
+      y = "Mean VST (ProB markers)",
+      fill = "Genotype"
+    ) +
+    ggplot2::theme(
+      plot.title  = ggplot2::element_text(face = "bold"),
+      axis.text.x = ggplot2::element_text(angle = 45, hjust = 1)
+    )
+
+  print(plot4)
+}
+
+```
+
+
+
+
+
+
+#Thoughts
+
+## Among ProB marker peaks, which are clearly TT-high, TC-high, CC-high, or balanced?
+
+## Among ProB peaks, which ones are present only in TT, only in CC, in TT+TC, pan-genotype, etc.? And how does that split between promoters vs enhancers?
+
+## Along the CLP → ProB transition, for each genotype separately:
+
+* Which peaks are gained (ProB-only)?
+
+* Which peaks are lost (CLP-only)?
+
+* Which are maintained (shared CLP+ProB)?
+** split into promoters vs enhancers maybe?
+*** This would be presence-based (not fold-change), but it might tell if TT clones gain or lose a different set of peaks than CC clones during the CLP→ProB step 
+
+
+---
+
+# Saving for combining with sj156
+
+```{r}
+# ================================================================
+# SAVE SPAIN ATAC CORE STATE (coding-only universe)
+# ================================================================
+# suppressPackageStartupMessages({
+#     library(dplyr)
+#     library(purrr)
+# })
+# 
+# # ---- 0) Output directory shared with SJ156 core state ----
+# combined_dir <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Clarissa/snp_cell_lines_public_datasets_project/stjudes_156/atacseq/peaks_sj_156_exploration/combined_sj156_spain"
+# 
+# if (!dir.exists(combined_dir)) {
+#     dir.create(combined_dir, recursive = TRUE)
+# }
+# 
+# # ---- 1) Sanity checks: make sure key Spain objects exist ----
+# stopifnot(
+#     exists("counts"),             # consensus counts, already restricted to coding_universe
+#     exists("gene_anno_min"),
+#     exists("gene_anno_min_ext"),
+#     exists("ct_joined"),
+#     exists("geno_cols"),
+#     exists("promoter_ids"),
+#     exists("enhancer_ids"),
+#     exists("coding_peak_ids")
+# )
+# 
+# # ---- 2) Gene-level counts for Spain (coding-only peaks) ----
+# # Use SYMBOL as gene ID, aggregate all coding peaks for each gene
+# gene2peak_spain <- gene_anno_min %>%
+#     filter(!is.na(SYMBOL), SYMBOL != "") %>%
+#     distinct(SYMBOL, peak_id) %>%
+#     filter(peak_id %in% rownames(counts))
+# 
+# peaks_by_gene_spain <- split(gene2peak_spain$peak_id, gene2peak_spain$SYMBOL)
+# 
+# gene_counts_spain <- purrr::map_dfc(
+#     peaks_by_gene_spain,
+#     ~ colSums(counts[.x, , drop = FALSE])
+# )
+# 
+# gene_counts_spain <- as.matrix(gene_counts_spain)
+# rownames(gene_counts_spain) <- colnames(counts)   # samples as rownames
+# gene_counts_spain <- t(gene_counts_spain)        # genes × samples
+# 
+# # ---- 3) Per-sample metadata (full) ----
+# meta_spain <- ct_joined %>%
+#     transmute(
+#         Sample    = as.character(Sample),
+#         donor,
+#         cell_type,
+#         genotype  = group,
+#         bam_path,
+#         broadPeak_path
+#     ) %>%
+#     distinct(Sample, .keep_all = TRUE)
+# 
+# # Metadata aligned to coding-only counts (one row per column in `counts`)
+# if (exists("meta_all_coding")) {
+#     meta_spain_coding <- meta_all_coding
+# } else {
+#     meta_spain_coding <- meta_spain %>%
+#         filter(Sample %in% colnames(counts)) %>%
+#         arrange(match(Sample, colnames(counts)))
+# }
+# 
+# stopifnot(identical(meta_spain_coding$Sample, colnames(counts)))
+# 
+# # ---- 4) Build Spain core state list ----
+# spain_state <- list(
+#     # Sample-level metadata
+#     meta_spain        = meta_spain,         # full metadata (including Naive/Transitional, etc.)
+#     meta_spain_coding = meta_spain_coding,  # aligned to coding-only counts
+#     geno_cols         = geno_cols,
+#     celltype_order    = celltype_order,
+#     donor_order       = donor_order,
+#     
+#     # Peak-level info (coding-only universe)
+#     counts            = counts,             # coding-only peaks × samples
+#     anno              = anno,               # basic peak BED-like annotation
+#     gene_anno_min     = gene_anno_min,
+#     gene_anno_min_ext = gene_anno_min_ext,
+#     promoter_ids      = promoter_ids,
+#     enhancer_ids      = enhancer_ids,
+#     coding_peak_ids   = coding_peak_ids,
+#     coding_ensembl_ids = if (exists("coding_ensembl_ids")) coding_ensembl_ids else NULL,
+#     
+#     # Gene-level coding-only matrix (for integration with SJ156)
+#     gene_counts_spain = gene_counts_spain
+# )
+# 
+# # ---- 5) Save RDS ----
+# out_path <- file.path(combined_dir, "spain_atac_core_state.rds")
+# saveRDS(spain_state, file = out_path)
+# 
+# cat("\nSaved Spain ATAC core state →", out_path, "\n")
+
+```
+
+# New way of saving
+
+```{r}
+# ---- 4) Gene-level matrices: ALL coding peaks vs PROMOTER-only ----
+suppressPackageStartupMessages({
+    library(dplyr)
+    library(purrr)
+})
+
+## 4.1 Ya tienes gene_counts_spain (ALL coding peaks)
+cat("\n[Spain] gene_counts_spain (ALL coding peaks) dim: ",
+    paste(dim(gene_counts_spain), collapse = " × "), "\n", sep = "")
+
+## 4.2 Construir gene_counts_spain_prom (SOLO promotores)
+cat("[Spain] Building gene_counts_spain_prom (promoters only)...\n")
+
+counts_spain  <- counts       # misma matriz coding-only peaks × samples
+prom_ids      <- promoter_ids # vector de peak_id promotor
+ganno         <- gene_anno_min
+
+cat("    counts_spain dim: ", paste(dim(counts_spain), collapse = " × "), "\n", sep = "")
+cat("    n(promoter_ids) =", length(prom_ids), "\n")
+
+gene2peak_spain_prom <- ganno %>%
+    dplyr::filter(!is.na(SYMBOL), SYMBOL != "") %>%
+    dplyr::filter(peak_id %in% prom_ids) %>%
+    dplyr::distinct(SYMBOL, peak_id)
+
+cat("    gene–promoter pairs:", nrow(gene2peak_spain_prom), "\n")
+cat("    genes with ≥1 promoter peak:",
+    length(unique(gene2peak_spain_prom$SYMBOL)), "\n")
+
+peaks_by_gene_spain_prom <- split(gene2peak_spain_prom$peak_id,
+                                  gene2peak_spain_prom$SYMBOL)
+
+gene_counts_spain_prom <- purrr::map_dfc(
+    peaks_by_gene_spain_prom,
+    ~ colSums(counts_spain[.x, , drop = FALSE])
+)
+
+gene_counts_spain_prom <- as.matrix(gene_counts_spain_prom)
+rownames(gene_counts_spain_prom) <- colnames(counts_spain)   # muestras
+gene_counts_spain_prom <- t(gene_counts_spain_prom)          # genes × muestras
+
+cat("    gene_counts_spain_prom dim: ",
+    paste(dim(gene_counts_spain_prom), collapse = " × "), "\n", sep = "")
+
+# ---- 4.3 Spain-derived ladder marker panels (PROMOTER / ENHANCER) ----
+
+spain_prom_path <- "~/Desktop/Tzu_projects/Matt/Clarissa/snp_cell_lines_public_datasets_project/spain_group/atacseq/100_M_reads/promoter_markers_by_celltype_marker_genes_wide.csv"
+spain_enh_path  <- "~/Desktop/Tzu_projects/Matt/Clarissa/snp_cell_lines_public_datasets_project/spain_group/atacseq/100_M_reads/enhancer_markers_by_celltype_marker_genes_wide.csv"
+
+## Orden de linaje canónico usado en los heatmaps Spain
+ct_spain_order <- c("HSC", "CLP", "ProB", "PreB", "Immature-B")
+
+load_spain_panel_long <- function(path, ct_order) {
+    wide <- read.csv(path, check.names = FALSE)
+
+    wide <- wide %>%
+        dplyr::mutate(across(dplyr::everything(), ~ trimws(as.character(.))))
+
+    ## Si las columnas son exactamente los tipos celulares, reordenar al orden canónico
+    if (all(sort(colnames(wide)) == sort(ct_order))) {
+        wide <- wide[, ct_order, drop = FALSE]
+    }
+
+    wide %>%
+        tidyr::pivot_longer(
+            cols      = dplyr::everything(),
+            names_to  = "cell_type",
+            values_to = "gene"
+        ) %>%
+        dplyr::filter(!is.na(gene), gene != "") %>%
+        dplyr::mutate(cell_type = factor(cell_type, levels = ct_order))
+}
+
+panel_spain_prom_long <- load_spain_panel_long(spain_prom_path, ct_spain_order)
+panel_spain_enh_long  <- load_spain_panel_long(spain_enh_path,  ct_spain_order)
+
+cat("\n[Spain] panel_spain_prom_long dim: ",
+    paste(dim(panel_spain_prom_long), collapse = " × "), "\n", sep = "")
+cat("[Spain] panel_spain_enh_long dim: ",
+    paste(dim(panel_spain_enh_long),  collapse = " × "), "\n", sep = "")
+
+# ---- 5) Build Spain core state list (incluyendo PROM-only + panels) ----
+spain_state <- list(
+    # Sample-level metadata
+    meta_spain        = meta_spain,         # full metadata
+    meta_spain_coding = meta_spain_coding,  # alineado a 'counts'
+    geno_cols         = geno_cols,
+    celltype_order    = celltype_order,
+    donor_order       = donor_order,
+
+    # Peak-level info (coding-only universe)
+    counts             = counts,             # coding-only peaks × samples
+    anno               = anno,
+    gene_anno_min      = gene_anno_min,
+    gene_anno_min_ext  = gene_anno_min_ext,
+    promoter_ids       = promoter_ids,
+    enhancer_ids       = enhancer_ids,
+    coding_peak_ids    = coding_peak_ids,
+    coding_ensembl_ids = if (exists("coding_ensembl_ids")) coding_ensembl_ids else NULL,
+
+    # Gene-level matrices
+    gene_counts_spain      = gene_counts_spain,      # ALL coding peaks / gen
+    gene_counts_spain_prom = gene_counts_spain_prom, # SOLO promotores / gen
+
+    # Spain marker panels + ordering (for later SJ+Spain integration)
+    panel_spain_prom_long  = panel_spain_prom_long,
+    panel_spain_enh_long   = panel_spain_enh_long,
+    ct_spain_order         = ct_spain_order
+)
+
+# ---- 6) Save RDS actualizado ----
+out_path <- file.path(combined_dir, "spain_atac_core_state.rds")
+saveRDS(spain_state, file = out_path)
+
+cat("\n[Spain] Core state with gene_counts_spain_prom + Spain marker panels saved in:\n  ",
+    out_path, "\n")
+
+
+```
+
+
+
