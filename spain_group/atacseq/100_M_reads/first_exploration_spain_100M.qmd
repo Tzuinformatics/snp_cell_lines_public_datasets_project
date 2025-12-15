@@ -2813,7 +2813,7 @@ ProB-marker accessibility across CLP → ProB → PreB shows that the CC genotyp
 # New way of saving
 
 ```{r}
-# ---- 4) Gene-level matrices: ALL coding peaks vs PROMOTER-only ----
+# ---- 4) Gene-level matrices: ALL coding peaks vs PROMOTER-only vs ENHANCER-only ----
 suppressPackageStartupMessages({
     library(dplyr)
     library(purrr)
@@ -2836,10 +2836,11 @@ cat("    n(promoter_ids) =", length(prom_ids), "\n")
 gene2peak_spain_prom <- ganno %>%
     dplyr::filter(!is.na(SYMBOL), SYMBOL != "") %>%
     dplyr::filter(peak_id %in% prom_ids) %>%
+    dplyr::filter(peak_id %in% rownames(counts_spain)) %>%   # por si acaso
     dplyr::distinct(SYMBOL, peak_id)
 
 cat("    gene–promoter pairs:", nrow(gene2peak_spain_prom), "\n")
-cat("    genes with ≥1 promoter peak:",
+cat("    genes con ≥1 pico promotor:",
     length(unique(gene2peak_spain_prom$SYMBOL)), "\n")
 
 peaks_by_gene_spain_prom <- split(gene2peak_spain_prom$peak_id,
@@ -2857,7 +2858,37 @@ gene_counts_spain_prom <- t(gene_counts_spain_prom)          # genes × muestras
 cat("    gene_counts_spain_prom dim: ",
     paste(dim(gene_counts_spain_prom), collapse = " × "), "\n", sep = "")
 
-# ---- 4.3 Spain-derived ladder marker panels (PROMOTER / ENHANCER) ----
+## 4.3 Construir gene_counts_spain_enh (SOLO enhancers)
+cat("[Spain] Building gene_counts_spain_enh (enhancers only)...\n")
+
+enh_ids <- enhancer_ids
+
+gene2peak_spain_enh <- ganno %>%
+    dplyr::filter(!is.na(SYMBOL), SYMBOL != "") %>%
+    dplyr::filter(peak_id %in% enh_ids) %>%
+    dplyr::filter(peak_id %in% rownames(counts_spain)) %>%
+    dplyr::distinct(SYMBOL, peak_id)
+
+cat("    gene–enhancer pairs:", nrow(gene2peak_spain_enh), "\n")
+cat("    genes con ≥1 pico enhancer:",
+    length(unique(gene2peak_spain_enh$SYMBOL)), "\n")
+
+peaks_by_gene_spain_enh <- split(gene2peak_spain_enh$peak_id,
+                                 gene2peak_spain_enh$SYMBOL)
+
+gene_counts_spain_enh <- purrr::map_dfc(
+    peaks_by_gene_spain_enh,
+    ~ colSums(counts_spain[.x, , drop = FALSE])
+)
+
+gene_counts_spain_enh <- as.matrix(gene_counts_spain_enh)
+rownames(gene_counts_spain_enh) <- colnames(counts_spain)
+gene_counts_spain_enh <- t(gene_counts_spain_enh)   # genes × muestras
+
+cat("    gene_counts_spain_enh dim: ",
+    paste(dim(gene_counts_spain_enh), collapse = " × "), "\n", sep = "")
+
+# ---- 4.4 Spain-derived ladder marker panels (PROMOTER / ENHANCER) ----
 
 spain_prom_path <- "~/Desktop/Tzu_projects/Matt/Clarissa/snp_cell_lines_public_datasets_project/spain_group/atacseq/100_M_reads/promoter_markers_by_celltype_marker_genes_wide.csv"
 spain_enh_path  <- "~/Desktop/Tzu_projects/Matt/Clarissa/snp_cell_lines_public_datasets_project/spain_group/atacseq/100_M_reads/enhancer_markers_by_celltype_marker_genes_wide.csv"
@@ -2894,7 +2925,7 @@ cat("\n[Spain] panel_spain_prom_long dim: ",
 cat("[Spain] panel_spain_enh_long dim: ",
     paste(dim(panel_spain_enh_long),  collapse = " × "), "\n", sep = "")
 
-# ---- 5) Build Spain core state list (incluyendo PROM-only + panels) ----
+# ---- 5) Build Spain core state list (incluyendo PROM-only + ENH-only + panels) ----
 spain_state <- list(
     # Sample-level metadata
     meta_spain        = meta_spain,         # full metadata
@@ -2916,6 +2947,7 @@ spain_state <- list(
     # Gene-level matrices
     gene_counts_spain      = gene_counts_spain,      # ALL coding peaks / gen
     gene_counts_spain_prom = gene_counts_spain_prom, # SOLO promotores / gen
+    gene_counts_spain_enh  = gene_counts_spain_enh,  # SOLO enhancers / gen
 
     # Spain marker panels + ordering (for later SJ+Spain integration)
     panel_spain_prom_long  = panel_spain_prom_long,
@@ -2927,11 +2959,253 @@ spain_state <- list(
 out_path <- file.path(combined_dir, "spain_atac_core_state.rds")
 saveRDS(spain_state, file = out_path)
 
-cat("\n[Spain] Core state with gene_counts_spain_prom + Spain marker panels saved in:\n  ",
+cat("\n[Spain] Core state with gene_counts_spain_prom + gene_counts_spain_enh + Spain marker panels saved in:\n  ",
     out_path, "\n")
 
 
 ```
 
 
+```{r}
+# =====================================================================
+# SPAIN SECTION 4 — Build ALL / PROMOTER-ONLY / ENHANCER-ONLY gene counts
+# and save spain_atac_core_state.rds
+# =====================================================================
+
+suppressPackageStartupMessages({
+    library(dplyr)
+    library(purrr)
+    library(tidyr)
+})
+
+cat("\n=== SPAIN SECTION 4: Building gene-level matrices ===\n")
+
+# ---------------------------------------------------------------------
+# 0) Safety checks: these MUST exist now (and DO exist in your ls())
+# ---------------------------------------------------------------------
+stopifnot(
+    exists("counts"),            # coding-only peak counts (rows = peak_id)
+    exists("gene_anno_min"),     # SYMBOL + peak_id mapping
+    exists("promoter_ids"),
+    exists("enhancer_ids"),
+    exists("ct_joined"),
+    exists("anno"),
+    exists("gene_anno_min_ext"),
+    exists("coding_peak_ids"),
+    exists("geno_cols"),
+    exists("celltype_order"),
+    exists("donor_order")
+)
+
+# ---------------------------------------------------------------------
+# 0b) Build meta_spain and meta_spain_coding here (no assumption)
+# ---------------------------------------------------------------------
+if (!exists("meta_spain")) {
+    cat("[0b] Constructing meta_spain from ct_joined...\n")
+    meta_spain <- ct_joined %>%
+        dplyr::transmute(
+            Sample   = as.character(Sample),
+            donor,
+            cell_type,
+            genotype = group,
+            bam_path,
+            broadPeak_path
+        ) %>%
+        dplyr::distinct(Sample, .keep_all = TRUE)
+}
+
+if (!exists("meta_spain_coding")) {
+    cat("[0b] Constructing meta_spain_coding aligned to `counts`...\n")
+    if (exists("meta_all_coding")) {
+        # Re-use your existing coding-aligned metadata but force alignment to colnames(counts)
+        meta_spain_coding <- meta_all_coding %>%
+            dplyr::filter(Sample %in% colnames(counts)) %>%
+            dplyr::arrange(match(Sample, colnames(counts)))
+    } else {
+        meta_spain_coding <- meta_spain %>%
+            dplyr::filter(Sample %in% colnames(counts)) %>%
+            dplyr::arrange(match(Sample, colnames(counts)))
+    }
+}
+
+stopifnot(identical(meta_spain_coding$Sample, colnames(counts)))
+
+# ---------------------------------------------------------------------
+# 1) Build gene_counts_spain = ALL coding peaks per gene
+# ---------------------------------------------------------------------
+cat("\n[1] Building gene_counts_spain (ALL coding peaks)...\n")
+
+gene2peak_spain_all <- gene_anno_min %>%
+    dplyr::filter(!is.na(SYMBOL), SYMBOL != "") %>%
+    dplyr::distinct(SYMBOL, peak_id) %>%
+    dplyr::filter(peak_id %in% rownames(counts))
+
+cat("    • gene–peak pairs:", nrow(gene2peak_spain_all), "\n")
+cat("    • genes with ≥1 coding peak:",
+    length(unique(gene2peak_spain_all$SYMBOL)), "\n")
+
+peaks_by_gene_spain_all <- split(
+    gene2peak_spain_all$peak_id,
+    gene2peak_spain_all$SYMBOL
+)
+
+gene_counts_spain <- purrr::map_dfc(
+    peaks_by_gene_spain_all,
+    ~ colSums(counts[.x, , drop = FALSE])
+)
+
+gene_counts_spain <- as.matrix(gene_counts_spain)
+rownames(gene_counts_spain) <- colnames(counts)   # samples
+gene_counts_spain <- t(gene_counts_spain)         # genes × samples
+
+cat("    • gene_counts_spain dim:",
+    paste(dim(gene_counts_spain), collapse = " × "), "\n")
+
+# ---------------------------------------------------------------------
+# 2) PROMOTER-ONLY per gene
+# ---------------------------------------------------------------------
+cat("\n[2] Building gene_counts_spain_prom (PROMOTER-only)...\n")
+
+gene2peak_spain_prom <- gene_anno_min %>%
+    dplyr::filter(!is.na(SYMBOL), SYMBOL != "") %>%
+    dplyr::filter(peak_id %in% promoter_ids) %>%
+    dplyr::filter(peak_id %in% rownames(counts)) %>%
+    dplyr::distinct(SYMBOL, peak_id)
+
+cat("    • gene–promoter pairs:", nrow(gene2peak_spain_prom), "\n")
+cat("    • genes with ≥1 promoter peak:",
+    length(unique(gene2peak_spain_prom$SYMBOL)), "\n")
+
+peaks_by_gene_spain_prom <- split(
+    gene2peak_spain_prom$peak_id,
+    gene2peak_spain_prom$SYMBOL
+)
+
+gene_counts_spain_prom <- purrr::map_dfc(
+    peaks_by_gene_spain_prom,
+    ~ colSums(counts[.x, , drop = FALSE])
+)
+
+gene_counts_spain_prom <- as.matrix(gene_counts_spain_prom)
+rownames(gene_counts_spain_prom) <- colnames(counts)
+gene_counts_spain_prom <- t(gene_counts_spain_prom)   # genes × samples
+
+cat("    • gene_counts_spain_prom dim:",
+    paste(dim(gene_counts_spain_prom), collapse = " × "), "\n")
+
+# ---------------------------------------------------------------------
+# 3) ENHANCER-ONLY per gene
+# ---------------------------------------------------------------------
+cat("\n[3] Building gene_counts_spain_enh (ENHANCER-only)...\n")
+
+gene2peak_spain_enh <- gene_anno_min %>%
+    dplyr::filter(!is.na(SYMBOL), SYMBOL != "") %>%
+    dplyr::filter(peak_id %in% enhancer_ids) %>%
+    dplyr::filter(peak_id %in% rownames(counts)) %>%
+    dplyr::distinct(SYMBOL, peak_id)
+
+cat("    • gene–enhancer pairs:", nrow(gene2peak_spain_enh), "\n")
+cat("    • genes with ≥1 enhancer peak:",
+    length(unique(gene2peak_spain_enh$SYMBOL)), "\n")
+
+peaks_by_gene_spain_enh <- split(
+    gene2peak_spain_enh$peak_id,
+    gene2peak_spain_enh$SYMBOL
+)
+
+gene_counts_spain_enh <- purrr::map_dfc(
+    peaks_by_gene_spain_enh,
+    ~ colSums(counts[.x, , drop = FALSE])
+)
+
+gene_counts_spain_enh <- as.matrix(gene_counts_spain_enh)
+rownames(gene_counts_spain_enh) <- colnames(counts)
+gene_counts_spain_enh <- t(gene_counts_spain_enh)   # genes × samples
+
+cat("    • gene_counts_spain_enh dim:",
+    paste(dim(gene_counts_spain_enh), collapse = " × "), "\n")
+
+# ---------------------------------------------------------------------
+# 4) Spain-derived ladder marker panels (PROMOTER / ENHANCER)
+# ---------------------------------------------------------------------
+cat("\n[4] Loading Spain marker panels...\n")
+
+spain_prom_path <- "~/Desktop/Tzu_projects/Matt/Clarissa/snp_cell_lines_public_datasets_project/spain_group/atacseq/100_M_reads/promoter_markers_by_celltype_marker_genes_wide.csv"
+spain_enh_path  <- "~/Desktop/Tzu_projects/Matt/Clarissa/snp_cell_lines_public_datasets_project/spain_group/atacseq/100_M_reads/enhancer_markers_by_celltype_marker_genes_wide.csv"
+
+ct_spain_order <- c("HSC", "CLP", "ProB", "PreB", "Immature-B")
+
+load_spain_panel_long <- function(path, ct_order) {
+    wide <- read.csv(path, check.names = FALSE)
+    
+    wide <- wide %>%
+        dplyr::mutate(across(dplyr::everything(), ~ trimws(as.character(.))))
+    
+    if (all(sort(colnames(wide)) == sort(ct_order))) {
+        wide <- wide[, ct_order, drop = FALSE]
+    }
+    
+    wide %>%
+        tidyr::pivot_longer(
+            cols      = dplyr::everything(),
+            names_to  = "cell_type",
+            values_to = "gene"
+        ) %>%
+        dplyr::filter(!is.na(gene), gene != "") %>%
+        dplyr::mutate(cell_type = factor(cell_type, levels = ct_order))
+}
+
+panel_spain_prom_long <- load_spain_panel_long(spain_prom_path, ct_spain_order)
+panel_spain_enh_long  <- load_spain_panel_long(spain_enh_path,  ct_spain_order)
+
+cat("    • panel_spain_prom_long dim:",
+    paste(dim(panel_spain_prom_long), collapse = " × "), "\n")
+cat("    • panel_spain_enh_long dim:",
+    paste(dim(panel_spain_enh_long),  collapse = " × "), "\n")
+
+# ---------------------------------------------------------------------
+# 5) Build Spain core state list (incluyendo PROM-only + ENH-only + panels)
+# ---------------------------------------------------------------------
+combined_dir <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Clarissa/snp_cell_lines_public_datasets_project/stjudes_156/atacseq/peaks_sj_156_exploration/combined_sj156_spain"
+if (!dir.exists(combined_dir)) dir.create(combined_dir, recursive = TRUE)
+
+spain_state <- list(
+    # Sample-level metadata
+    meta_spain        = meta_spain,         # full metadata
+    meta_spain_coding = meta_spain_coding,  # aligned to 'counts'
+    geno_cols         = geno_cols,
+    celltype_order    = celltype_order,
+    donor_order       = donor_order,
+    
+    # Peak-level info (coding-only universe)
+    counts             = counts,             # coding-only peaks × samples
+    anno               = anno,
+    gene_anno_min      = gene_anno_min,
+    gene_anno_min_ext  = gene_anno_min_ext,
+    promoter_ids       = promoter_ids,
+    enhancer_ids       = enhancer_ids,
+    coding_peak_ids    = coding_peak_ids,
+    coding_ensembl_ids = if (exists("coding_ensembl_ids")) coding_ensembl_ids else NULL,
+    
+    # Gene-level matrices
+    gene_counts_spain      = gene_counts_spain,      # ALL coding peaks / gene
+    gene_counts_spain_prom = gene_counts_spain_prom, # PROMOTER-only / gene
+    gene_counts_spain_enh  = gene_counts_spain_enh,  # ENHANCER-only / gene
+    
+    # Spain marker panels + ordering (for later SJ+Spain integration)
+    panel_spain_prom_long  = panel_spain_prom_long,
+    panel_spain_enh_long   = panel_spain_enh_long,
+    ct_spain_order         = ct_spain_order
+)
+
+# ---------------------------------------------------------------------
+# 6) Save RDS actualizado
+# ---------------------------------------------------------------------
+out_path <- file.path(combined_dir, "spain_atac_core_state.rds")
+saveRDS(spain_state, file = out_path)
+
+cat("\n[Spain] Core state with ALL / PROM / ENH gene matrices + Spain marker panels saved in:\n  ",
+    out_path, "\n")
+
+```
 

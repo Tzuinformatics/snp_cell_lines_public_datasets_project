@@ -1,0 +1,337 @@
+TITULO: VERSION ORDENADA DE ANALISIS
+
+------------------------------------------------------------------------
+
+1\) LIBRERIAS
+
+```{r}
+# ============================================================
+# MÓDULO 1 — Cargar librerías con control de enmascaramientos
+# ============================================================
+
+library(readxl)     # leer Excel
+library(dplyr)      # manipulación de datos
+library(tidyr)      # separar texto en columnas
+library(janitor)    # clean_names y funciones de limpieza
+library(stringr)    # expresiones regulares
+library(stringi)    # quitar acentos
+library(skimr)      # resumen general de la base
+
+# Nota:
+# Si necesitas usar las funciones originales de stats:
+# stats::filter()
+# stats::lag()
+
+
+```
+
+2\) BASE Y LIMPIEZA
+
+```{r}
+# ============================================================
+# MÓDULO 2 — Cargar base + Limpieza profunda
+# ============================================================
+
+# 1) Cargar base
+datos <- read_excel("Encuesta_SMA_2025_Respuestas.xlsx")
+
+# 2) Limpiar nombres de columnas
+datos <- datos %>% 
+  janitor::clean_names()
+
+# 3) Estandarizar "sí" y "no"
+datos <- datos %>%
+  mutate(across(
+    .cols = where(is.character),
+    ~ case_when(
+        .x %in% c("Sí","SÍ","si","Si","sí","SI") ~ "si",
+        .x %in% c("No","NO","no") ~ "no",
+        TRUE ~ .x
+    )
+  ))
+
+# 4) Limpieza de texto: minúsculas, quitar acentos, pero conservar comas y guiones
+datos <- datos %>%
+  mutate(across(
+    where(is.character),
+    ~ .x %>%
+      str_to_lower() %>%
+      str_replace_all("[[:punct:]&&[^,;:_-]]", " ") %>%
+      str_squish() %>%
+      stringi::stri_trans_general("Latin-ASCII")
+  ))
+
+# 5) Estandarización de universidades
+datos <- datos %>%
+  mutate(
+    universidad_estandarizada = case_when(
+      str_detect(universidad_en_la_que_trabaja, "uadec") ~ "Universidad Autonoma de Coahuila",
+      str_detect(universidad_en_la_que_trabaja, "nuevo leon|uanl") ~ "Universidad Autonoma de Nuevo Leon",
+      str_detect(universidad_en_la_que_trabaja, "baja california") ~ "Universidad Autonoma de Baja California",
+      str_detect(universidad_en_la_que_trabaja, "tamaulipas|uat") ~ "Universidad Autonoma de Tamaulipas",
+      str_detect(universidad_en_la_que_trabaja, "puebla|buap") ~ "Benemerita Universidad Autonoma de Puebla",
+      str_detect(universidad_en_la_que_trabaja, "queretaro") ~ "Universidad Anahuac Queretaro",
+      str_detect(universidad_en_la_que_trabaja, "panamericana") ~ "Universidad Panamericana",
+      str_detect(universidad_en_la_que_trabaja, "guadalajara") ~ "Universidad de Guadalajara",
+      str_detect(universidad_en_la_que_trabaja, "monterrey|udem") ~ "Universidad de Monterrey",
+      str_detect(universidad_en_la_que_trabaja, "veracruzana") ~ "Universidad Veracruzana",
+      str_detect(universidad_en_la_que_trabaja, "chihuahua") ~ "Universidad Autonoma de Chihuahua",
+      str_detect(universidad_en_la_que_trabaja, "durango") ~ "Universidad Autonoma de Durango",
+      str_detect(universidad_en_la_que_trabaja, "sonora") ~ "Universidad de Sonora",
+      str_detect(universidad_en_la_que_trabaja, "guerrero") ~ "Universidad Autonoma de Guerrero",
+      str_detect(universidad_en_la_que_trabaja, "ceseeo") ~ "Escuela de Formacion en Ciencias de la Salud - CESEEO",
+      str_detect(universidad_en_la_que_trabaja, "urse|sureste") ~ "Universidad Regional del Sureste",
+      str_detect(universidad_en_la_que_trabaja, "unam|fac med") ~ "Universidad Nacional Autonoma de Mexico",
+      TRUE ~ "REGISTRO_MULTIPLE_REVISAR"
+    )
+  )
+
+
+
+```
+
+3\) CLASIFCAR VARIABLES
+
+```{r}
+
+# ============================================================
+# MÓDULO 3 — Clasificación de variables por bloques
+# ============================================================
+
+vars <- tibble(
+  variable = names(datos),
+  posicion = seq_along(names(datos))
+)
+
+# ============================================================
+# 1) SOCIODEMOGRAFICAS (1–17)
+# ============================================================
+
+vars <- vars %>%
+  mutate(
+    tipo = case_when(
+      posicion == 1 ~ "dicotomica",
+      posicion %in% 2:4 ~ "categorica",
+      posicion == 5 ~ "numerica",
+      posicion == 6 ~ "categorica",
+      posicion == 7 ~ "categorica",
+      posicion == 8 ~ "dicotomica",
+      posicion == 9 ~ "categorica",
+      posicion == 10 ~ "numerica",
+      posicion == 11 ~ "categorica",
+      posicion == 12 ~ "opcion_multiple",
+      posicion == 13 ~ "texto",
+      posicion == 14 ~ "categorica",
+      posicion == 15 ~ "categorica",
+      posicion == 16 ~ "opcion_multiple",
+      posicion == 17 ~ "dicotomica",
+      TRUE ~ NA_character_
+    )
+  )
+
+# ============================================================
+# Funcion para clasificar bloques por materia (36 variables)
+# ============================================================
+
+clasificar_bloque <- function(i){
+  case_when(
+    i == 1 ~ "dicotomica",
+    i == 2 ~ "categorica",
+    i == 3 ~ "texto",
+    i == 4 ~ "opcion_multiple",
+    i == 5 ~ "opcion_multiple",
+    i == 6 ~ "numerica",
+    i == 7 ~ "categorica",
+    i == 8 ~ "categorica",
+    i == 9 ~ "numerica",
+    i == 10 ~ "numerica",
+    i == 11 ~ "numerica",
+    i == 12 ~ "opcion_multiple",
+    i == 13 ~ "categorica",
+    i == 14 ~ "texto",
+    i == 15 ~ "categorica",
+    i == 16 ~ "dicotomica",
+    i == 17 ~ "texto",
+    i == 18 ~ "dicotomica",
+    i == 19 ~ "texto",
+    i == 20 ~ "opcion_multiple",
+    i == 21 ~ "numerica",
+    i == 22 ~ "categorica",
+    i == 23 ~ "texto",
+    i == 24 ~ "dicotomica",
+    i == 25 ~ "dicotomica",
+    i == 26 ~ "dicotomica",
+    i == 27 ~ "categorica",
+    i == 28 ~ "dicotomica",
+    i == 29 ~ "categorica",
+    i == 30 ~ "dicotomica",
+    i == 31 ~ "opcion_multiple",
+    i == 32 ~ "numerica",
+    i == 33 ~ "opcion_multiple",
+    i == 34 ~ "numerica",
+    i == 35 ~ "numerica",
+    i == 36 ~ "dicotomica",
+    TRUE ~ "sin_clasificar"
+  )
+}
+
+# Aplicar la función a los 4 bloques de materias
+
+vars$tipo[18:53]   <- sapply(1:36, clasificar_bloque)
+vars$tipo[54:89]   <- sapply(1:36, clasificar_bloque)
+vars$tipo[90:125]  <- sapply(1:36, clasificar_bloque)
+vars$tipo[126:161] <- sapply(1:36, clasificar_bloque)
+
+# ============================================================
+# BLOQUE IA (162–173)
+# ============================================================
+
+vars$tipo[162] <- "dicotomica"
+vars$tipo[163] <- "categorica"
+vars$tipo[164] <- "opcion_multiple"
+vars$tipo[165] <- "opcion_multiple"
+vars$tipo[166] <- "categorica"
+vars$tipo[167] <- "categorica"
+vars$tipo[168] <- "categorica"
+vars$tipo[169] <- "categorica"
+vars$tipo[170] <- "categorica"
+vars$tipo[171] <- "dicotomica"
+vars$tipo[172] <- "categorica"
+vars$tipo[173] <- "categorica"
+
+# ============================================================
+# UNIVERSIDAD ESTANDARIZADA (174)
+# ============================================================
+
+vars$tipo[174] <- "categorica"
+
+# ============================================================
+# REVISIÓN FINAL
+# ============================================================
+
+vars %>% count(tipo)
+vars %>% filter(tipo == "sin_clasificar")
+
+
+```
+
+4\) ANALISIS DESCRIPTIVO
+
+```{r}
+
+# ============================================================
+# MÓDULO 4 — Análisis descriptivo según tipo de variable
+# ============================================================
+
+# Objetos donde iremos guardando cada tipo de análisis
+desc_dicotomicas   <- list()
+desc_categoricas   <- list()
+desc_numericas     <- list()
+desc_opc_multiple  <- list()
+desc_texto         <- list()
+
+# ============================================================
+# Funciones auxiliares para cada tipo
+# ============================================================
+
+# ---- Dicotómicas (sí/no)
+analizar_dicotomica <- function(vec) {
+  tab <- table(vec, useNA = "ifany")
+  prop <- round(prop.table(tab) * 100, 1)
+  tibble(
+    respuesta = names(tab),
+    frecuencia = as.numeric(tab),
+    porcentaje = as.numeric(prop)
+  )
+}
+
+# ---- Categóricas
+analizar_categorica <- function(vec) {
+  tab <- table(vec, useNA = "ifany")
+  prop <- round(prop.table(tab) * 100, 1)
+  tibble(
+    categoria = names(tab),
+    frecuencia = as.numeric(tab),
+    porcentaje = as.numeric(prop)
+  )
+}
+
+# ---- Numéricas
+analizar_numerica <- function(vec) {
+  vec_num <- suppressWarnings(as.numeric(vec))
+  tibble(
+    n = sum(!is.na(vec_num)),
+    media = mean(vec_num, na.rm = TRUE),
+    mediana = median(vec_num, na.rm = TRUE),
+    sd = sd(vec_num, na.rm = TRUE),
+    iqr = IQR(vec_num, na.rm = TRUE),
+    minimo = min(vec_num, na.rm = TRUE),
+    maximo = max(vec_num, na.rm = TRUE)
+  )
+}
+
+# ---- Opción múltiple (separadas por comas)
+analizar_opcion_multiple <- function(vec) {
+  sep <- tibble(x = vec) %>%
+    separate_rows(x, sep = ",") %>%
+    mutate(x = str_squish(x)) %>%
+    filter(x != "")
+
+  sep %>% count(x, name = "frecuencia") %>%
+    arrange(desc(frecuencia))
+}
+
+# ---- Texto libre
+analizar_texto <- function(vec) {
+  tibble(
+    respuestas_no_vacias = sum(vec != "" & !is.na(vec))
+  )
+}
+
+# ============================================================
+# Bucle maestro: aplica según tipo
+# ============================================================
+
+for(i in seq_len(nrow(vars))){
+
+  varname <- vars$variable[i]
+  tipo    <- vars$tipo[i]
+  vec     <- datos[[varname]]
+
+  if(tipo == "dicotomica"){
+    desc_dicotomicas[[varname]] <- analizar_dicotomica(vec)
+
+  } else if(tipo == "categorica"){
+    desc_categoricas[[varname]] <- analizar_categorica(vec)
+
+  } else if(tipo == "numerica"){
+    desc_numericas[[varname]] <- analizar_numerica(vec)
+
+  } else if(tipo == "opcion_multiple"){
+    desc_opc_multiple[[varname]] <- analizar_opcion_multiple(vec)
+
+  } else if(tipo == "texto"){
+    desc_texto[[varname]] <- analizar_texto(vec)
+  }
+}
+
+# ============================================================
+# Mensajes de resumen
+# ============================================================
+
+cat("\n[✔] Análisis descriptivo COMPLETADO.\n")
+cat("Dicotómicas analizadas: ", length(desc_dicotomicas), "\n")
+cat("Categóricas analizadas: ", length(desc_categoricas), "\n")
+cat("Numéricas analizadas: ", length(desc_numericas), "\n")
+cat("Opción múltiple analizadas: ", length(desc_opc_multiple), "\n")
+cat("Texto analizadas: ", length(desc_texto), "\n\n")
+
+cat("Para ver una tabla descriptiva de una variable:\n",
+    "  desc_categoricas[['genero']]\n",
+    "  desc_dicotomicas[['es_docente_de_la_materia_de_anatomia']]\n",
+    "  desc_numericas[['edad_en_anos']]\n",
+    "  desc_opc_multiple[['que_metodos_de_ensenanza_utiliza_22']]\n",
+    "  desc_texto[['nombre_del_curso_que_imparte']]\n",
+    sep = "")
+
+```

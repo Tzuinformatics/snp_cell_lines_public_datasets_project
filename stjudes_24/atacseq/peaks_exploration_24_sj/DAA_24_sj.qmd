@@ -5,7 +5,7 @@ library(rtracklayer)
 ```
 
 ```{r}
-snp_summary <- read.csv("../snp_summary_merged.csv")
+snp_summary <- read.csv("../24_sj_snp_summary_merged.csv")
 
 data_dict <- read.csv("../../GEO_data_dict_sj24_ATAC_RNA_GSM_SRR_mapping.csv")
 
@@ -61,60 +61,121 @@ fastq_files <- data.frame(
 )
 
 
+# Dependencies
 library(dplyr)
 library(stringr)
 
-# Step 1: Extract SRR IDs from FASTQ filenames
-fastq_files <- fastq_files %>%
-  mutate(SRR_ID = str_extract(fqfiles, "SRR[0-9]+"))
-
-# Step 2: Left join with data_dict using SRR_ID
+# --- FASTQ annotation: add SRR_ID and join to data_dict ---
 fastq_annotated <- fastq_files %>%
+  mutate(SRR_ID = str_extract(fqfiles, "SRR[0-9]+")) %>%
   left_join(data_dict, by = "SRR_ID")
 
-# Step 3: View the result
+# Quick check
 head(fastq_annotated)
 
-
-library(dplyr)
-library(stringr)
-
-# Step 1: Extract SRR IDs from FASTQ filenames
-fastq_files <- fastq_files %>%
-  mutate(SRR_ID = str_extract(fqfiles, "SRR[0-9]+"))
-
-# Step 2: Left join with data_dict using SRR_ID
-fastq_annotated <- fastq_files %>%
-  left_join(data_dict, by = "SRR_ID")
-
-# Step 3: View the result
-head(fastq_annotated)
-
-
-library(dplyr)
-library(stringr)
-
-# Step 1: Extract atac_number from snp_summary$Sample
+# --- Harmonize atac_number in both datasets ---
+# From snp_summary$Sample
 snp_summary <- snp_summary %>%
   mutate(atac_number = str_extract(Sample, "24_atac_number_[0-9]+"))
 
-# Step 2: Extract atac_number from fastq_annotated$fqfiles
+# From fastq_annotated$fqfiles
 fastq_annotated <- fastq_annotated %>%
   mutate(atac_number = str_extract(fqfiles, "24_atac_number_[0-9]+"))
 
-# Step 3: Get unique mapping of atac_number to Sample_Title
+# --- Build mapping: atac_number -> Sample_Title (unique) ---
 atac_to_title <- fastq_annotated %>%
   select(atac_number, Sample_Title) %>%
   distinct()
 
-# Step 4: Join with snp_summary to update Sample names
+# --- Update snp_summary with GEO titles ---
 snp_summary_updated <- snp_summary %>%
   left_join(atac_to_title, by = "atac_number") %>%
-  mutate(Sample = Sample_Title) %>%
+  mutate(Sample = coalesce(Sample_Title, Sample)) %>%   # keep original Sample if title missing
   select(-atac_number, -Sample_Title)
 
-# Step 5: View updated snp_summary
+# Quick check
 head(snp_summary_updated)
+
+# ====== Packages ======
+suppressPackageStartupMessages({
+    library(ggplot2)
+    library(dplyr)
+    library(tidyr)
+})
+
+# snp_summary_updated is assumed to be your data.frame with columns:
+# Sample, Ref, A, C, G, T, N, Total, ALT.
+
+# ====== Long format for stacked bars (A/C/G/T/N) ======
+snp_long <- snp_summary_updated %>%
+    dplyr::select(Sample, A, C, G, T, N) %>%
+    tidyr::pivot_longer(cols = c(A, C, G, T, N),
+                        names_to = "Base",
+                        values_to = "Reads")
+
+# Optional: order samples by total reads (descending) for readability
+sample_order <- snp_summary_updated %>%
+    dplyr::mutate(Total_reads = A + C + G + T + N) %>%
+    dplyr::arrange(dplyr::desc(Total_reads)) %>%
+    dplyr::pull(Sample)
+
+snp_long <- snp_long %>%
+    dplyr::mutate(Sample = factor(Sample, levels = sample_order))
+
+# ====== Stacked bar plot (counts) ======
+ggplot(snp_long, aes(x = Sample, y = Reads, fill = Base)) +
+    geom_bar(stat = "identity") +
+    labs(x = "Sample",
+         y = "Number of reads at SNP",
+         fill = "Base") +
+    theme_minimal(base_size = 12) +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+
+
+# Required
+library(dplyr)
+
+# 1) Your manual genotype calls
+genotype_map <- tibble::tribble(
+  ~Sample,         ~Genotype,
+  "ATAC_10_REP1",  "TT",
+  "ATAC_11_REP1",  "TC",
+  "ATAC_12_REP1",  "TT",
+  "ATAC_13_REP1",  "CC",
+  "ATAC_14_REP1",  "CC",
+  "ATAC_15_REP1",  "CC",
+  "ATAC_16_REP1",  "TC",
+  "ATAC_17_REP1",  "TT",
+  "ATAC_18_REP1",  "TT",
+  "ATAC_19_REP1",  "TC",
+  "ATAC_1_REP1",   "TT",
+  "ATAC_20_REP1",  "TT",
+  "ATAC_21_REP1",  "TC",
+  "ATAC_22_REP1",  "TC",
+  "ATAC_23_REP1",  "TT",
+  "ATAC_24_REP1",  "TT",
+  "ATAC_2_REP1",   "TC",
+  "ATAC_3_REP1",   "TT",
+  "ATAC_4_REP1",   "TC",
+  "ATAC_5_REP1",   "TT",
+  "ATAC_6_REP1",   "TC",
+  "ATAC_7_REP1",   "CC",
+  "ATAC_8_REP1",   "TC",
+  "ATAC_9_REP1",   "CC"
+)
+
+# 2) Join onto your summary table
+snp_summary_with_geno <- snp_summary_updated %>%
+  dplyr::left_join(genotype_map, by = "Sample")
+
+# 3) Quick sanity checks (optional)
+# Any samples in your map not present in the summary?
+setdiff(genotype_map$Sample, snp_summary_updated$Sample)
+# Any samples without a genotype after join?
+snp_summary_with_geno %>% dplyr::filter(is.na(Genotype))
+
+# 4) Save (optional)
+write.csv(snp_summary_with_geno,"atac_sj19_snp_summary_with_geno.csv")
 
 ```
 

@@ -1,0 +1,731 @@
+
+```{r}
+# ============================================================
+# 1 — Libraries + sample dictionary (St. Jude RNAseq)
+# ============================================================
+
+library(tidyverse)
+library(stringr)
+
+# Base dir with all RNAseq* folders and BAMs
+base_dir <- "/Volumes/Analysts/Julian/Matt/Clarissa/snp_project_ARID/RNAseq/RNA_seq_bulk/24_stjudes_rnaseq_bulk/nf_core_rnaseq_out/star_salmon"
+
+# Get ONLY sample directories (non-recursive)
+
+sample_dirs <- list.dirs(base_dir, recursive = FALSE, full.names = TRUE) %>%
+  keep(~ str_starts(basename(.x), "RNA"))
+
+# Extract folder names (e.g. "RNAseq_1_TT_SRR13074069")
+sample_names <- basename(sample_dirs)
+
+# Sanity check
+cat("Found sample folders:\n")
+print(sample_names)
+
+# ------------------------------------------------------------
+# Build sample_metadata with genotype, SRR, numeric index
+# ------------------------------------------------------------
+sample_metadata <- tibble(
+  Sample = sample_names,
+  files  = file.path(sample_dirs, "quant.sf")
+) %>%
+  mutate(
+    # RNAseq index (1,2,...,19)
+    sample_index = str_match(Sample, "^RNAseq_([0-9]+)_")[,2] %>% as.integer(),
+
+    # genotype: TT / TC / CC (we already fixed 15→CC, 19→TC)
+    genotype = str_match(Sample, "^RNAseq_[0-9]+_([A-Z]+)_")[,2] %>%
+      factor(levels = c("TT", "TC", "CC")),
+
+    # SRR ID
+    srr = str_extract(Sample, "SRR[0-9]+"),
+
+    # a simple group ID if needed later
+    group = genotype
+  )
+
+# Set rownames for compatibility with downstream code style
+rownames(sample_metadata) <- sample_metadata$Sample
+
+cat("\nSample metadata preview:\n")
+print(sample_metadata)
+
+```
+
+
+# 2️⃣ Load GTF and build tx2gene
+
+(same logic as your example; just reusing your GTF path)
+
+
+```{r}
+# ============================================================
+# 2 — Load GTF and construct tx2gene
+# ============================================================
+
+library(rtracklayer)
+library(tidyverse)
+
+gtf_path <- "/Users/cojulian/Desktop/Tzu_projects/Matt/reference_genomces/Homo_sapiens.GRCh38.113.gtf.gz"
+
+cat("Importing GTF from:\n", gtf_path, "\n")
+
+gtf <- rtracklayer::import(gtf_path)
+gtf_df <- as.data.frame(gtf)
+
+# standard chromosomes
+standard_chroms <- c(as.character(1:22), "X", "Y", "MT")
+
+gtf_df <- gtf_df[gtf_df$seqnames %in% standard_chroms, ]
+
+tx2gene_df <- gtf_df %>%
+  dplyr::select(transcript_id, gene_id, gene_name) %>%
+  dplyr::distinct(transcript_id, gene_id, gene_name) %>%
+  tidyr::drop_na(transcript_id, gene_id)
+
+cat("\nDimensions of tx2gene_df:\n")
+print(dim(tx2gene_df))
+
+head(tx2gene_df)
+
+```
+
+
+
+```{r}
+# ============================================================
+# 3 — Build human_coldata from sample_metadata
+# ============================================================
+
+human_coldata <- sample_metadata %>%
+  dplyr::mutate(files = files) %>%
+  dplyr::select(Sample, files, sample_index, genotype, srr, group)
+
+# Ensure rownames == Sample (required for some Bioc tools)
+rownames(human_coldata) <- human_coldata$Sample
+
+cat("\nhuman_coldata preview:\n")
+print(human_coldata)
+
+```
+
+
+```{r}
+# ============================================================
+# 4 — Build gene-level count matrix from quant.sf
+# ============================================================
+
+# Read first quant.sf to define gene universe + row order
+first_file <- human_coldata$files[1]
+cat("Reading first quant.sf:\n", first_file, "\n")
+
+tmp <- readr::read_tsv(first_file, show_col_types = FALSE) %>%
+  dplyr::inner_join(tx2gene_df, by = c("Name" = "transcript_id")) %>%
+  dplyr::group_by(gene_id) %>%
+  dplyr::summarise(
+    NumReads = as.integer(round(sum(NumReads))),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(gene_id)
+
+num_genes <- nrow(tmp)
+num_samples <- nrow(human_coldata)
+
+cat("\nGene universe size:", num_genes, "\n")
+cat("Number of samples:", num_samples, "\n")
+
+# Initialize matrix
+sf.df <- matrix(
+  NA_integer_,
+  nrow = num_genes,
+  ncol = num_samples,
+  dimnames = list(tmp$gene_id, human_coldata$Sample)
+)
+
+# Fill first column
+sf.df[, 1] <- tmp$NumReads
+
+# Loop over remaining samples
+for (i in seq_len(num_samples)[-1]) {
+  f <- human_coldata$files[i]
+  s <- human_coldata$Sample[i]
+
+  cat("Processing sample", s, "from file:\n", f, "\n")
+
+  tmp_i <- readr::read_tsv(f, show_col_types = FALSE) %>%
+    dplyr::inner_join(tx2gene_df, by = c("Name" = "transcript_id")) %>%
+    dplyr::group_by(gene_id) %>%
+    dplyr::summarise(
+      NumReads = as.integer(round(sum(NumReads))),
+      .groups = "drop"
+    ) %>%
+    dplyr::arrange(gene_id)
+
+  # Defensive check: same gene set and order
+  if (!identical(tmp$gene_id, tmp_i$gene_id)) {
+    stop("Gene ID mismatch for sample ", s,
+         " — gene sets or order differ. Check tx2gene/quant.sf.")
+  }
+
+  sf.df[, i] <- tmp_i$NumReads
+}
+
+# Convert to a more friendly object for inspection
+Salmon.matrix <- sf.df
+
+cat("\nRaw count matrix dimensions (genes x samples):\n")
+print(dim(Salmon.matrix))
+
+# Quick peek at first genes / samples
+Salmon.matrix[1:5, 1:5]
+
+```
+
+# 5
+
+```{r}
+# ============================================================
+# 5 — Genotype-aware expression filtering
+# ============================================================
+
+library(dplyr)
+library(tidyr)
+library(tibble)
+
+# ------------------------------------------------------------
+# Parameters
+# ------------------------------------------------------------
+expression_threshold    <- 10  # counts to call "expressed"
+min_clones_per_genotype <- 1   # how many samples in a genotype must pass threshold
+
+cat("\n[GENO-FILTER] expression_threshold      =", expression_threshold, "\n")
+cat("[GENO-FILTER] min_clones_per_genotype   =", min_clones_per_genotype, "\n")
+
+# ------------------------------------------------------------
+# Long format: gene_id × Sample × counts
+# ------------------------------------------------------------
+Salmon_long <- Salmon.matrix %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("gene_id") %>%
+  tidyr::pivot_longer(
+    cols      = -gene_id,
+    names_to  = "Sample",
+    values_to = "counts"
+  )
+
+# ------------------------------------------------------------
+# Build metadata for join WITHOUT duplicating 'Sample'
+# human_coldata already has a 'Sample' column
+# ------------------------------------------------------------
+human_meta <- human_coldata %>%
+  as.data.frame() %>%
+  dplyr::select(Sample, genotype)
+
+# Join genotype info
+Salmon_long <- Salmon_long %>%
+  dplyr::left_join(human_meta, by = "Sample")
+
+# Optional sanity check: samples with missing genotype
+missing_geno <- Salmon_long %>%
+  dplyr::filter(is.na(genotype)) %>%
+  dplyr::distinct(Sample)
+
+if (nrow(missing_geno) > 0) {
+  cat("\n[GENO-FILTER] WARNING: Samples with missing genotype after join:\n")
+  print(missing_geno)
+}
+
+# Make genotype an ordered factor (TT, TC, CC)
+Salmon_long <- Salmon_long %>%
+  dplyr::mutate(genotype = factor(genotype, levels = c("TT", "TC", "CC")))
+
+cat("\n[GENO-FILTER] Long-format table preview:\n")
+print(head(Salmon_long))
+
+# ------------------------------------------------------------
+# For each gene × genotype: how many samples are "expressed"?
+# ------------------------------------------------------------
+gene_genotype_summary <- Salmon_long %>%
+  dplyr::group_by(gene_id, genotype) %>%
+  dplyr::summarise(
+    n_samples_ge_thresh = sum(counts >= expression_threshold),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    present_in_genotype = n_samples_ge_thresh >= min_clones_per_genotype
+  )
+
+cat("\n[GENO-FILTER] gene_genotype_summary preview:\n")
+print(head(gene_genotype_summary))
+
+# ------------------------------------------------------------
+# For each gene: in how many genotypes is it expressed?
+# Keep any gene that is expressed in ≥1 genotype.
+# ------------------------------------------------------------
+genes_to_keep <- gene_genotype_summary %>%
+  dplyr::group_by(gene_id) %>%
+  dplyr::summarise(
+    n_genotypes_present = sum(present_in_genotype, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::filter(n_genotypes_present >= 1) %>%
+  dplyr::pull(gene_id)
+
+cat("\n[GENO-FILTER] Number of genes BEFORE filter:", nrow(Salmon.matrix), "\n")
+cat("[GENO-FILTER] Number of genes AFTER  filter:", length(genes_to_keep), "\n")
+
+# ------------------------------------------------------------
+# Build filtered matrix
+# ------------------------------------------------------------
+sf.df.filtered <- Salmon.matrix[genes_to_keep, , drop = FALSE]
+
+cat("\n[GENO-FILTER] Filtered matrix dimensions (genes × samples):\n")
+print(dim(sf.df.filtered))
+
+# Quick sanity peek
+sf.df.filtered[1:5, 1:5]
+```
+
+
+# 6 PCA
+
+```{r}
+# ============================================================
+# 6 — PCA on log2 counts (top variable genes)
+# ============================================================
+
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+library(tibble)
+
+# ------------------------------------------------------------
+# Log2-transform
+# ------------------------------------------------------------
+log_counts <- log2(sf.df.filtered + 1)
+
+cat("\n[PCA] Log2-transformed matrix dimensions:\n")
+print(dim(log_counts))
+
+# ------------------------------------------------------------
+# Select top variable genes
+# ------------------------------------------------------------
+top_n_genes <- 5000
+gene_vars <- apply(log_counts, 1, var)
+gene_order <- names(sort(gene_vars, decreasing = TRUE))
+n_use <- min(top_n_genes, length(gene_order))
+top_genes <- gene_order[seq_len(n_use)]
+
+cat("\n[PCA] Using", n_use, "most variable genes.\n")
+
+log_counts_top <- log_counts[top_genes, , drop = FALSE]
+
+# ------------------------------------------------------------
+# PCA
+# ------------------------------------------------------------
+pca_res <- prcomp(t(log_counts_top), scale. = TRUE, center = TRUE)
+
+var_expl <- (pca_res$sdev^2) / sum(pca_res$sdev^2) * 100
+pc1_lab  <- paste0("PC1 (", round(var_expl[1], 1), "%)")
+pc2_lab  <- paste0("PC2 (", round(var_expl[2], 1), "%)")
+
+# ------------------------------------------------------------
+# PCA dataframe (NO rownames_to_column!)
+# ------------------------------------------------------------
+pca_df <- as.data.frame(pca_res$x) %>%
+  rownames_to_column("Sample") %>%
+  left_join(
+    human_coldata %>% as.data.frame() %>% select(Sample, genotype, sample_index, srr),
+    by = "Sample"
+  )
+
+cat("\n[PCA] PCA dataframe preview:\n")
+print(head(pca_df))
+
+# ------------------------------------------------------------
+# PCA plot
+# ------------------------------------------------------------
+ggplot(pca_df, aes(x = PC1, y = PC2, color = genotype, label = sample_index)) +
+  geom_point(size = 3, alpha = 0.9) +
+  geom_text_repel(size = 3, max.overlaps = 20) +
+  labs(
+    x = pc1_lab,
+    y = pc2_lab,
+    color = "Genotype",
+    title = "PCA of SJ19 RNAseq (Salmon counts, genotype-aware filtered)"
+  ) +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+## 7 plot of Arid
+
+
+```{r}
+# ============================================================
+# 7 — Boxplot of ARID5B Expression INCLUDING sample_index
+# ============================================================
+
+library(ggplot2)
+library(dplyr)
+library(tibble)
+library(ggrepel)
+
+cat("\n[ARID5B] Extracting ARID5B (ENSG00000150347) expression ...\n")
+
+# ------------------------------------------------------------
+# Extract ARID5B counts from log-transformed matrix
+# ------------------------------------------------------------
+arid5b_id <- "ENSG00000150347"
+
+if (!(arid5b_id %in% rownames(log_counts))) {
+  stop("[ARID5B] ERROR: ARID5B gene ID not found in log_counts matrix.")
+}
+
+arid5b_vec <- log_counts[arid5b_id, ]
+
+# ------------------------------------------------------------
+# Build dataframe for plotting
+# ------------------------------------------------------------
+arid5b_df <- tibble(
+  Sample      = names(arid5b_vec),
+  log2_expr   = as.numeric(arid5b_vec)
+) %>%
+  left_join(
+    human_coldata %>% 
+      as.data.frame() %>% 
+      select(Sample, genotype, sample_index),
+    by = "Sample"
+  )
+
+cat("\n[ARID5B] Preview of ARID5B expression table:\n")
+print(head(arid5b_df))
+
+# Ensure genotype is factor ordered TT → TC → CC
+arid5b_df <- arid5b_df %>%
+  mutate(genotype = factor(genotype, levels = c("TT", "TC", "CC")))
+
+# ------------------------------------------------------------
+# Boxplot WITH jitter labels using sample_index
+# ------------------------------------------------------------
+ggplot(arid5b_df, aes(x = genotype, y = log2_expr, fill = genotype)) +
+  geom_boxplot(alpha = 0.8, outlier.shape = NA) +
+  geom_jitter(aes(label = sample_index), 
+              width = 0.15, size = 3, alpha = 0.9, color = "black") +
+  ggrepel::geom_text_repel(aes(label = sample_index),
+                           size = 3, max.overlaps = 20) +
+  scale_fill_manual(values = c("TT" = "#1f78b4", "TC" = "#33a02c", "CC" = "#e31a1c")) +
+  labs(
+    title = "Expression of ARID5B (ENSG00000150347)",
+    x = "Genotype",
+    y = "Log2 Expression (Salmon counts + 1)",
+    caption = "Numbers represent sample_index"
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    legend.position = "none"
+  )
+```
+
+## Loading Ilarias
+
+
+```{r}
+# ============================================================
+# 1 — Load curated Ilaria panel & basic exploration
+#     File: clean_ilarias_700_genes.csv
+# ============================================================
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(readr)
+  library(tibble)
+  library(stringr)
+})
+
+panel_path <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Clarissa/snp_cell_lines_public_datasets_project/sj_expression_arid5b_Wenjian/clean_ilarias_700_genes.csv"
+
+cat("\n[ILARIA-LOAD] Reading panel from:\n  ", panel_path, "\n", sep = "")
+
+df_raw <- readr::read_csv(panel_path, show_col_types = FALSE)
+
+cat("\n[ILARIA-LOAD] Raw panel dimensions (rows × cols):\n")
+print(dim(df_raw))
+
+cat("\n[ILARIA-LOAD] Column names (cell types):\n")
+print(colnames(df_raw))
+
+cat("\n[ILARIA-LOAD] Raw head():\n")
+print(head(df_raw, 5))
+
+# ------------------------------------------------------------
+# 1.1 — Clean: trim whitespace, convert "" → NA
+# ------------------------------------------------------------
+df_updated <- df_raw %>%
+  dplyr::mutate(across(
+    everything(),
+    ~ {
+      x <- as.character(.)
+      x <- stringr::str_trim(x)
+      dplyr::na_if(x, "")
+    }
+  ))
+
+cat("\n[ILARIA-LOAD] After cleaning: NAs per cell-type column:\n")
+na_counts <- colSums(is.na(df_updated))
+print(na_counts)
+
+cat("\n[ILARIA-LOAD] Cleaned head(df_updated):\n")
+print(head(df_updated, 5))
+
+# ------------------------------------------------------------
+# 1.2 — Panel in long form (cell_type × gene)
+# ------------------------------------------------------------
+panel_long <- df_updated %>%
+  tidyr::pivot_longer(
+    everything(),
+    names_to  = "cell_type",
+    values_to = "gene"
+  ) %>%
+  dplyr::filter(!is.na(gene), gene != "")
+
+cat("\n[ILARIA-LOAD] panel_long dimensions (rows):\n")
+print(nrow(panel_long))
+
+cat("\n[ILARIA-LOAD] Unique cell types in panel_long:\n")
+print(sort(unique(panel_long$cell_type)))
+
+panel_genes <- panel_long %>%
+  dplyr::distinct(gene) %>%
+  dplyr::pull(gene)
+
+cat("\n[ILARIA-LOAD] Panel size (unique HGNC genes):", length(panel_genes), "\n")
+
+# ------------------------------------------------------------
+# 1.3 — Duplicate marker check across cell types
+# ------------------------------------------------------------
+panel_dups <- panel_long %>%
+  dplyr::group_by(gene) %>%
+  dplyr::summarise(
+    cell_types   = paste(sort(unique(cell_type)), collapse = ", "),
+    n_cell_types = dplyr::n_distinct(cell_type),
+    .groups      = "drop"
+  ) %>%
+  dplyr::filter(n_cell_types > 1) %>%
+  dplyr::arrange(gene)
+
+cat("\n[ILARIA-LOAD] Number of genes used in >1 cell type:", nrow(panel_dups), "\n")
+if (nrow(panel_dups) > 0) {
+  cat("[ILARIA-LOAD] Example duplicated markers (first 10):\n")
+  print(utils::head(panel_dups, 10))
+}
+
+# ------------------------------------------------------------
+# 1.4 — Define ct_levels and a basic color palette
+#       (for ComplexHeatmap / pheatmap later)
+# ------------------------------------------------------------
+ct_levels <- colnames(df_updated)
+cat("\n[ILARIA-LOAD] ct_levels (order used for modules / plots):\n")
+print(ct_levels)
+
+# Simple default palette; you can overwrite later with your own
+if (!exists("cell_type_colors")) {
+  cell_type_colors <- setNames(
+    grDevices::rainbow(length(ct_levels)),
+    ct_levels
+  )
+  cat("\n[ILARIA-LOAD] Initialized cell_type_colors with rainbow() (one per cell type).\n")
+}
+
+# ------------------------------------------------------------
+# 1.5 — Quick summary: markers per cell type
+# ------------------------------------------------------------
+markers_per_ct <- panel_long %>%
+  dplyr::group_by(cell_type) %>%
+  dplyr::summarise(
+    n_markers = dplyr::n_distinct(gene),
+    .groups   = "drop"
+  ) %>%
+  dplyr::arrange(cell_type)
+
+cat("\n[ILARIA-LOAD] Markers per cell type (distinct genes):\n")
+print(markers_per_ct)
+
+cat("\n[ILARIA-LOAD] Panel loaded and explored. Objects available:\n")
+cat("  - df_updated      : cleaned wide panel (genes in rows, cell types in cols)\n")
+cat("  - panel_long      : long table (cell_type × gene)\n")
+cat("  - panel_genes     : vector of unique HGNC genes\n")
+cat("  - panel_dups      : genes present in >1 cell type\n")
+cat("  - ct_levels       : ordered vector of cell types\n")
+cat("  - cell_type_colors: named palette for cell types\n\n")
+
+```
+
+
+
+## Heatmap
+
+```{r}
+# ============================================================
+# 3.5p — Tian-style dominance heatmap (pheatmap version)
+#        Ilaria marker-based modules + genotype annotation
+# ============================================================
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(pheatmap)
+})
+
+cat("\n[PHEAT] Building pheatmap dominance map from avg_z_by_ct...\n")
+# avg_z_by_ct must be: rows = cell types, columns = samples,
+# values = mean z-score of Ilaria marker genes per lineage × sample.
+stopifnot(exists("avg_z_by_ct"),
+          exists("ct_levels"),
+          exists("human_coldata"))
+
+cat("[PHEAT] avg_z_by_ct dimensions (cell_types × samples):\n")
+print(dim(avg_z_by_ct))
+
+# ------------------------------------------------------------
+# 0) Define palettes EXACTLY as requested
+# ------------------------------------------------------------
+cell_type_colors <- c(
+  HSCMPP        = "#fb8072",
+  GMP           = "#bebada",
+  pDC           = "#ffd92f",
+  EarlyLymphoid = "#f781bf",
+  ProB          = "#ff33ff",
+  PreB          = "#00e5c0",
+  B             = "#00bfff"
+)
+
+margin_colors <- c(
+  "Q1 (lowest)" = "#c7e9c0",
+  "Q2"          = "#a1d99b",
+  "Q3"          = "#74c476",
+  "Q4 (highest)"= "#238b45"
+)
+
+# You can tune genotype colors as you like
+genotype_colors <- c(
+  TT = "#f65e0dff",
+  TC = "#0c2e18ff",
+  CC = "#d7a419ff"
+)
+
+# Sanity: ensure rownames of avg_z_by_ct match ct_levels (marker modules)
+stopifnot(all(rownames(avg_z_by_ct) %in% ct_levels))
+
+# ------------------------------------------------------------
+# Align samples with human_coldata and keep only common ones
+# ------------------------------------------------------------
+common_samples <- intersect(colnames(avg_z_by_ct), human_coldata$Sample)
+if (length(common_samples) < ncol(avg_z_by_ct)) {
+  cat("[PHEAT] WARNING: some samples in avg_z_by_ct are missing in human_coldata; dropping them.\n")
+}
+avg_z_by_ct <- avg_z_by_ct[, common_samples, drop = FALSE]
+
+geno_df <- human_coldata %>%
+  as.data.frame() %>%
+  dplyr::filter(Sample %in% common_samples) %>%
+  dplyr::select(Sample, genotype)
+
+# Reorder geno_df to match columns of avg_z_by_ct
+geno_df <- geno_df[match(colnames(avg_z_by_ct), geno_df$Sample), , drop = FALSE]
+
+# ------------------------------------------------------------
+# 1) Winner, runner-up, margin (Tian-style dominance)
+# ------------------------------------------------------------
+top_idx    <- apply(avg_z_by_ct, 2, which.max)
+second_idx <- apply(avg_z_by_ct, 2, function(v) order(v, decreasing = TRUE)[2])
+
+dominant_tbl <- tibble::tibble(
+  sample       = colnames(avg_z_by_ct),
+  top_ct       = rownames(avg_z_by_ct)[top_idx],
+  top_score    = mapply(function(j, i)  avg_z_by_ct[i,  j],
+                        seq_along(top_idx),    top_idx),
+  second_ct    = rownames(avg_z_by_ct)[second_idx],
+  second_score = mapply(function(j, i2) avg_z_by_ct[i2, j],
+                        seq_along(second_idx), second_idx)
+) %>%
+  dplyr::mutate(
+    margin   = top_score - second_score,
+    genotype = geno_df$genotype
+  )
+
+cat("\n[PHEAT] Dominant lineage (first 10 samples):\n")
+print(utils::head(dominant_tbl, 10))
+
+# ------------------------------------------------------------
+# 2) Column order (winner → margin → top_score)
+# ------------------------------------------------------------
+col_order <- order(
+  factor(dominant_tbl$top_ct, levels = ct_levels),
+  -dominant_tbl$margin,
+  -dominant_tbl$top_score
+)
+avg_z_by_ct_ord <- avg_z_by_ct[, col_order, drop = FALSE]
+dominant_tbl    <- dominant_tbl[col_order, ]
+
+cat("\n[PHEAT] Ordered avg_z_by_ct_ord dimensions:\n")
+print(dim(avg_z_by_ct_ord))
+
+# ------------------------------------------------------------
+# 3) Margin bins + full annotation (top_ct, margin, genotype)
+# ------------------------------------------------------------
+margin_bins <- cut(
+  dominant_tbl$margin,
+  breaks = quantile(dominant_tbl$margin, probs = seq(0, 1, 0.25), na.rm = TRUE),
+  include.lowest = TRUE,
+  labels = c("Q1 (lowest)", "Q2", "Q3", "Q4 (highest)")
+)
+
+ann_col <- data.frame(
+  top_ct   = factor(dominant_tbl$top_ct, levels = ct_levels),
+  margin   = margin_bins,
+  genotype = factor(dominant_tbl$genotype, levels = c("TT", "TC", "CC")),
+  row.names = dominant_tbl$sample
+)
+
+# ------------------------------------------------------------
+# 4) Gaps between winner blocks (by top_ct)
+# ------------------------------------------------------------
+top_ct_run <- rle(as.character(ann_col$top_ct))
+if (length(top_ct_run$lengths) > 1) {
+  gaps_col <- cumsum(top_ct_run$lengths)[-length(top_ct_run$lengths)]
+} else {
+  gaps_col <- NULL
+}
+gaps_row <- seq_len(nrow(avg_z_by_ct_ord) - 1)
+
+# ------------------------------------------------------------
+# 5) Color scale for z-scores
+# ------------------------------------------------------------
+z_col_fun <- colorRampPalette(c("blue", "white", "red"))(201)
+
+# ------------------------------------------------------------
+# 6) pheatmap: marker-defined modules × samples
+# ------------------------------------------------------------
+pheatmap::pheatmap(
+  avg_z_by_ct_ord,
+  color            = z_col_fun,
+  cluster_rows     = FALSE,
+  cluster_cols     = FALSE,
+  show_rownames    = TRUE,
+  show_colnames    = FALSE,
+  annotation_col   = ann_col,
+  annotation_colors = list(
+    top_ct   = cell_type_colors,
+    margin   = margin_colors,
+    genotype = genotype_colors
+  ),
+  gaps_col         = gaps_col,
+  gaps_row         = gaps_row,
+  border_color     = NA,
+  main             = "Per-sample dominant lineage (St. Jude RNAseq; Ilaria marker modules)"
+)
+
+cat("\n[PHEAT] pheatmap dominance map drawn (cell types defined by marker expression).\n")
+
+```## 
