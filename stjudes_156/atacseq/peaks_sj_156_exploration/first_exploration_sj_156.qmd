@@ -3611,368 +3611,359 @@ Ditch transitional B on both matrix and umap
 
 ```{r}
 # =====================================================================
-# ATAC — Ilaria dominance map with column-scaled module scores
-#        (no sample should be "red for all lineages")
-# =====================================================================
+# ATAC — ILARIA DOMINANCE MAP (ALL PEAKS; TSS-BASED COLLAPSE)
+#        + ONE-PEAK-PER-GENE (closest-to-TSS across ALL peaks)
+#        + QC for this strategy
+#
+# Rationale:
+#   - Avoid "big gene = more peaks = more votes" by enforcing 1 gene = 1 vote
+#   - For ALL peaks, we collapse peak→gene by selecting, per gene, the peak
+#     with minimal abs(distanceToTSS) (i.e., most proximal peak overall).
+#
 # Requires:
-#   - counts_all_gene : matrix [genes × samples] (ATAC gene-level counts)
-#   - meta_sj         : data.frame with columns Sample, genotype
+#   - counts   : matrix [peaks × samples] (ATAC peak-level counts)
+#   - anno_df  : data.frame with peak_id, SYMBOL, distanceToTSS (annotation optional)
+#   - meta_sj  : data.frame with Sample, genotype
+#
+# Produces:
+#   - counts_all_gene              (gene matrix; one peak per gene)
+#   - avg_z_by_ct_ATAC_raw        (raw module scores)
+#   - avg_z_by_ct_ATAC            (column-scaled module scores)
+#   - dominant_tbl_ATAC           (winner + margin)
+#   - ann_col_ATAC                (pheatmap annotations)
+#   - ALL-peaks dominance heatmap
 # =====================================================================
 
 suppressPackageStartupMessages({
-    library(dplyr)
-    library(readr)
-    library(tibble)
-    library(tidyr)
-    library(pheatmap)
+  library(dplyr)
+  library(tidyr)
+  library(readr)
+  library(tibble)
+  library(pheatmap)
+  library(stringr)
 })
 
-cat("\n[ILARIA-HEATMAP/ALL] =============================================\n")
-cat("[ILARIA-HEATMAP/ALL] Starting heatmap generation for ALL PEAKS\n")
+cat("\n[ILARIA/ALL-TSS] =============================================\n")
+cat("[ILARIA/ALL-TSS] ALL PEAKS — one peak per gene (closest-to-TSS)\n")
 
-# ------------------------------------------------
-# 0. Sanity: peak-level counts and annotation
-# ------------------------------------------------
-cat("[ILARIA-HEATMAP/ALL] Checking peak-level `counts` and `anno_df`...\n")
-cat("  • counts class: ", paste(class(counts), collapse = ", "), "\n", sep = "")
-cat("  • counts dim   : ", paste(dim(counts), collapse = " x "), "\n", sep = "")
+# ---------------------------------------------------------------------
+# 0 — Sanity checks
+# ---------------------------------------------------------------------
+if (!exists("counts"))  stop("[ILARIA/ALL-TSS] ERROR: `counts` not found.")
+if (!exists("anno_df")) stop("[ILARIA/ALL-TSS] ERROR: `anno_df` not found.")
+if (!exists("meta_sj")) stop("[ILARIA/ALL-TSS] ERROR: `meta_sj` not found.")
 
-if (is.null(rownames(counts)) || is.null(colnames(counts))) {
-    stop("[ILARIA-HEATMAP/ALL] ERROR: `counts` must have both rownames (features) and colnames (samples).")
-}
-
-if (!exists("anno_df")) {
-    stop("[ILARIA-HEATMAP/ALL] ERROR: `anno_df` not found. Run the annotatePeak chunk first.")
-}
-
-cat("  • anno_df dim  : ", paste(dim(anno_df), collapse = " x "), "\n", sep = "")
-cat("  • anno_df cols : ", paste(colnames(anno_df), collapse = ", "), "\n", sep = "")
-
-# anno_df must have peak_id + SYMBOL
+stopifnot(!is.null(rownames(counts)), !is.null(colnames(counts)))
 stopifnot(all(c("peak_id", "SYMBOL") %in% colnames(anno_df)))
-
-# ------------------------------------------------
-# 0.1 Build peak → gene (SYMBOL) mapping
-# ------------------------------------------------
-cat("\n[ILARIA-HEATMAP/ALL] Building peak → gene mapping from anno_df...\n")
-
-gene_map <- anno_df %>%
-    dplyr::select(peak_id, SYMBOL) %>%
-    filter(!is.na(SYMBOL), SYMBOL != "") %>%
-    distinct()
-
-cat("  • gene_map rows (peak_id with SYMBOL): ", nrow(gene_map), "\n", sep = "")
-cat("  • unique SYMBOLs                     : ", length(unique(gene_map$SYMBOL)), "\n", sep = "")
-
-# overlap between counts and gene_map
-peaks_in_counts <- rownames(counts)
-common_peaks    <- intersect(peaks_in_counts, gene_map$peak_id)
-
-cat("  • peaks in counts          : ", length(peaks_in_counts), "\n", sep = "")
-cat("  • peaks in gene_map        : ", length(unique(gene_map$peak_id)), "\n", sep = "")
-cat("  • common peaks (used)      : ", length(common_peaks), "\n", sep = "")
-
-if (length(common_peaks) == 0L) {
-    stop("[ILARIA-HEATMAP/ALL] ERROR: No overlap between rownames(counts) and gene_map$peak_id.")
+if (!("distanceToTSS" %in% colnames(anno_df))) {
+  stop("[ILARIA/ALL-TSS] ERROR: anno_df must contain `distanceToTSS` for TSS-based collapsing.")
 }
 
-# ------------------------------------------------
-# 0.2 Build gene-level ALL-PEAKS matrix (sum of peaks per SYMBOL)
-# ------------------------------------------------
-cat("\n[ILARIA-HEATMAP/ALL] Aggregating peak counts to gene-level (ALL PEAKS)...\n")
+cat("[0] counts dim (peaks × samples): ", paste(dim(counts), collapse = " × "), "\n", sep = "")
+cat("[0] anno_df dim (rows × cols): ", paste(dim(anno_df), collapse = " × "), "\n", sep = "")
 
-# Convert counts to data frame for easier join
-counts_df <- as.data.frame(counts)
-counts_df$peak_id <- rownames(counts_df)
-
-# Restrict to common peaks and join SYMBOL
-counts_gene_df <- gene_map %>%
-    filter(peak_id %in% common_peaks) %>%
-    left_join(counts_df, by = "peak_id")
-
-cat("  • rows after join (peak x sample with SYMBOL): ",
-    nrow(counts_gene_df), "\n", sep = "")
-
-# Group by SYMBOL and sum across peaks for each gene
-counts_gene_summarised <- counts_gene_df %>%
-    dplyr::select(-peak_id) %>%
-    group_by(SYMBOL) %>%
-    summarise(across(.cols = where(is.numeric), .fns = sum), .groups = "drop")
-
-cat("  • gene-level rows (SYMBOL): ",
-    nrow(counts_gene_summarised), "\n", sep = "")
-
-# Convert back to matrix
-counts_all_gene <- counts_gene_summarised %>%
-    as.data.frame()
-
-rownames(counts_all_gene) <- counts_all_gene$SYMBOL
-counts_all_gene$SYMBOL    <- NULL
-
-counts_all_gene <- as.matrix(counts_all_gene)
-
-cat("  • counts_all_gene dim (genes x samples): ",
-    paste(dim(counts_all_gene), collapse = " x "), "\n", sep = "")
 # ---------------------------------------------------------------------
-# 1 — Load & clean Ilaria panel
+# 1 — Load Ilaria panel (if needed)
 # ---------------------------------------------------------------------
-panel_path <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Clarissa/snp_cell_lines_public_datasets_project/sj_expression_arid5b_Wenjian/clean_ilarias_700_genes.csv"
+if (!exists("panel_long") || !exists("panel_genes") || !exists("ct_levels")) {
 
-cat("[1] Loading curated Ilaria panel:\n    ", panel_path, "\n", sep = "")
-df_raw <- readr::read_csv(panel_path, show_col_types = FALSE)
+  cat("\n[1] Loading curated Ilaria panel (objects not found)...\n")
 
-cat("[1] Raw panel dim (rows × cols): ",
-    paste(dim(df_raw), collapse = " × "), "\n", sep = "")
-cat("[1] Raw cell-type columns:\n")
-print(colnames(df_raw))
+  panel_path <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Clarissa/snp_cell_lines_public_datasets_project/sj_expression_arid5b_Wenjian/clean_ilarias_700_genes.csv"
+  cat("    • panel_path = ", panel_path, "\n", sep = "")
 
-df_updated <- df_raw %>%
+  df_raw <- readr::read_csv(panel_path, show_col_types = FALSE)
+
+  df_updated <- df_raw %>%
     dplyr::mutate(
-        dplyr::across(
-            .cols = dplyr::everything(),
-            .fns  = ~ {
-                x <- as.character(.)
-                x <- stringr::str_trim(x)
-                dplyr::na_if(x, "")
-            }
-        )
+      dplyr::across(
+        .cols = dplyr::everything(),
+        .fns  = ~ {
+          x <- as.character(.)
+          x <- stringr::str_trim(x)
+          dplyr::na_if(x, "")
+        }
+      )
     )
 
-panel_long <- df_updated %>%
+  panel_long <- df_updated %>%
     tidyr::pivot_longer(
-        cols      = dplyr::everything(),
-        names_to  = "cell_type",
-        values_to = "gene"
+      cols      = dplyr::everything(),
+      names_to  = "cell_type",
+      values_to = "gene"
     ) %>%
     dplyr::filter(!is.na(gene), gene != "")
 
-panel_genes <- unique(panel_long$gene)
-ct_levels   <- colnames(df_updated)
+  panel_genes <- unique(panel_long$gene)
+  ct_levels   <- colnames(df_updated)
 
-cat("[1] Cleaned panel:\n")
-cat("    • unique marker genes : ", length(panel_genes), "\n", sep = "")
-cat("    • cell_type levels    : ", paste(ct_levels, collapse = " → "), "\n", sep = "")
-
-markers_per_ct <- panel_long %>%
-    dplyr::group_by(cell_type) %>%
-    dplyr::summarise(n_markers = dplyr::n_distinct(gene), .groups = "drop")
-
-cat("[1] Markers per cell type:\n")
-print(markers_per_ct)
-
-panel_dups <- panel_long %>%
-    dplyr::group_by(gene) %>%
-    dplyr::summarise(
-        n_cell_types = dplyr::n_distinct(cell_type),
-        .groups      = "drop"
-    ) %>%
-    dplyr::filter(n_cell_types > 1L)
-
-cat("[1] Genes used in >1 lineage: ", nrow(panel_dups), "\n", sep = "")
-
-
-# ---------------------------------------------------------------------
-# 2 — Subset ATAC matrix to Ilaria genes
-# ---------------------------------------------------------------------
-cat("\n[2] Subsetting ATAC gene matrix to Ilaria genes...\n")
-
-if (!exists("counts_all_gene")) {
-    stop("[2] ERROR: `counts_all_gene` not found. Build gene-level matrix first.")
+  cat("[1] Panel loaded:\n")
+  cat("    • unique marker genes : ", length(panel_genes), "\n", sep = "")
+  cat("    • cell_type levels    : ", paste(ct_levels, collapse = " → "), "\n", sep = "")
 }
 
-cat("[2] counts_all_gene dim (genes × samples): ",
-    paste(dim(counts_all_gene), collapse = " × "), "\n", sep = "")
+# ---------------------------------------------------------------------
+# 2 — Build ALL-peaks TSS-based peak→gene map + choose ONE peak per gene
+# ---------------------------------------------------------------------
+cat("\n[2] Building TSS-based peak→gene map (ALL peaks) + selecting closest peak per gene...\n")
+
+anno_tss <- anno_df %>%
+  dplyr::mutate(
+    .tss_dist = suppressWarnings(as.numeric(as.character(.data$distanceToTSS))),
+    .abs_tss  = abs(.tss_dist)
+  )
+
+cat("[2-QC] distanceToTSS |abs| summary:\n")
+print(summary(anno_tss$.abs_tss))
+
+n_na_dist <- sum(is.na(anno_tss$.abs_tss))
+cat("[2-QC] peaks with NA distanceToTSS after coercion: ", n_na_dist, "\n", sep = "")
+
+gene_map_all <- anno_tss %>%
+  dplyr::filter(!is.na(SYMBOL), SYMBOL != "") %>%
+  dplyr::select(peak_id, SYMBOL, .tss_dist, .abs_tss, dplyr::any_of("annotation")) %>%
+  dplyr::distinct()
+
+common_peaks_all <- intersect(rownames(counts), gene_map_all$peak_id)
+cat("[2] peaks with SYMBOL (anno): ", nrow(gene_map_all), "\n", sep = "")
+cat("[2] overlap with counts rownames: ", length(common_peaks_all), "\n", sep = "")
+
+if (length(common_peaks_all) == 0L) {
+  stop("[2] ERROR: No overlap between gene_map_all$peak_id and rownames(counts).")
+}
+
+# QC: peaks per gene (ALL peaks)
+peaks_per_gene_all <- gene_map_all %>%
+  dplyr::filter(peak_id %in% common_peaks_all) %>%
+  dplyr::count(SYMBOL, name = "n_peaks") %>%
+  dplyr::arrange(dplyr::desc(n_peaks))
+
+cat("[2-QC] peaks-per-gene summary (ALL peaks with SYMBOL):\n")
+print(summary(peaks_per_gene_all$n_peaks))
+cat("[2-QC] top genes by # peaks (first 10):\n")
+print(utils::head(peaks_per_gene_all, 10))
+
+# One peak per gene: closest-to-TSS across ALL peaks
+gene_map_one <- gene_map_all %>%
+  dplyr::filter(peak_id %in% common_peaks_all) %>%
+  dplyr::group_by(SYMBOL) %>%
+  dplyr::slice_min(.abs_tss, with_ties = FALSE) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(SYMBOL, peak_id, .tss_dist, .abs_tss) %>%
+  dplyr::distinct()
+
+cat("[2] selected 1 peak/gene (closest-to-TSS across ALL peaks): ", nrow(gene_map_one), "\n", sep = "")
+stopifnot(!anyDuplicated(gene_map_one$SYMBOL))
+
+# QC: any selected peak maps to >1 gene?
+genes_per_peak_all <- gene_map_one %>%
+  dplyr::count(peak_id, name = "n_genes") %>%
+  dplyr::arrange(dplyr::desc(n_genes))
+
+n_ambig_peak <- sum(genes_per_peak_all$n_genes > 1)
+cat("[2-QC] selected peaks mapping to >1 gene: ", n_ambig_peak, "\n", sep = "")
+
+# ---------------------------------------------------------------------
+# 3 — Build gene matrix (genes × samples) using ONE peak per gene
+# ---------------------------------------------------------------------
+cat("\n[3] Building counts_all_gene (genes × samples) using ONE peak/gene...\n")
+
+counts_all_gene <- counts[gene_map_one$peak_id, , drop = FALSE]
+rownames(counts_all_gene) <- gene_map_one$SYMBOL
+
+cat("[3] counts_all_gene dim (genes × samples): ", paste(dim(counts_all_gene), collapse = " × "), "\n", sep = "")
+stopifnot(!anyDuplicated(rownames(counts_all_gene)))
+stopifnot(all(colnames(counts_all_gene) == colnames(counts)))
+
+# OPTIONAL QC (fast-ish): compare one-peak vs sum-of-peaks BUT ONLY for Ilaria genes
+cat("\n[3-QC] OPTIONAL: one-peak vs SUM-OF-PEAKS comparison (restricted to Ilaria genes)...\n")
+
+gene_map_panel <- gene_map_all %>%
+  dplyr::filter(SYMBOL %in% panel_genes, peak_id %in% common_peaks_all) %>%
+  dplyr::select(peak_id, SYMBOL) %>%
+  dplyr::distinct()
+
+cat("[3-QC] Ilaria-mapped peaks for SUM comparison: ", nrow(gene_map_panel), "\n", sep = "")
+cat("[3-QC] unique Ilaria genes with ≥1 peak: ", length(unique(gene_map_panel$SYMBOL)), "\n", sep = "")
+
+if (nrow(gene_map_panel) > 0) {
+  counts_panel_df <- as.data.frame(counts[unique(gene_map_panel$peak_id), , drop = FALSE])
+  counts_panel_df$peak_id <- rownames(counts_panel_df)
+
+  sum_join <- gene_map_panel %>%
+    dplyr::left_join(counts_panel_df, by = "peak_id", relationship = "many-to-many")
+
+  counts_all_gene_sum_panel <- sum_join %>%
+    dplyr::select(-peak_id) %>%
+    dplyr::group_by(SYMBOL) %>%
+    dplyr::summarise(dplyr::across(dplyr::where(is.numeric), sum), .groups = "drop") %>%
+    as.data.frame()
+
+  rownames(counts_all_gene_sum_panel) <- counts_all_gene_sum_panel$SYMBOL
+  counts_all_gene_sum_panel$SYMBOL <- NULL
+  counts_all_gene_sum_panel <- as.matrix(counts_all_gene_sum_panel)
+
+  common_g <- intersect(rownames(counts_all_gene), rownames(counts_all_gene_sum_panel))
+  cat("[3-QC] genes comparable (one-peak vs sum): ", length(common_g), "\n", sep = "")
+
+  if (length(common_g) > 50) {
+    m1 <- rowMeans(counts_all_gene[common_g, , drop = FALSE], na.rm = TRUE)
+    m2 <- rowMeans(counts_all_gene_sum_panel[common_g, , drop = FALSE], na.rm = TRUE)
+    cat("[3-QC] Spearman corr of gene mean signal (one-peak vs sum; Ilaria genes): ",
+        round(stats::cor(m1, m2, method = "spearman", use = "pairwise.complete.obs"), 3), "\n", sep = "")
+  }
+}
+
+# ---------------------------------------------------------------------
+# 4 — Subset to Ilaria genes & z-score per gene across samples
+# ---------------------------------------------------------------------
+cat("\n[4] Subsetting to Ilaria genes & z-scoring per gene...\n")
 
 genes_in_atac <- intersect(rownames(counts_all_gene), panel_genes)
-cat("[2] Overlap genes_in_atac: ", length(genes_in_atac), " / ",
-    nrow(counts_all_gene), " genes\n", sep = "")
+cat("[4] genes in (ALL one-peak ∩ Ilaria): ", length(genes_in_atac), "\n", sep = "")
+if (length(genes_in_atac) == 0L) stop("[4] ERROR: No Ilaria genes found in counts_all_gene.")
 
 atac_mat <- counts_all_gene[genes_in_atac, , drop = FALSE]
-cat("[2] atac_mat dim (subset): ",
-    paste(dim(atac_mat), collapse = " × "), "\n", sep = "")
-
-
-# ---------------------------------------------------------------------
-# 3 — Per-gene z-score across samples
-# ---------------------------------------------------------------------
-cat("\n[3] Z-scoring per gene across samples...\n")
+cat("[4] atac_mat dim (Ilaria genes × samples): ", paste(dim(atac_mat), collapse = " × "), "\n", sep = "")
 
 atac_z_gene <- t(scale(t(atac_mat)))
 atac_z_gene[is.na(atac_z_gene)] <- 0
 
-cat("[3] Sanity check — first 5 genes × 5 samples (z-scores):\n")
+cat("[4] Example gene z-scores (5 genes × 5 samples):\n")
 print(round(atac_z_gene[1:5, 1:5, drop = FALSE], 3))
 
-col_means_z <- apply(atac_z_gene, 2, mean)
-col_sds_z   <- apply(atac_z_gene, 2, sd)
-
-cat("[3] Distribution of per-sample mean(z) across genes:\n")
-print(summary(col_means_z))
-cat("[3] Distribution of per-sample sd(z) across genes:\n")
-print(summary(col_sds_z))
-
-
-# ---------------------------------------------------------------------
-# 4 — Expand to gene×cell-type rows (duplicate genes across lineages)
-# ---------------------------------------------------------------------
-cat("\n[4] Expanding to gene×cell-type rows...\n")
-
-panel_expanded <- panel_long %>%
-    dplyr::filter(gene %in% genes_in_atac) %>%
-    dplyr::mutate(row_id = paste(gene, cell_type, sep = "|"))
-
-cat("[4] panel_expanded rows: ", nrow(panel_expanded), "\n", sep = "")
-cat("[4] unique row_id       : ", length(unique(panel_expanded$row_id)), "\n", sep = "")
-
-atac_expanded <- panel_expanded %>%
-    dplyr::select(row_id, gene, cell_type) %>%
-    dplyr::left_join(
-        atac_z_gene %>%
-            as.data.frame() %>%
-            tibble::rownames_to_column("gene"),
-        by = "gene"
-    )
-
-cat("[4] atac_expanded rows after join: ", nrow(atac_expanded), "\n", sep = "")
-
-mat_expanded <- atac_expanded %>%
-    dplyr::select(-gene, -cell_type) %>%
-    tibble::column_to_rownames("row_id") %>%
-    as.matrix()
-
-cat("[4] mat_expanded dim (gene×ct rows × samples): ",
-    paste(dim(mat_expanded), collapse = " × "), "\n", sep = "")
-
+# QC: marker overlap per cell type
+cat("\n[4-QC] Marker overlap per cell_type under ALL one-peak strategy:\n")
+marker_overlap <- panel_long %>%
+  dplyr::group_by(cell_type) %>%
+  dplyr::summarise(
+    n_markers_panel   = dplyr::n_distinct(gene),
+    n_markers_present = sum(unique(gene) %in% genes_in_atac),
+    frac_present      = n_markers_present / n_markers_panel,
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(dplyr::desc(frac_present))
+print(marker_overlap)
 
 # ---------------------------------------------------------------------
-# 5 — Build raw module matrix: avg_z_by_ct_ATAC_raw
+# 5 — Raw module matrix (CT × samples)
 # ---------------------------------------------------------------------
-cat("\n[5] Computing raw module activity matrix (avg_z_by_ct_ATAC_raw)...\n")
-
-ct_for_row <- panel_expanded$cell_type
-names(ct_for_row) <- panel_expanded$row_id
-ct_for_row <- ct_for_row[rownames(mat_expanded)]
-
-# check alignment
-cat("[5] Alignment check — first 5 rows:\n")
-print(head(cbind(ct_for_row = ct_for_row[1:5],
-                 rowname   = names(ct_for_row)[1:5])))
+cat("\n[5] Computing raw module matrix (avg_z_by_ct_ATAC_raw)...\n")
 
 avg_z_by_ct_ATAC_raw <- do.call(
-    rbind,
-    lapply(ct_levels, function(ct) {
-        idx <- which(ct_for_row == ct)
-        colMeans(mat_expanded[idx, , drop = FALSE], na.rm = TRUE)
-    })
+  rbind,
+  lapply(ct_levels, function(ct) {
+
+    genes_ct <- panel_long %>%
+      dplyr::filter(cell_type == ct, gene %in% genes_in_atac) %>%
+      dplyr::pull(gene) %>%
+      unique()
+
+    if (length(genes_ct) == 0L) {
+      cat("[5] WARNING: no markers present for cell_type ", ct, "; filling NA.\n", sep = "")
+      return(rep(NA_real_, ncol(atac_z_gene)))
+    }
+
+    colMeans(atac_z_gene[genes_ct, , drop = FALSE], na.rm = TRUE)
+  })
 )
 rownames(avg_z_by_ct_ATAC_raw) <- ct_levels
+colnames(avg_z_by_ct_ATAC_raw) <- colnames(atac_z_gene)
 
-cat("[5] avg_z_by_ct_ATAC_raw dim (7 × samples): ",
-    paste(dim(avg_z_by_ct_ATAC_raw), collapse = " × "), "\n", sep = "")
-
-cat("[5] Example raw module scores (first 5 samples):\n")
+cat("[5] avg_z_by_ct_ATAC_raw dim: ", paste(dim(avg_z_by_ct_ATAC_raw), collapse = " × "), "\n", sep = "")
+cat("[5] Example RAW module scores (first 5 samples):\n")
 print(round(avg_z_by_ct_ATAC_raw[, 1:5, drop = FALSE], 3))
 
+# QC: module SD BEFORE scaling
+cat("\n[5-QC] Module SD BEFORE column scaling (per sample):\n")
+sd_by_sample <- apply(avg_z_by_ct_ATAC_raw, 2, stats::sd, na.rm = TRUE)
+print(summary(sd_by_sample))
+low_sd <- names(sd_by_sample)[sd_by_sample < 0.05]
+cat("[5-QC] samples with sd < 0.05 across modules: ", length(low_sd), "\n", sep = "")
+if (length(low_sd) > 0) print(low_sd)
 
 # ---------------------------------------------------------------------
-# 6 — Column-wise scaling (per-sample z across lineages)
+# 6 — Column-wise scaling across modules (per sample)
 # ---------------------------------------------------------------------
-cat("\n[6] Column-wise scaling: z-score modules WITHIN each sample...\n")
-cat("    (This enforces that, for each sample, some lineages are\n")
-cat("     relatively high and others low — no all-red columns.)\n\n")
-
+cat("\n[6] Column-wise scaling across modules (per sample)...\n")
 avg_z_by_ct_ATAC <- scale(avg_z_by_ct_ATAC_raw, center = TRUE, scale = TRUE)
 
-cat("[6] Sanity — per-sample mean & sd across 7 lineages AFTER scaling:\n")
 col_means_mod <- apply(avg_z_by_ct_ATAC, 2, mean)
 col_sds_mod   <- apply(avg_z_by_ct_ATAC, 2, sd)
+
+cat("[6] Per-sample mean(z) across 7 lineages (after scaling):\n")
 print(summary(col_means_mod))
+cat("[6] Per-sample sd(z) across 7 lineages (after scaling):\n")
 print(summary(col_sds_mod))
 
-# quick check: how many samples have all values > 0?
 all_pos <- apply(avg_z_by_ct_ATAC, 2, function(v) all(v > 0))
-cat("[6] Samples with ALL module scores > 0 (should be 0): ",
-    sum(all_pos), "\n", sep = "")
-
-cat("[6] Example scaled module scores (first 5 samples):\n")
-print(round(avg_z_by_ct_ATAC[, 1:5, drop = FALSE], 3))
-
+cat("[6] Samples with ALL module scores > 0 (should be 0): ", sum(all_pos), "\n", sep = "")
 
 # ---------------------------------------------------------------------
-# 7 — Dominant lineage + margins (using column-scaled matrix)
+# 7 — Dominant lineage + margins + QC RAW vs SCALED
 # ---------------------------------------------------------------------
-cat("\n[7] Computing dominant lineage and Tian-style margins (scaled)...\n")
+cat("\n[7] Dominant lineage & margins + QC RAW vs SCALED...\n")
 
 top_idx    <- apply(avg_z_by_ct_ATAC, 2, which.max)
 second_idx <- apply(avg_z_by_ct_ATAC, 2, function(v) order(v, decreasing = TRUE)[2])
 
 dominant_tbl_ATAC <- tibble::tibble(
-    sample       = colnames(avg_z_by_ct_ATAC),
-    top_ct       = ct_levels[top_idx],
-    top_score    = avg_z_by_ct_ATAC[cbind(top_idx, seq_along(top_idx))],
-    second_ct    = ct_levels[second_idx],
-    second_score = avg_z_by_ct_ATAC[cbind(second_idx, seq_along(second_idx))]
+  sample       = colnames(avg_z_by_ct_ATAC),
+  top_ct       = ct_levels[top_idx],
+  top_score    = avg_z_by_ct_ATAC[cbind(top_idx, seq_along(top_idx))],
+  second_ct    = ct_levels[second_idx],
+  second_score = avg_z_by_ct_ATAC[cbind(second_idx, seq_along(second_idx))]
 ) %>%
-    dplyr::mutate(
-        margin = top_score - second_score
-    ) %>%
-    dplyr::left_join(
-        meta_sj %>% dplyr::select(Sample, genotype),
-        by = c("sample" = "Sample")
-    )
+  dplyr::mutate(margin = top_score - second_score) %>%
+  dplyr::left_join(meta_sj %>% dplyr::select(Sample, genotype),
+                   by = c("sample" = "Sample"))
 
-cat("[7] First 10 dominance calls:\n")
-print(utils::head(dominant_tbl_ATAC, 10))
-
-cat("\n[7] Frequency of top_ct assignments:\n")
+cat("[7] top_ct frequencies:\n")
 print(sort(table(dominant_tbl_ATAC$top_ct), decreasing = TRUE))
-
-cat("\n[7] Margin summary (larger = more confident):\n")
+cat("[7] margin summary:\n")
 print(summary(dominant_tbl_ATAC$margin))
 
+cat("\n[7-QC] Dominance consistency: RAW vs SCALED...\n")
+raw_top  <- apply(avg_z_by_ct_ATAC_raw, 2, which.max)
+sc_top   <- apply(avg_z_by_ct_ATAC,     2, which.max)
+raw_call <- ct_levels[raw_top]
+sc_call  <- ct_levels[sc_top]
+cat("  • % same top_ct (RAW vs SCALED): ", round(100 * mean(raw_call == sc_call, na.rm = TRUE), 2), "%\n", sep = "")
+cat("  • Confusion (RAW rows vs SCALED cols):\n")
+print(table(raw_call, sc_call))
 
 # ---------------------------------------------------------------------
-# 8 — Order samples: top_ct → margin → top_score
+# 8 — Order samples + pheatmap annotations
 # ---------------------------------------------------------------------
-cat("\n[8] Ordering samples by (top_ct → margin → top_score)...\n")
+cat("\n[8] Ordering samples (top_ct → margin → top_score)...\n")
 
 col_order <- order(
-    factor(dominant_tbl_ATAC$top_ct, levels = ct_levels),
-    -dominant_tbl_ATAC$margin,
-    -dominant_tbl_ATAC$top_score
+  factor(dominant_tbl_ATAC$top_ct, levels = ct_levels),
+  -dominant_tbl_ATAC$margin,
+  -dominant_tbl_ATAC$top_score
 )
 
 avg_z_by_ct_ord  <- avg_z_by_ct_ATAC[, col_order, drop = FALSE]
 dominant_tbl_ord <- dominant_tbl_ATAC[col_order, ]
 
-cat("[8] Ordered module matrix dim: ",
-    paste(dim(avg_z_by_ct_ord), collapse = " × "), "\n", sep = "")
-
-
-# ---------------------------------------------------------------------
-# 9 — Build annotations for pheatmap
-# ---------------------------------------------------------------------
-cat("\n[9] Building annotation_col for pheatmap...\n")
-
 margin_bins <- cut(
-    dominant_tbl_ord$margin,
-    breaks = quantile(dominant_tbl_ord$margin, probs = seq(0, 1, 0.25), na.rm = TRUE),
-    include.lowest = TRUE,
-    labels = c("Q1 (lowest)", "Q2", "Q3", "Q4 (highest)")
+  dominant_tbl_ord$margin,
+  breaks = quantile(dominant_tbl_ord$margin, probs = seq(0, 1, 0.25), na.rm = TRUE),
+  include.lowest = TRUE,
+  labels = c("Q1 (lowest)", "Q2", "Q3", "Q4 (highest)")
 )
 
 ann_col_ATAC <- data.frame(
-    top_ct   = factor(dominant_tbl_ord$top_ct, levels = ct_levels),
-    margin   = margin_bins,
-    genotype = dominant_tbl_ord$genotype,
-    row.names = dominant_tbl_ord$sample,
-    stringsAsFactors = FALSE
+  top_ct    = factor(dominant_tbl_ord$top_ct, levels = ct_levels),
+  margin    = margin_bins,
+  genotype  = dominant_tbl_ord$genotype,
+  row.names = dominant_tbl_ord$sample,
+  stringsAsFactors = FALSE
 )
 
-cat("[9] Annotation table head:\n")
-print(utils::head(ann_col_ATAC, 10))
-
-cell_type_colors <- c(
+# Palettes (reuse if present; otherwise define)
+if (!exists("cell_type_colors")) {
+  cell_type_colors <- c(
     HSCMPP        = "#fb8072",
     GMP           = "#bebada",
     pDC           = "#ffd92f",
@@ -3980,67 +3971,72 @@ cell_type_colors <- c(
     ProB          = "#ff33ff",
     PreB          = "#00e5c0",
     B             = "#00bfff"
-)
-
-margin_colors <- c(
-    "Q1 (lowest)" = "#c7e9c0",
-    "Q2"          = "#a1d99b",
-    "Q3"          = "#74c476",
-    "Q4 (highest)"= "#238b45"
-)
-
-genotype_colors <- c(
+  )
+}
+if (!exists("margin_colors")) {
+  margin_colors <- c(
+    "Q1 (lowest)"  = "#c7e9c0",
+    "Q2"           = "#a1d99b",
+    "Q3"           = "#74c476",
+    "Q4 (highest)" = "#238b45"
+  )
+}
+if (!exists("genotype_colors")) {
+  genotype_colors <- c(
     TT = "#f65e0dff",
     TC = "#0c2e18ff",
     CC = "#d7a419ff"
-)
-
+  )
+}
 
 # ---------------------------------------------------------------------
-# 10 — Final pheatmap
+# 9 — Heatmap
 # ---------------------------------------------------------------------
-cat("\n[10] Drawing final ATAC dominance heatmap (column-scaled)...\n")
+cat("\n[9] Drawing ALL-peaks dominance heatmap...\n")
 
 z_col_fun <- colorRampPalette(c("blue", "white", "red"))(201)
 
 pheatmap::pheatmap(
-    avg_z_by_ct_ord,
-    color            = z_col_fun,
-    cluster_rows     = FALSE,
-    cluster_cols     = FALSE,
-    show_rownames    = TRUE,
-    show_colnames    = FALSE,
-    annotation_col   = ann_col_ATAC,
-    annotation_colors = list(
-        top_ct   = cell_type_colors,
-        margin   = margin_colors,
-        genotype = genotype_colors
-    ),
-    border_color = NA,
-    main = "ATAC module activity (Ilaria markers; column-scaled dominance)"
+  avg_z_by_ct_ord,
+  color             = z_col_fun,
+  cluster_rows      = FALSE,
+  cluster_cols      = FALSE,
+  show_rownames     = TRUE,
+  show_colnames     = FALSE,
+  annotation_col    = ann_col_ATAC,
+  annotation_colors = list(
+    top_ct   = cell_type_colors,
+    margin   = margin_colors,
+    genotype = genotype_colors
+  ),
+  border_color = NA,
+  main = "ATAC module activity (ALL peaks; one peak/gene = closest-to-TSS; column-scaled)"
 )
-
-cat("\n[ATAC] DONE — no column should now be uniformly red; each sample\n")
-cat("       is internally standardized across HSCMPP→B modules.\n")
-cat("===============================================================\n\n")
-
-
 ```
 
 ### 14.1 Promoters only
 
 ```{r}
 # =====================================================================
-# ATAC — PROMOTER-ONLY ILARIA DOMINANCE MAP
-#        (column-scaled module scores, Tian-style margins)
+# ATAC — PROMOTER-ONLY ILARIA DOMINANCE MAP (TSS-WINDOW DEFINITION)
+#        + ONE-PEAK-PER-GENE (closest-to-TSS) to enforce "one gene = one vote"
+#        + QC for the new strategy
+#
+# Promoter definition here is NOT string-based ("Promoter") — instead:
+#   promoter peak := abs(distanceToTSS) <= PROMOTER_WINDOW_BP
+#
+# Gene-level promoter score here is NOT "sum of promoter peaks" — instead:
+#   gene promoter peak := per gene, select the single peak with min abs(distanceToTSS)
+#   => prevents genes with many promoter peaks from having more "votes"
 #
 # Requires:
 #   - counts   : matrix [peaks × samples] (ATAC peak-level counts)
-#   - anno_df  : data.frame with peak_id, SYMBOL, annotation
+#   - anno_df  : data.frame with peak_id, SYMBOL, distanceToTSS, annotation (optional)
 #   - meta_sj  : data.frame with Sample, genotype
+#   - panel_long, panel_genes, ct_levels (or it will load panel)
 #
 # Produces:
-#   - prom_counts_all_gene          (promoter-only gene matrix)
+#   - prom_counts_all_gene          (promoter-only gene matrix; one peak per gene)
 #   - prom_avg_z_by_ct_ATAC_raw    (raw module scores)
 #   - prom_avg_z_by_ct_ATAC        (column-scaled module scores)
 #   - prom_dominant_tbl_ATAC       (winner + margin)
@@ -4058,33 +4054,36 @@ suppressPackageStartupMessages({
 })
 
 cat("\n===============================================================\n")
-cat("ATAC ILARIA PIPELINE — PROMOTER-ONLY, COLUMN-SCALED DOMINANCE\n")
+cat("ATAC ILARIA PIPELINE — PROMOTER-ONLY (TSS WINDOW), ONE PEAK/GENE\n")
 cat("===============================================================\n\n")
 
 # ---------------------------------------------------------------------
-# 0 — Sanity checks
+# 0 — Parameters + sanity checks
 # ---------------------------------------------------------------------
-if (!exists("counts")) {
-    stop("[PROM-COL] ERROR: `counts` (peak × sample matrix) not found.")
-}
-if (!exists("anno_df")) {
-    stop("[PROM-COL] ERROR: `anno_df` (ChIPseeker annotation) not found.")
-}
-if (!exists("meta_sj")) {
-    stop("[PROM-COL] ERROR: `meta_sj` (Sample + genotype) not found.")
-}
+PROMOTER_WINDOW_BP <- 2000  # e.g., 1000 or 2000; keep constant across runs
 
-cat("[0] counts dim (peaks × samples): ",
-    paste(dim(counts), collapse = " × "), "\n", sep = "")
-cat("[0] anno_df dim (rows × cols): ",
-    paste(dim(anno_df), collapse = " × "), "\n", sep = "")
+if (!exists("counts"))  stop("[PROM-TSS] ERROR: `counts` (peak × sample matrix) not found.")
+if (!exists("anno_df")) stop("[PROM-TSS] ERROR: `anno_df` (annotation table) not found.")
+if (!exists("meta_sj")) stop("[PROM-TSS] ERROR: `meta_sj` (Sample + genotype) not found.")
+
+cat("[0] PROMOTER_WINDOW_BP: ±", PROMOTER_WINDOW_BP, "bp around TSS\n", sep = "")
+cat("[0] counts dim (peaks × samples): ", paste(dim(counts), collapse = " × "), "\n", sep = "")
+cat("[0] anno_df dim (rows × cols): ", paste(dim(anno_df), collapse = " × "), "\n", sep = "")
+
+stopifnot(!is.null(rownames(counts)), !is.null(colnames(counts)))
+stopifnot(all(c("peak_id", "SYMBOL") %in% colnames(anno_df)))
+
+# Require distanceToTSS for the new strategy
+if (!("distanceToTSS" %in% colnames(anno_df))) {
+    stop("[PROM-TSS] ERROR: anno_df must contain `distanceToTSS` for TSS-window promoter definition.")
+}
 
 # ---------------------------------------------------------------------
 # 1 — Load & clean Ilaria panel (if not already loaded)
 # ---------------------------------------------------------------------
 if (!exists("panel_long") || !exists("panel_genes") || !exists("ct_levels")) {
     
-    cat("\n[1] Loading curated Ilaria panel (since objects not found)...\n")
+    cat("\n[1] Loading curated Ilaria panel (objects not found)...\n")
     
     panel_path <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Clarissa/snp_cell_lines_public_datasets_project/sj_expression_arid5b_Wenjian/clean_ilarias_700_genes.csv"
     cat("    • panel_path = ", panel_path, "\n", sep = "")
@@ -4120,204 +4119,239 @@ if (!exists("panel_long") || !exists("panel_genes") || !exists("ct_levels")) {
 }
 
 # ---------------------------------------------------------------------
-# 2 — Identify promoter peaks & build promoter-only gene matrix
+# 2 — QC + Build promoter peak set by TSS-window (abs(distanceToTSS) <= window)
 # ---------------------------------------------------------------------
-cat("\n[2] Identifying promoter peaks and aggregating to genes...\n")
+cat("\n[2] Defining promoter peaks by TSS-window using distanceToTSS...\n")
 
-prom_annot_summary <- anno_df %>%
-    dplyr::count(annotation, sort = TRUE)
-cat("[2] annotation (top 10):\n")
-print(utils::head(prom_annot_summary, 10))
+anno_tss <- anno_df %>%
+    dplyr::mutate(
+        .tss_dist = suppressWarnings(as.numeric(as.character(.data$distanceToTSS))),
+        .abs_tss  = abs(.tss_dist)
+    )
 
-prom_anno_df <- anno_df %>%
-    dplyr::filter(stringr::str_detect(annotation, "Promoter"))
+cat("[2] QC: distanceToTSS numeric coercion summary (abs):\n")
+print(summary(anno_tss$.abs_tss))
 
-cat("[2] prom_anno_df rows (Promoter*): ", nrow(prom_anno_df), "\n", sep = "")
+n_na_dist <- sum(is.na(anno_tss$.abs_tss))
+cat("[2] QC: peaks with NA distanceToTSS after coercion: ", n_na_dist, "\n", sep = "")
 
-if (nrow(prom_anno_df) == 0L) {
-    stop("[2] ERROR: No promoter rows in anno_df$annotation.")
-}
-
-prom_gene_map <- prom_anno_df %>%
-    dplyr::select(peak_id, SYMBOL) %>%
+prom_tss_df <- anno_tss %>%
+    dplyr::filter(!is.na(.abs_tss), .abs_tss <= PROMOTER_WINDOW_BP) %>%
     dplyr::filter(!is.na(SYMBOL), SYMBOL != "") %>%
+    dplyr::select(peak_id, SYMBOL, .tss_dist, .abs_tss, dplyr::any_of("annotation")) %>%
     dplyr::distinct()
 
-cat("[2] prom_gene_map rows (promoter peaks with SYMBOL): ",
-    nrow(prom_gene_map), "\n", sep = "")
-cat("[2] unique SYMBOL in promoters: ",
-    length(unique(prom_gene_map$SYMBOL)), "\n", sep = "")
+cat("[2] promoter peaks in TSS window (with SYMBOL): ", nrow(prom_tss_df), "\n", sep = "")
+cat("[2] unique SYMBOL captured by TSS-window promoters: ",
+    length(unique(prom_tss_df$SYMBOL)), "\n", sep = "")
 
-prom_peaks_in_counts <- rownames(counts)
-prom_common_peaks    <- intersect(prom_peaks_in_counts, prom_gene_map$peak_id)
-cat("[2] promoter peaks overlapping counts rownames: ",
-    length(prom_common_peaks), "\n", sep = "")
-
-if (length(prom_common_peaks) == 0L) {
-    stop("[2] ERROR: No overlap between promoter peak_ids and rownames(counts).")
+# Optional QC: how much does this differ from string-based promoter annotation?
+if ("annotation" %in% colnames(prom_tss_df)) {
+    cat("\n[2-QC] Overlap check: TSS-window promoters vs annotation containing 'Promoter'\n")
+    tab_prom <- prom_tss_df %>%
+        dplyr::mutate(.annot_prom = stringr::str_detect(.data$annotation, "Promoter")) %>%
+        dplyr::count(.annot_prom)
+    print(tab_prom)
+    
+    cat("[2-QC] annotation categories within TSS-window (top 10):\n")
+    print(
+        prom_tss_df %>%
+            dplyr::count(annotation, sort = TRUE) %>%
+            utils::head(10)
+    )
+} else {
+    cat("\n[2-QC] NOTE: anno_df has no `annotation` column; skipping string-based overlap QC.\n")
 }
 
-prom_counts_df <- counts %>%
-    as.data.frame()
+# Ensure overlap with counts
+prom_common_peaks <- intersect(rownames(counts), prom_tss_df$peak_id)
+cat("\n[2] promoter peaks overlapping rownames(counts): ", length(prom_common_peaks), "\n", sep = "")
+if (length(prom_common_peaks) == 0L) stop("[2] ERROR: No overlap between TSS-window promoter peaks and rownames(counts).")
+
+# ---------------------------------------------------------------------
+# 3 — QC: peaks-per-gene in promoter window + choose ONE peak per gene (closest to TSS)
+# ---------------------------------------------------------------------
+cat("\n[3] QC: peaks-per-gene within TSS-window + selecting closest peak per gene...\n")
+
+peaks_per_gene_prom <- prom_tss_df %>%
+    dplyr::filter(peak_id %in% prom_common_peaks) %>%
+    dplyr::count(SYMBOL, name = "n_prom_peaks") %>%
+    dplyr::arrange(dplyr::desc(n_prom_peaks))
+
+cat("[3] peaks-per-gene (TSS-window) summary:\n")
+print(summary(peaks_per_gene_prom$n_prom_peaks))
+
+cat("[3] top genes by # promoter-window peaks (first 10):\n")
+print(utils::head(peaks_per_gene_prom, 10))
+
+# Choose the single closest-to-TSS peak per gene
+prom_gene_map_one <- prom_tss_df %>%
+    dplyr::filter(peak_id %in% prom_common_peaks) %>%
+    dplyr::group_by(SYMBOL) %>%
+    dplyr::slice_min(.abs_tss, with_ties = FALSE) %>%
+    dplyr::ungroup() %>%
+    dplyr::select(SYMBOL, peak_id, .tss_dist, .abs_tss) %>%
+    dplyr::distinct()
+
+cat("[3] selected 1 peak/gene (closest-to-TSS): ", nrow(prom_gene_map_one), "\n", sep = "")
+stopifnot(!anyDuplicated(prom_gene_map_one$SYMBOL))
+
+# QC: any peak maps to multiple genes (should usually be 0 if your anno_df is clean)
+genes_per_peak_prom <- prom_gene_map_one %>%
+    dplyr::count(peak_id, name = "n_genes") %>%
+    dplyr::arrange(dplyr::desc(n_genes))
+
+n_ambig_peak <- sum(genes_per_peak_prom$n_genes > 1)
+cat("[3-QC] peaks mapping to >1 gene among selected closest peaks: ", n_ambig_peak, "\n", sep = "")
+if (n_ambig_peak > 0) {
+    cat("[3-QC] WARNING: ambiguous peak→gene mapping detected (first 10):\n")
+    print(utils::head(dplyr::filter(genes_per_peak_prom, n_genes > 1), 10))
+    cat("        Consider forcing a unique assignment upstream.\n")
+}
+
+# ---------------------------------------------------------------------
+# 4 — Build promoter-only gene matrix (one peak per gene)
+# ---------------------------------------------------------------------
+cat("\n[4] Building prom_counts_all_gene (genes × samples) using ONE peak/gene...\n")
+
+prom_counts_all_gene <- counts[prom_gene_map_one$peak_id, , drop = FALSE]
+rownames(prom_counts_all_gene) <- prom_gene_map_one$SYMBOL
+
+cat("[4] prom_counts_all_gene dim (genes × samples): ", paste(dim(prom_counts_all_gene), collapse = " × "), "\n", sep = "")
+
+# QC: quick sanity check for missing/duplicated rownames
+stopifnot(!anyDuplicated(rownames(prom_counts_all_gene)))
+stopifnot(all(colnames(prom_counts_all_gene) == colnames(counts)))
+
+# OPTIONAL QC: compare "one peak/gene" vs "sum of promoter peaks/gene"
+# (kept as QC only — not used downstream unless you swap it in)
+cat("\n[4-QC] OPTIONAL: building sum-of-promoter-peaks gene matrix for comparison...\n")
+prom_counts_df <- as.data.frame(counts)
 prom_counts_df$peak_id <- rownames(prom_counts_df)
 
-prom_counts_joined <- prom_gene_map %>%
+prom_sum_join <- prom_tss_df %>%
     dplyr::filter(peak_id %in% prom_common_peaks) %>%
-    dplyr::left_join(
-        prom_counts_df,
-        by = "peak_id",
-        relationship = "many-to-many"
-    )
+    dplyr::select(peak_id, SYMBOL) %>%
+    dplyr::left_join(prom_counts_df, by = "peak_id", relationship = "many-to-many")
 
-cat("[2] rows after promoter join (promoter peak × sample): ",
-    nrow(prom_counts_joined), "\n", sep = "")
-
-prom_counts_gene_summarised <- prom_counts_joined %>%
+prom_counts_all_gene_sum <- prom_sum_join %>%
     dplyr::select(-peak_id) %>%
     dplyr::group_by(SYMBOL) %>%
-    dplyr::summarise(
-        dplyr::across(.cols = dplyr::where(is.numeric), .fns = sum),
-        .groups = "drop"
-    )
-
-cat("[2] promoter gene-level rows (SYMBOL): ",
-    nrow(prom_counts_gene_summarised), "\n", sep = "")
-
-prom_counts_all_gene <- prom_counts_gene_summarised %>%
+    dplyr::summarise(dplyr::across(dplyr::where(is.numeric), sum), .groups = "drop") %>%
     as.data.frame()
-rownames(prom_counts_all_gene) <- prom_counts_all_gene$SYMBOL
-prom_counts_all_gene$SYMBOL    <- NULL
-prom_counts_all_gene <- as.matrix(prom_counts_all_gene)
 
-cat("[2] prom_counts_all_gene dim (genes × samples): ",
-    paste(dim(prom_counts_all_gene), collapse = " × "), "\n", sep = "")
+rownames(prom_counts_all_gene_sum) <- prom_counts_all_gene_sum$SYMBOL
+prom_counts_all_gene_sum$SYMBOL <- NULL
+prom_counts_all_gene_sum <- as.matrix(prom_counts_all_gene_sum)
 
-# ---------------------------------------------------------------------
-# 3 — Subset promoter matrix to Ilaria genes & gene-level z-score
-# ---------------------------------------------------------------------
-cat("\n[3] Subsetting promoter matrix to Ilaria genes and z-scoring...\n")
+common_genes_compare <- intersect(rownames(prom_counts_all_gene), rownames(prom_counts_all_gene_sum))
+cat("[4-QC] genes comparable (one-peak vs sum): ", length(common_genes_compare), "\n", sep = "")
 
-prom_genes_in_atac <- intersect(rownames(prom_counts_all_gene), panel_genes)
-cat("[3] genes in (promoters ∩ Ilaria): ",
-    length(prom_genes_in_atac), "\n", sep = "")
-
-if (length(prom_genes_in_atac) == 0L) {
-    stop("[3] ERROR: No Ilaria genes among promoter-only genes.")
+if (length(common_genes_compare) > 50) {
+    # Correlate per-gene mean signal across samples as a quick “are these wildly different?” check
+    m1 <- rowMeans(prom_counts_all_gene[common_genes_compare, , drop = FALSE], na.rm = TRUE)
+    m2 <- rowMeans(prom_counts_all_gene_sum[common_genes_compare, , drop = FALSE], na.rm = TRUE)
+    cat("[4-QC] Spearman corr of gene mean signal (one-peak vs sum): ",
+        round(stats::cor(m1, m2, method = "spearman", use = "pairwise.complete.obs"), 3), "\n", sep = "")
+} else {
+    cat("[4-QC] Skipping correlation (too few comparable genes).\n")
 }
 
+# ---------------------------------------------------------------------
+# 5 — Subset promoter matrix to Ilaria genes & gene-level z-score
+# ---------------------------------------------------------------------
+cat("\n[5] Subsetting promoter matrix to Ilaria genes and z-scoring per gene...\n")
+
+prom_genes_in_atac <- intersect(rownames(prom_counts_all_gene), panel_genes)
+cat("[5] genes in (TSS-window promoters ∩ Ilaria): ", length(prom_genes_in_atac), "\n", sep = "")
+
+if (length(prom_genes_in_atac) == 0L) stop("[5] ERROR: No Ilaria genes found in promoter-only gene matrix.")
+
 prom_atac_mat <- prom_counts_all_gene[prom_genes_in_atac, , drop = FALSE]
-cat("[3] prom_atac_mat dim (Ilaria genes × samples): ",
-    paste(dim(prom_atac_mat), collapse = " × "), "\n", sep = "")
+cat("[5] prom_atac_mat dim (Ilaria genes × samples): ", paste(dim(prom_atac_mat), collapse = " × "), "\n", sep = "")
 
 prom_atac_z_gene <- t(scale(t(prom_atac_mat)))
 prom_atac_z_gene[is.na(prom_atac_z_gene)] <- 0
 
-cat("[3] Example promoter gene z-scores (5 genes × 5 samples):\n")
+cat("[5] Example promoter gene z-scores (5 genes × 5 samples):\n")
 print(round(prom_atac_z_gene[1:5, 1:5, drop = FALSE], 3))
 
-# ---------------------------------------------------------------------
-# 4 — Expand to gene×cell-type rows
-# ---------------------------------------------------------------------
-cat("\n[4] Expanding promoter matrix to gene×cell-type rows...\n")
-
-prom_panel_expanded <- panel_long %>%
-    dplyr::filter(gene %in% prom_genes_in_atac) %>%
-    dplyr::mutate(prom_row_id = paste(gene, cell_type, sep = "|"))
-
-cat("[4] prom_panel_expanded rows: ",
-    nrow(prom_panel_expanded), "\n", sep = "")
-cat("[4] unique prom_row_id       : ",
-    length(unique(prom_panel_expanded$prom_row_id)), "\n", sep = "")
-
-prom_atac_expanded <- prom_panel_expanded %>%
-    dplyr::select(prom_row_id, gene, cell_type) %>%
-    dplyr::left_join(
-        prom_atac_z_gene %>%
-            as.data.frame() %>%
-            tibble::rownames_to_column("gene"),
-        by = "gene",
-        relationship = "many-to-many"
-    )
-
-cat("[4] prom_atac_expanded rows after join: ",
-    nrow(prom_atac_expanded), "\n", sep = "")
-
-prom_mat_expanded <- prom_atac_expanded %>%
-    dplyr::select(-gene, -cell_type) %>%
-    tibble::column_to_rownames("prom_row_id") %>%
-    as.matrix()
-
-cat("[4] prom_mat_expanded dim (gene×ct rows × samples): ",
-    paste(dim(prom_mat_expanded), collapse = " × "), "\n", sep = "")
+# QC: marker coverage per cell type under this promoter definition
+cat("\n[5-QC] Marker overlap per cell_type under TSS-window promoters:\n")
+marker_overlap <- panel_long %>%
+    dplyr::group_by(cell_type) %>%
+    dplyr::summarise(
+        n_markers_panel   = dplyr::n_distinct(gene),
+        n_markers_present = sum(unique(gene) %in% prom_genes_in_atac),
+        frac_present      = n_markers_present / n_markers_panel,
+        .groups = "drop"
+    ) %>%
+    dplyr::arrange(dplyr::desc(frac_present))
+print(marker_overlap)
 
 # ---------------------------------------------------------------------
-# 5 — Raw promoter module matrix: prom_avg_z_by_ct_ATAC_raw
+# 6 — Raw module matrix: prom_avg_z_by_ct_ATAC_raw (no expansion join needed)
 # ---------------------------------------------------------------------
-cat("\n[5] Computing raw promoter module matrix (prom_avg_z_by_ct_ATAC_raw)...\n")
-
-prom_ct_for_row <- prom_panel_expanded$cell_type
-names(prom_ct_for_row) <- prom_panel_expanded$prom_row_id
-prom_ct_for_row <- prom_ct_for_row[rownames(prom_mat_expanded)]
-
-cat("[5] Alignment check — first 5 rows:\n")
-print(
-    head(
-        cbind(
-            prom_ct_for_row = prom_ct_for_row[1:5],
-            rowname         = names(prom_ct_for_row)[1:5]
-        )
-    )
-)
+cat("\n[6] Computing raw module matrix (prom_avg_z_by_ct_ATAC_raw) from z-scored genes...\n")
 
 prom_avg_z_by_ct_ATAC_raw <- do.call(
     rbind,
     lapply(ct_levels, function(ct) {
-        idx <- which(prom_ct_for_row == ct)
-        if (length(idx) == 0L) {
-            cat("[5] WARNING: no promoter markers for cell_type ", ct,
-                "; filling with NA.\n", sep = "")
-            return(rep(NA_real_, ncol(prom_mat_expanded)))
-        } else {
-            return(colMeans(prom_mat_expanded[idx, , drop = FALSE], na.rm = TRUE))
+        genes_ct <- panel_long %>%
+            dplyr::filter(cell_type == ct, gene %in% prom_genes_in_atac) %>%
+            dplyr::pull(gene) %>%
+            unique()
+        
+        if (length(genes_ct) == 0L) {
+            cat("[6] WARNING: no promoter markers available for cell_type ", ct, "; filling with NA.\n", sep = "")
+            return(rep(NA_real_, ncol(prom_atac_z_gene)))
         }
+        colMeans(prom_atac_z_gene[genes_ct, , drop = FALSE], na.rm = TRUE)
     })
 )
 rownames(prom_avg_z_by_ct_ATAC_raw) <- ct_levels
+colnames(prom_avg_z_by_ct_ATAC_raw) <- colnames(prom_atac_z_gene)
 
-cat("[5] prom_avg_z_by_ct_ATAC_raw dim (7 × samples): ",
+cat("[6] prom_avg_z_by_ct_ATAC_raw dim (CT × samples): ",
     paste(dim(prom_avg_z_by_ct_ATAC_raw), collapse = " × "), "\n", sep = "")
-cat("[5] Example RAW promoter module scores (first 5 samples):\n")
+cat("[6] Example RAW promoter module scores (first 5 samples):\n")
 print(round(prom_avg_z_by_ct_ATAC_raw[, 1:5, drop = FALSE], 3))
 
-# ---------------------------------------------------------------------
-# 6 — Column-wise scaling across modules (CRUCIAL FIX)
-# ---------------------------------------------------------------------
-cat("\n[6] Column-wise scaling across the 7 lineages (promoter-only)...\n")
-cat("    This enforces per-sample mean ~ 0 and sd ~ 1 across modules,\n")
-cat("    preventing 'all-red' columns.\n\n")
+# QC: module SD BEFORE column scaling (critical)
+cat("\n[6-QC] Module SD BEFORE column scaling (across CTs, per sample):\n")
+sd_by_sample <- apply(prom_avg_z_by_ct_ATAC_raw, 2, stats::sd, na.rm = TRUE)
+print(summary(sd_by_sample))
 
-prom_avg_z_by_ct_ATAC <- scale(prom_avg_z_by_ct_ATAC_raw,
-                               center = TRUE, scale = TRUE)
+low_sd <- names(sd_by_sample)[sd_by_sample < 0.05]
+cat("[6-QC] samples with sd < 0.05 across modules (scaling can amplify noise): ", length(low_sd), "\n", sep = "")
+if (length(low_sd) > 0) print(low_sd)
+
+# ---------------------------------------------------------------------
+# 7 — Column-wise scaling across modules (per sample)
+# ---------------------------------------------------------------------
+cat("\n[7] Column-wise scaling across the 7 lineages (TSS-window promoters)...\n")
+cat("    This standardizes each sample across CT modules (mean~0, sd~1).\n\n")
+
+prom_avg_z_by_ct_ATAC <- scale(prom_avg_z_by_ct_ATAC_raw, center = TRUE, scale = TRUE)
 
 col_means_mod_prom <- apply(prom_avg_z_by_ct_ATAC, 2, mean)
 col_sds_mod_prom   <- apply(prom_avg_z_by_ct_ATAC, 2, sd)
 
-cat("[6] Per-sample mean(z) across 7 lineages (after scaling):\n")
+cat("[7] Per-sample mean(z) across 7 lineages (after scaling):\n")
 print(summary(col_means_mod_prom))
-cat("[6] Per-sample sd(z) across 7 lineages (after scaling):\n")
+cat("[7] Per-sample sd(z) across 7 lineages (after scaling):\n")
 print(summary(col_sds_mod_prom))
 
 all_pos_prom <- apply(prom_avg_z_by_ct_ATAC, 2, function(v) all(v > 0))
-cat("[6] Samples with ALL promoter module scores > 0 (should be 0): ",
-    sum(all_pos_prom), "\n", sep = "")
+cat("[7] Samples with ALL module scores > 0 (should be ~0): ", sum(all_pos_prom), "\n", sep = "")
 
-cat("[6] Example SCALED promoter module scores (first 5 samples):\n")
+cat("[7] Example SCALED promoter module scores (first 5 samples):\n")
 print(round(prom_avg_z_by_ct_ATAC[, 1:5, drop = FALSE], 3))
 
 # ---------------------------------------------------------------------
-# 7 — Dominant lineage + margins (promoter-only, scaled)
+# 8 — Dominant lineage + margins (scaled)
 # ---------------------------------------------------------------------
-cat("\n[7] Computing dominant lineage & margins (promoter-only, scaled)...\n")
+cat("\n[8] Computing dominant lineage & margins (TSS-window promoters, scaled)...\n")
 
 prom_top_idx    <- apply(prom_avg_z_by_ct_ATAC, 2, which.max)
 prom_second_idx <- apply(prom_avg_z_by_ct_ATAC, 2, function(v) order(v, decreasing = TRUE)[2])
@@ -4329,27 +4363,40 @@ prom_dominant_tbl_ATAC <- tibble::tibble(
     second_ct    = ct_levels[prom_second_idx],
     second_score = prom_avg_z_by_ct_ATAC[cbind(prom_second_idx, seq_along(prom_second_idx))]
 ) %>%
-    dplyr::mutate(
-        margin = top_score - second_score
-    ) %>%
-    dplyr::left_join(
-        meta_sj %>% dplyr::select(Sample, genotype),
-        by = c("sample" = "Sample")
-    )
+    dplyr::mutate(margin = top_score - second_score) %>%
+    dplyr::left_join(meta_sj %>% dplyr::select(Sample, genotype),
+                     by = c("sample" = "Sample"))
 
-cat("[7] First 10 promoter dominance calls:\n")
+cat("[8] First 10 promoter dominance calls:\n")
 print(utils::head(prom_dominant_tbl_ATAC, 10))
 
-cat("\n[7] Frequency of promoter-based top_ct assignments:\n")
+cat("\n[8] Frequency of top_ct assignments:\n")
 print(sort(table(prom_dominant_tbl_ATAC$top_ct), decreasing = TRUE))
 
-cat("\n[7] Margin summary (promoter-only, scaled):\n")
+cat("\n[8] Margin summary:\n")
 print(summary(prom_dominant_tbl_ATAC$margin))
 
 # ---------------------------------------------------------------------
-# 8 — Order samples: top_ct → margin → top_score
+# 9 — QC: Dominance consistency RAW vs SCALED (are you forcing winners?)
 # ---------------------------------------------------------------------
-cat("\n[8] Ordering samples (top_ct → margin → top_score) [promoters]...\n")
+cat("\n[9-QC] Dominance consistency: RAW vs COLUMN-SCALED...\n")
+
+raw_top <- apply(prom_avg_z_by_ct_ATAC_raw, 2, which.max)
+sc_top  <- apply(prom_avg_z_by_ct_ATAC,     2, which.max)
+
+raw_call <- ct_levels[raw_top]
+sc_call  <- ct_levels[sc_top]
+
+concord <- mean(raw_call == sc_call, na.rm = TRUE)
+cat("  • % samples with same top_ct (RAW vs SCALED): ", round(100 * concord, 2), "%\n", sep = "")
+
+cat("  • Confusion (RAW rows vs SCALED cols):\n")
+print(table(raw_call, sc_call))
+
+# ---------------------------------------------------------------------
+# 10 — Order samples: top_ct → margin → top_score
+# ---------------------------------------------------------------------
+cat("\n[10] Ordering samples (top_ct → margin → top_score)...\n")
 
 prom_col_order <- order(
     factor(prom_dominant_tbl_ATAC$top_ct, levels = ct_levels),
@@ -4360,13 +4407,12 @@ prom_col_order <- order(
 prom_avg_z_by_ct_ord  <- prom_avg_z_by_ct_ATAC[, prom_col_order, drop = FALSE]
 prom_dominant_tbl_ord <- prom_dominant_tbl_ATAC[prom_col_order, ]
 
-cat("[8] prom_avg_z_by_ct_ord dim: ",
-    paste(dim(prom_avg_z_by_ct_ord), collapse = " × "), "\n", sep = "")
+cat("[10] prom_avg_z_by_ct_ord dim: ", paste(dim(prom_avg_z_by_ct_ord), collapse = " × "), "\n", sep = "")
 
 # ---------------------------------------------------------------------
-# 9 — Build annotations for pheatmap
+# 11 — Build annotations for pheatmap
 # ---------------------------------------------------------------------
-cat("\n[9] Building prom_ann_col_ATAC for pheatmap...\n")
+cat("\n[11] Building prom_ann_col_ATAC for pheatmap...\n")
 
 prom_margin_bins <- cut(
     prom_dominant_tbl_ord$margin,
@@ -4383,10 +4429,10 @@ prom_ann_col_ATAC <- data.frame(
     stringsAsFactors = FALSE
 )
 
-cat("[9] prom_ann_col_ATAC head:\n")
+cat("[11] prom_ann_col_ATAC head:\n")
 print(utils::head(prom_ann_col_ATAC, 10))
 
-# Reuse palettes from main pipeline, or define if missing
+# Palettes (reuse if present; otherwise define)
 if (!exists("cell_type_colors")) {
     cell_type_colors <- c(
         HSCMPP        = "#fb8072",
@@ -4400,10 +4446,10 @@ if (!exists("cell_type_colors")) {
 }
 if (!exists("margin_colors")) {
     margin_colors <- c(
-        "Q1 (lowest)" = "#c7e9c0",
-        "Q2"          = "#a1d99b",
-        "Q3"          = "#74c476",
-        "Q4 (highest)"= "#238b45"
+        "Q1 (lowest)"  = "#c7e9c0",
+        "Q2"           = "#a1d99b",
+        "Q3"           = "#74c476",
+        "Q4 (highest)" = "#238b45"
     )
 }
 if (!exists("genotype_colors")) {
@@ -4415,31 +4461,33 @@ if (!exists("genotype_colors")) {
 }
 
 # ---------------------------------------------------------------------
-# 10 — Final promoter-only dominance heatmap
+# 12 — Final promoter-only dominance heatmap
 # ---------------------------------------------------------------------
-cat("\n[10] Drawing promoter-only ATAC dominance heatmap (column-scaled)...\n")
+cat("\n[12] Drawing promoter-only ATAC dominance heatmap (column-scaled)...\n")
 
 prom_z_col_fun <- colorRampPalette(c("blue", "white", "red"))(201)
 
 pheatmap::pheatmap(
     prom_avg_z_by_ct_ord,
-    color            = prom_z_col_fun,
-    cluster_rows     = FALSE,
-    cluster_cols     = FALSE,
-    show_rownames    = TRUE,
-    show_colnames    = FALSE,
-    annotation_col   = prom_ann_col_ATAC,
-    annotation_colors = list(
+    color              = prom_z_col_fun,
+    cluster_rows       = FALSE,
+    cluster_cols       = FALSE,
+    show_rownames      = TRUE,
+    show_colnames      = FALSE,
+    annotation_col     = prom_ann_col_ATAC,
+    annotation_colors  = list(
         top_ct   = cell_type_colors,
         margin   = margin_colors,
         genotype = genotype_colors
     ),
     border_color = NA,
-    main = "ATAC module activity (PROMOTER PEAKS ONLY; column-scaled dominance)"
+    main = paste0("ATAC module activity (PROMOTERS = |distanceToTSS| ≤ ",
+                  PROMOTER_WINDOW_BP, "bp; ONE peak/gene; column-scaled)")
 )
 
-cat("\n[PROM-COL] DONE — promoter-only modules are now internally\n")
-cat("           standardized per sample; no column should be uniformly red.\n")
+cat("\n[PROM-TSS] DONE — promoters defined by fixed TSS window; one peak per gene.\n")
+cat("           QC printed above: distance distributions, peaks-per-gene,\n")
+cat("           marker overlap, low-SD samples, RAW vs SCALED concordance.\n")
 cat("===============================================================\n\n")
 
 ```
@@ -4447,422 +4495,382 @@ cat("===============================================================\n\n")
 ### 14.2 Enhancers only
 ```{r}
 # =====================================================================
-# ATAC — ENHANCER-ONLY ILARIA DOMINANCE MAP
-#        (column-scaled module scores, Tian-style margins)
+# ATAC — ENHANCER-ONLY ILARIA DOMINANCE MAP (TSS-WINDOW COMPLEMENT)
+#        + ONE-PEAK-PER-GENE (closest enhancer peak per gene)
+#        + QC for this strategy
 #
-# Enhancers = all non-promoter peaks with a SYMBOL in `anno_df`,
-#             aggregated to genes, then to lineage modules using
-#             Ilaria marker lists.
+# Enhancer definition (explicit, reviewer-proof):
+#   enhancer peak := abs(distanceToTSS) > PROMOTER_WINDOW_BP
+#
+# Gene-level enhancer score (avoid gene-size bias):
+#   per gene, select single enhancer peak with minimal abs(distanceToTSS)
+#   among enhancer peaks => "closest enhancer" = one gene = one vote
 #
 # Requires:
-#   - counts   : matrix [peaks × samples] (ATAC peak-level counts)
-#   - anno_df  : data.frame with peak_id, SYMBOL, annotation
+#   - counts   : matrix [peaks × samples]
+#   - anno_df  : data.frame with peak_id, SYMBOL, distanceToTSS (annotation optional)
 #   - meta_sj  : data.frame with Sample, genotype
-#   - panel_long / panel_genes / ct_levels
-#
-# Produces:
-#   - enh_counts_all_gene          (enhancer-only gene matrix)
-#   - enh_avg_z_by_ct_ATAC_raw    (raw module scores)
-#   - enh_avg_z_by_ct_ATAC        (column-scaled module scores)
-#   - enh_dominant_tbl_ATAC       (winner + margin)
-#   - enh_ann_col_ATAC            (pheatmap annotations)
-#   - enhancer-only dominance heatmap
+#   - panel_long, panel_genes, ct_levels (or it will load panel)
 # =====================================================================
 
 suppressPackageStartupMessages({
-    library(dplyr)
-    library(tidyr)
-    library(readr)
-    library(tibble)
-    library(pheatmap)
-    library(stringr)
+  library(dplyr)
+  library(tidyr)
+  library(readr)
+  library(tibble)
+  library(pheatmap)
+  library(stringr)
 })
 
-cat("\n===============================================================\n")
-cat("ATAC ILARIA PIPELINE — ENHANCER-ONLY, COLUMN-SCALED DOMINANCE\n")
-cat("===============================================================\n\n")
+cat("\n[ILARIA/ENH-TSS] =============================================\n")
+cat("[ILARIA/ENH-TSS] ENHANCERS — |distanceToTSS| > window; one peak/gene\n")
 
 # ---------------------------------------------------------------------
-# 0 — Sanity checks
+# 0 — Parameters + sanity checks
 # ---------------------------------------------------------------------
-if (!exists("counts")) {
-    stop("[ENH-COL] ERROR: `counts` (peak × sample matrix) not found.")
-}
-if (!exists("anno_df")) {
-    stop("[ENH-COL] ERROR: `anno_df` (ChIPseeker annotation) not found.")
-}
-if (!exists("meta_sj")) {
-    stop("[ENH-COL] ERROR: `meta_sj` (Sample + genotype) not found.")
+PROMOTER_WINDOW_BP <- 2000  # keep consistent with your promoter chunk
+
+if (!exists("counts"))  stop("[ILARIA/ENH-TSS] ERROR: `counts` not found.")
+if (!exists("anno_df")) stop("[ILARIA/ENH-TSS] ERROR: `anno_df` not found.")
+if (!exists("meta_sj")) stop("[ILARIA/ENH-TSS] ERROR: `meta_sj` not found.")
+
+stopifnot(!is.null(rownames(counts)), !is.null(colnames(counts)))
+stopifnot(all(c("peak_id", "SYMBOL") %in% colnames(anno_df)))
+if (!("distanceToTSS" %in% colnames(anno_df))) {
+  stop("[ILARIA/ENH-TSS] ERROR: anno_df must contain `distanceToTSS` for TSS-window complement definition.")
 }
 
-cat("[0] counts dim (peaks × samples): ",
-    paste(dim(counts), collapse = " × "), "\n", sep = "")
-cat("[0] anno_df dim (rows × cols): ",
-    paste(dim(anno_df), collapse = " × "), "\n", sep = "")
+cat("[0] PROMOTER_WINDOW_BP: ±", PROMOTER_WINDOW_BP, "bp\n", sep = "")
+cat("[0] counts dim (peaks × samples): ", paste(dim(counts), collapse = " × "), "\n", sep = "")
+cat("[0] anno_df dim (rows × cols): ", paste(dim(anno_df), collapse = " × "), "\n", sep = "")
 
 # ---------------------------------------------------------------------
-# 1 — Load & clean Ilaria panel (if not already loaded)
+# 1 — Load Ilaria panel (if needed)
 # ---------------------------------------------------------------------
 if (!exists("panel_long") || !exists("panel_genes") || !exists("ct_levels")) {
-    
-    cat("\n[1] Loading curated Ilaria panel (since objects not found)...\n")
-    
-    panel_path <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Clarissa/snp_cell_lines_public_datasets_project/sj_expression_arid5b_Wenjian/clean_ilarias_700_genes.csv"
-    cat("    • panel_path = ", panel_path, "\n", sep = "")
-    
-    df_raw <- readr::read_csv(panel_path, show_col_types = FALSE)
-    
-    df_updated <- df_raw %>%
-        dplyr::mutate(
-            dplyr::across(
-                .cols = dplyr::everything(),
-                .fns  = ~ {
-                    x <- as.character(.)
-                    x <- stringr::str_trim(x)
-                    dplyr::na_if(x, "")
-                }
-            )
-        )
-    
-    panel_long <- df_updated %>%
-        tidyr::pivot_longer(
-            cols      = dplyr::everything(),
-            names_to  = "cell_type",
-            values_to = "gene"
-        ) %>%
-        dplyr::filter(!is.na(gene), gene != "")
-    
-    panel_genes <- unique(panel_long$gene)
-    ct_levels   <- colnames(df_raw)
-    
-    cat("[1] Panel loaded:\n")
-    cat("    • unique marker genes : ", length(panel_genes), "\n", sep = "")
-    cat("    • cell_type levels    : ", paste(ct_levels, collapse = " → "), "\n", sep = "")
-}
 
-# ---------------------------------------------------------------------
-# 2 — Identify enhancer (non-promoter) peaks & build gene matrix
-# ---------------------------------------------------------------------
-cat("\n[2] Identifying NON-PROMOTER peaks (enhancer-like) and aggregating to genes...\n")
+  cat("\n[1] Loading curated Ilaria panel (objects not found)...\n")
 
-enh_annot_summary <- anno_df %>%
-    dplyr::count(annotation, sort = TRUE)
-cat("[2] annotation (top 10):\n")
-print(utils::head(enh_annot_summary, 10))
+  panel_path <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Clarissa/snp_cell_lines_public_datasets_project/sj_expression_arid5b_Wenjian/clean_ilarias_700_genes.csv"
+  cat("    • panel_path = ", panel_path, "\n", sep = "")
 
-# "Enhancers" here = any annotation NOT containing "Promoter"
-enh_anno_df <- anno_df %>%
-    dplyr::filter(!stringr::str_detect(annotation, "Promoter"))
+  df_raw <- readr::read_csv(panel_path, show_col_types = FALSE)
 
-cat("[2] enh_anno_df rows (NON-Promoter): ", nrow(enh_anno_df), "\n", sep = "")
-
-if (nrow(enh_anno_df) == 0L) {
-    stop("[2] ERROR: No non-promoter rows in anno_df$annotation.")
-}
-
-enh_gene_map <- enh_anno_df %>%
-    dplyr::select(peak_id, SYMBOL) %>%
-    dplyr::filter(!is.na(SYMBOL), SYMBOL != "") %>%
-    dplyr::distinct()
-
-cat("[2] enh_gene_map rows (non-promoter peaks with SYMBOL): ",
-    nrow(enh_gene_map), "\n", sep = "")
-cat("[2] unique SYMBOL in enhancers: ",
-    length(unique(enh_gene_map$SYMBOL)), "\n", sep = "")
-
-enh_peaks_in_counts <- rownames(counts)
-enh_common_peaks    <- intersect(enh_peaks_in_counts, enh_gene_map$peak_id)
-cat("[2] non-promoter peaks overlapping counts rownames: ",
-    length(enh_common_peaks), "\n", sep = "")
-
-if (length(enh_common_peaks) == 0L) {
-    stop("[2] ERROR: No overlap between non-promoter peak_ids and rownames(counts).")
-}
-
-enh_counts_df <- counts %>%
-    as.data.frame()
-enh_counts_df$peak_id <- rownames(enh_counts_df)
-
-enh_counts_joined <- enh_gene_map %>%
-    dplyr::filter(peak_id %in% enh_common_peaks) %>%
-    dplyr::left_join(
-        enh_counts_df,
-        by = "peak_id",
-        relationship = "many-to-many"
+  df_updated <- df_raw %>%
+    dplyr::mutate(
+      dplyr::across(
+        .cols = dplyr::everything(),
+        .fns  = ~ {
+          x <- as.character(.)
+          x <- stringr::str_trim(x)
+          dplyr::na_if(x, "")
+        }
+      )
     )
 
-cat("[2] rows after non-promoter join (enhancer peak × sample): ",
-    nrow(enh_counts_joined), "\n", sep = "")
+  panel_long <- df_updated %>%
+    tidyr::pivot_longer(
+      cols      = dplyr::everything(),
+      names_to  = "cell_type",
+      values_to = "gene"
+    ) %>%
+    dplyr::filter(!is.na(gene), gene != "")
 
-enh_counts_gene_summarised <- enh_counts_joined %>%
-    dplyr::select(-peak_id) %>%
-    dplyr::group_by(SYMBOL) %>%
-    dplyr::summarise(
-        dplyr::across(.cols = dplyr::where(is.numeric), .fns = sum),
-        .groups = "drop"
-    )
+  panel_genes <- unique(panel_long$gene)
+  ct_levels   <- colnames(df_updated)
 
-cat("[2] enhancer gene-level rows (SYMBOL): ",
-    nrow(enh_counts_gene_summarised), "\n", sep = "")
-
-enh_counts_all_gene <- enh_counts_gene_summarised %>%
-    as.data.frame()
-rownames(enh_counts_all_gene) <- enh_counts_all_gene$SYMBOL
-enh_counts_all_gene$SYMBOL    <- NULL
-enh_counts_all_gene <- as.matrix(enh_counts_all_gene)
-
-cat("[2] enh_counts_all_gene dim (genes × samples): ",
-    paste(dim(enh_counts_all_gene), collapse = " × "), "\n", sep = "")
+  cat("[1] Panel loaded:\n")
+  cat("    • unique marker genes : ", length(panel_genes), "\n", sep = "")
+  cat("    • cell_type levels    : ", paste(ct_levels, collapse = " → "), "\n", sep = "")
+}
 
 # ---------------------------------------------------------------------
-# 3 — Subset enhancer matrix to Ilaria genes & gene-level z-score
+# 2 — Define enhancer peaks by TSS-window complement + QC
 # ---------------------------------------------------------------------
-cat("\n[3] Subsetting enhancer matrix to Ilaria genes and z-scoring...\n")
+cat("\n[2] Defining enhancer peaks by |distanceToTSS| > PROMOTER_WINDOW_BP...\n")
+
+anno_tss <- anno_df %>%
+  dplyr::mutate(
+    .tss_dist = suppressWarnings(as.numeric(as.character(.data$distanceToTSS))),
+    .abs_tss  = abs(.tss_dist)
+  )
+
+cat("[2-QC] distanceToTSS |abs| summary:\n")
+print(summary(anno_tss$.abs_tss))
+
+n_na_dist <- sum(is.na(anno_tss$.abs_tss))
+cat("[2-QC] peaks with NA distanceToTSS after coercion: ", n_na_dist, "\n", sep = "")
+
+enh_tss_df <- anno_tss %>%
+  dplyr::filter(!is.na(.abs_tss), .abs_tss > PROMOTER_WINDOW_BP) %>%
+  dplyr::filter(!is.na(SYMBOL), SYMBOL != "") %>%
+  dplyr::select(peak_id, SYMBOL, .tss_dist, .abs_tss, dplyr::any_of("annotation")) %>%
+  dplyr::distinct()
+
+cat("[2] enhancer peaks (TSS-complement) with SYMBOL: ", nrow(enh_tss_df), "\n", sep = "")
+cat("[2] unique SYMBOL captured by enhancers: ", length(unique(enh_tss_df$SYMBOL)), "\n", sep = "")
+
+# Optional QC: how many of these would have been labeled "Promoter" by annotation?
+if ("annotation" %in% colnames(enh_tss_df)) {
+  cat("\n[2-QC] Overlap check: enhancer-by-distance vs annotation containing 'Promoter'\n")
+  tab_prom <- enh_tss_df %>%
+    dplyr::mutate(.annot_prom = stringr::str_detect(.data$annotation, "Promoter")) %>%
+    dplyr::count(.annot_prom)
+  print(tab_prom)
+
+  cat("[2-QC] annotation categories within enhancer-by-distance (top 10):\n")
+  print(
+    enh_tss_df %>%
+      dplyr::count(annotation, sort = TRUE) %>%
+      utils::head(10)
+  )
+}
+
+enh_common_peaks <- intersect(rownames(counts), enh_tss_df$peak_id)
+cat("[2] enhancer peaks overlapping rownames(counts): ", length(enh_common_peaks), "\n", sep = "")
+if (length(enh_common_peaks) == 0L) stop("[2] ERROR: No overlap between enhancer peaks and rownames(counts).")
+
+# ---------------------------------------------------------------------
+# 3 — QC: peaks-per-gene among enhancers + choose ONE enhancer peak per gene
+# ---------------------------------------------------------------------
+cat("\n[3] QC: peaks-per-gene (enhancers) + selecting closest enhancer peak per gene...\n")
+
+peaks_per_gene_enh <- enh_tss_df %>%
+  dplyr::filter(peak_id %in% enh_common_peaks) %>%
+  dplyr::count(SYMBOL, name = "n_enh_peaks") %>%
+  dplyr::arrange(dplyr::desc(n_enh_peaks))
+
+cat("[3-QC] peaks-per-gene summary (enhancers):\n")
+print(summary(peaks_per_gene_enh$n_enh_peaks))
+cat("[3-QC] top genes by # enhancer peaks (first 10):\n")
+print(utils::head(peaks_per_gene_enh, 10))
+
+# One enhancer peak per gene: closest enhancer (min abs(distanceToTSS) among enhancers)
+enh_gene_map_one <- enh_tss_df %>%
+  dplyr::filter(peak_id %in% enh_common_peaks) %>%
+  dplyr::group_by(SYMBOL) %>%
+  dplyr::slice_min(.abs_tss, with_ties = FALSE) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(SYMBOL, peak_id, .tss_dist, .abs_tss) %>%
+  dplyr::distinct()
+
+cat("[3] selected 1 enhancer peak/gene (closest enhancer): ", nrow(enh_gene_map_one), "\n", sep = "")
+stopifnot(!anyDuplicated(enh_gene_map_one$SYMBOL))
+
+genes_per_peak_enh <- enh_gene_map_one %>%
+  dplyr::count(peak_id, name = "n_genes") %>%
+  dplyr::arrange(dplyr::desc(n_genes))
+
+n_ambig_peak <- sum(genes_per_peak_enh$n_genes > 1)
+cat("[3-QC] selected enhancer peaks mapping to >1 gene: ", n_ambig_peak, "\n", sep = "")
+
+# ---------------------------------------------------------------------
+# 4 — Build enhancer gene matrix (genes × samples)
+# ---------------------------------------------------------------------
+cat("\n[4] Building enh_counts_all_gene (genes × samples) using ONE enhancer peak/gene...\n")
+
+enh_counts_all_gene <- counts[enh_gene_map_one$peak_id, , drop = FALSE]
+rownames(enh_counts_all_gene) <- enh_gene_map_one$SYMBOL
+
+cat("[4] enh_counts_all_gene dim: ", paste(dim(enh_counts_all_gene), collapse = " × "), "\n", sep = "")
+stopifnot(!anyDuplicated(rownames(enh_counts_all_gene)))
+stopifnot(all(colnames(enh_counts_all_gene) == colnames(counts)))
+
+# ---------------------------------------------------------------------
+# 5 — Subset to Ilaria genes & z-score per gene
+# ---------------------------------------------------------------------
+cat("\n[5] Subsetting enhancer gene matrix to Ilaria genes & z-scoring...\n")
 
 enh_genes_in_atac <- intersect(rownames(enh_counts_all_gene), panel_genes)
-cat("[3] genes in (enhancers ∩ Ilaria): ",
-    length(enh_genes_in_atac), "\n", sep = "")
+cat("[5] genes in (enhancers one-peak ∩ Ilaria): ", length(enh_genes_in_atac), "\n", sep = "")
+if (length(enh_genes_in_atac) == 0L) stop("[5] ERROR: No Ilaria genes found in enhancer-only gene matrix.")
 
-if (length(enh_genes_in_atac) == 0L) {
-    stop("[3] ERROR: No Ilaria genes among enhancer-only genes.")
-}
+enh_mat <- enh_counts_all_gene[enh_genes_in_atac, , drop = FALSE]
+cat("[5] enh_mat dim (Ilaria genes × samples): ", paste(dim(enh_mat), collapse = " × "), "\n", sep = "")
 
-enh_atac_mat <- enh_counts_all_gene[enh_genes_in_atac, , drop = FALSE]
-cat("[3] enh_atac_mat dim (Ilaria genes × samples): ",
-    paste(dim(enh_atac_mat), collapse = " × "), "\n", sep = "")
+enh_z_gene <- t(scale(t(enh_mat)))
+enh_z_gene[is.na(enh_z_gene)] <- 0
 
-enh_atac_z_gene <- t(scale(t(enh_atac_mat)))
-enh_atac_z_gene[is.na(enh_atac_z_gene)] <- 0
+cat("[5] Example enhancer gene z-scores (5 genes × 5 samples):\n")
+print(round(enh_z_gene[1:5, 1:5, drop = FALSE], 3))
 
-cat("[3] Example enhancer gene z-scores (5 genes × 5 samples):\n")
-print(round(enh_atac_z_gene[1:5, 1:5, drop = FALSE], 3))
-
-# ---------------------------------------------------------------------
-# 4 — Expand to gene×cell-type rows
-# ---------------------------------------------------------------------
-cat("\n[4] Expanding enhancer matrix to gene×cell-type rows...\n")
-
-enh_panel_expanded <- panel_long %>%
-    dplyr::filter(gene %in% enh_genes_in_atac) %>%
-    dplyr::mutate(enh_row_id = paste(gene, cell_type, sep = "|"))
-
-cat("[4] enh_panel_expanded rows: ",
-    nrow(enh_panel_expanded), "\n", sep = "")
-cat("[4] unique enh_row_id       : ",
-    length(unique(enh_panel_expanded$enh_row_id)), "\n", sep = "")
-
-enh_atac_expanded <- enh_panel_expanded %>%
-    dplyr::select(enh_row_id, gene, cell_type) %>%
-    dplyr::left_join(
-        enh_atac_z_gene %>%
-            as.data.frame() %>%
-            tibble::rownames_to_column("gene"),
-        by = "gene",
-        relationship = "many-to-many"
-    )
-
-cat("[4] enh_atac_expanded rows after join: ",
-    nrow(enh_atac_expanded), "\n", sep = "")
-
-enh_mat_expanded <- enh_atac_expanded %>%
-    dplyr::select(-gene, -cell_type) %>%
-    tibble::column_to_rownames("enh_row_id") %>%
-    as.matrix()
-
-cat("[4] enh_mat_expanded dim (gene×ct rows × samples): ",
-    paste(dim(enh_mat_expanded), collapse = " × "), "\n", sep = "")
+cat("\n[5-QC] Marker overlap per cell_type under enhancer-only one-peak strategy:\n")
+marker_overlap <- panel_long %>%
+  dplyr::group_by(cell_type) %>%
+  dplyr::summarise(
+    n_markers_panel   = dplyr::n_distinct(gene),
+    n_markers_present = sum(unique(gene) %in% enh_genes_in_atac),
+    frac_present      = n_markers_present / n_markers_panel,
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(dplyr::desc(frac_present))
+print(marker_overlap)
 
 # ---------------------------------------------------------------------
-# 5 — Raw enhancer module matrix: enh_avg_z_by_ct_ATAC_raw
+# 6 — Raw module matrix (CT × samples) + QC low-SD samples
 # ---------------------------------------------------------------------
-cat("\n[5] Computing raw enhancer module matrix (enh_avg_z_by_ct_ATAC_raw)...\n")
-
-enh_ct_for_row <- enh_panel_expanded$cell_type
-names(enh_ct_for_row) <- enh_panel_expanded$enh_row_id
-enh_ct_for_row <- enh_ct_for_row[rownames(enh_mat_expanded)]
-
-cat("[5] Alignment check — first 5 rows:\n")
-print(
-    head(
-        cbind(
-            enh_ct_for_row = enh_ct_for_row[1:5],
-            rowname        = names(enh_ct_for_row)[1:5]
-        )
-    )
-)
+cat("\n[6] Computing enhancer-only raw module matrix (enh_avg_z_by_ct_ATAC_raw)...\n")
 
 enh_avg_z_by_ct_ATAC_raw <- do.call(
-    rbind,
-    lapply(ct_levels, function(ct) {
-        idx <- which(enh_ct_for_row == ct)
-        if (length(idx) == 0L) {
-            cat("[5] WARNING: no enhancer markers for cell_type ", ct,
-                "; filling with NA.\n", sep = "")
-            return(rep(NA_real_, ncol(enh_mat_expanded)))
-        } else {
-            return(colMeans(enh_mat_expanded[idx, , drop = FALSE], na.rm = TRUE))
-        }
-    })
+  rbind,
+  lapply(ct_levels, function(ct) {
+
+    genes_ct <- panel_long %>%
+      dplyr::filter(cell_type == ct, gene %in% enh_genes_in_atac) %>%
+      dplyr::pull(gene) %>%
+      unique()
+
+    if (length(genes_ct) == 0L) {
+      cat("[6] WARNING: no enhancer markers present for ", ct, "; filling NA.\n", sep = "")
+      return(rep(NA_real_, ncol(enh_z_gene)))
+    }
+
+    colMeans(enh_z_gene[genes_ct, , drop = FALSE], na.rm = TRUE)
+  })
 )
 rownames(enh_avg_z_by_ct_ATAC_raw) <- ct_levels
+colnames(enh_avg_z_by_ct_ATAC_raw) <- colnames(enh_z_gene)
 
-cat("[5] enh_avg_z_by_ct_ATAC_raw dim (7 × samples): ",
-    paste(dim(enh_avg_z_by_ct_ATAC_raw), collapse = " × "), "\n", sep = "")
-cat("[5] Example RAW enhancer module scores (first 5 samples):\n")
+cat("[6] enh_avg_z_by_ct_ATAC_raw dim: ", paste(dim(enh_avg_z_by_ct_ATAC_raw), collapse = " × "), "\n", sep = "")
+cat("[6] Example RAW enhancer module scores (first 5 samples):\n")
 print(round(enh_avg_z_by_ct_ATAC_raw[, 1:5, drop = FALSE], 3))
 
-# ---------------------------------------------------------------------
-# 6 — Column-wise scaling across modules (CRUCIAL)
-# ---------------------------------------------------------------------
-cat("\n[6] Column-wise scaling across the 7 lineages (enhancer-only)...\n")
-cat("    This enforces per-sample mean ~ 0 and sd ~ 1 across modules,\n")
-cat("    preventing 'all-red' columns.\n\n")
-
-enh_avg_z_by_ct_ATAC <- scale(enh_avg_z_by_ct_ATAC_raw,
-                              center = TRUE, scale = TRUE)
-
-col_means_mod_enh <- apply(enh_avg_z_by_ct_ATAC, 2, mean)
-col_sds_mod_enh   <- apply(enh_avg_z_by_ct_ATAC, 2, sd)
-
-cat("[6] Per-sample mean(z) across 7 lineages (after scaling):\n")
-print(summary(col_means_mod_enh))
-cat("[6] Per-sample sd(z) across 7 lineages (after scaling):\n")
-print(summary(col_sds_mod_enh))
-
-all_pos_enh <- apply(enh_avg_z_by_ct_ATAC, 2, function(v) all(v > 0))
-cat("[6] Samples with ALL enhancer module scores > 0 (should be 0): ",
-    sum(all_pos_enh), "\n", sep = "")
-
-cat("[6] Example SCALED enhancer module scores (first 5 samples):\n")
-print(round(enh_avg_z_by_ct_ATAC[, 1:5, drop = FALSE], 3))
+cat("\n[6-QC] Module SD BEFORE column scaling (per sample):\n")
+sd_by_sample <- apply(enh_avg_z_by_ct_ATAC_raw, 2, stats::sd, na.rm = TRUE)
+print(summary(sd_by_sample))
+low_sd <- names(sd_by_sample)[sd_by_sample < 0.05]
+cat("[6-QC] samples with sd < 0.05 across modules: ", length(low_sd), "\n", sep = "")
+if (length(low_sd) > 0) print(low_sd)
 
 # ---------------------------------------------------------------------
-# 7 — Dominant lineage + margins (enhancer-only, scaled)
+# 7 — Column-wise scaling across modules + QC
 # ---------------------------------------------------------------------
-cat("\n[7] Computing dominant lineage & margins (enhancer-only, scaled)...\n")
+cat("\n[7] Column-wise scaling across enhancer-only modules (per sample)...\n")
 
-enh_top_idx    <- apply(enh_avg_z_by_ct_ATAC, 2, which.max)
-enh_second_idx <- apply(enh_avg_z_by_ct_ATAC, 2, function(v) order(v, decreasing = TRUE)[2])
+enh_avg_z_by_ct_ATAC <- scale(enh_avg_z_by_ct_ATAC_raw, center = TRUE, scale = TRUE)
+
+col_means_mod <- apply(enh_avg_z_by_ct_ATAC, 2, mean)
+col_sds_mod   <- apply(enh_avg_z_by_ct_ATAC, 2, sd)
+
+cat("[7] Per-sample mean(z) across modules (after scaling):\n")
+print(summary(col_means_mod))
+cat("[7] Per-sample sd(z) across modules (after scaling):\n")
+print(summary(col_sds_mod))
+
+all_pos <- apply(enh_avg_z_by_ct_ATAC, 2, function(v) all(v > 0))
+cat("[7] Samples with ALL enhancer module scores > 0 (should be 0): ", sum(all_pos), "\n", sep = "")
+
+# ---------------------------------------------------------------------
+# 8 — Dominant lineage + margins + QC RAW vs SCALED
+# ---------------------------------------------------------------------
+cat("\n[8] Dominant lineage & margins (enhancer-only) + QC RAW vs SCALED...\n")
+
+top_idx    <- apply(enh_avg_z_by_ct_ATAC, 2, which.max)
+second_idx <- apply(enh_avg_z_by_ct_ATAC, 2, function(v) order(v, decreasing = TRUE)[2])
 
 enh_dominant_tbl_ATAC <- tibble::tibble(
-    sample       = colnames(enh_avg_z_by_ct_ATAC),
-    top_ct       = ct_levels[enh_top_idx],
-    top_score    = enh_avg_z_by_ct_ATAC[cbind(enh_top_idx, seq_along(enh_top_idx))],
-    second_ct    = ct_levels[enh_second_idx],
-    second_score = enh_avg_z_by_ct_ATAC[cbind(enh_second_idx, seq_along(enh_second_idx))]
+  sample       = colnames(enh_avg_z_by_ct_ATAC),
+  top_ct       = ct_levels[top_idx],
+  top_score    = enh_avg_z_by_ct_ATAC[cbind(top_idx, seq_along(top_idx))],
+  second_ct    = ct_levels[second_idx],
+  second_score = enh_avg_z_by_ct_ATAC[cbind(second_idx, seq_along(second_idx))]
 ) %>%
-    dplyr::mutate(
-        margin = top_score - second_score
-    ) %>%
-    dplyr::left_join(
-        meta_sj %>% dplyr::select(Sample, genotype),
-        by = c("sample" = "Sample")
-    )
+  dplyr::mutate(margin = top_score - second_score) %>%
+  dplyr::left_join(meta_sj %>% dplyr::select(Sample, genotype),
+                   by = c("sample" = "Sample"))
 
-cat("[7] First 10 enhancer dominance calls:\n")
-print(utils::head(enh_dominant_tbl_ATAC, 10))
-
-cat("\n[7] Frequency of enhancer-based top_ct assignments:\n")
+cat("[8] top_ct frequencies:\n")
 print(sort(table(enh_dominant_tbl_ATAC$top_ct), decreasing = TRUE))
-
-cat("\n[7] Margin summary (enhancer-only, scaled):\n")
+cat("[8] margin summary:\n")
 print(summary(enh_dominant_tbl_ATAC$margin))
 
+cat("\n[8-QC] Dominance consistency: RAW vs SCALED...\n")
+raw_top  <- apply(enh_avg_z_by_ct_ATAC_raw, 2, which.max)
+sc_top   <- apply(enh_avg_z_by_ct_ATAC,     2, which.max)
+raw_call <- ct_levels[raw_top]
+sc_call  <- ct_levels[sc_top]
+cat("  • % same top_ct (RAW vs SCALED): ", round(100 * mean(raw_call == sc_call, na.rm = TRUE), 2), "%\n", sep = "")
+cat("  • Confusion (RAW rows vs SCALED cols):\n")
+print(table(raw_call, sc_call))
+
 # ---------------------------------------------------------------------
-# 8 — Order samples: top_ct → margin → top_score
+# 9 — Order samples + pheatmap annotations + heatmap
 # ---------------------------------------------------------------------
-cat("\n[8] Ordering samples (top_ct → margin → top_score) [enhancers]...\n")
+cat("\n[9] Ordering samples (top_ct → margin → top_score) + heatmap...\n")
 
 enh_col_order <- order(
-    factor(enh_dominant_tbl_ATAC$top_ct, levels = ct_levels),
-    -enh_dominant_tbl_ATAC$margin,
-    -enh_dominant_tbl_ATAC$top_score
+  factor(enh_dominant_tbl_ATAC$top_ct, levels = ct_levels),
+  -enh_dominant_tbl_ATAC$margin,
+  -enh_dominant_tbl_ATAC$top_score
 )
 
 enh_avg_z_by_ct_ord  <- enh_avg_z_by_ct_ATAC[, enh_col_order, drop = FALSE]
 enh_dominant_tbl_ord <- enh_dominant_tbl_ATAC[enh_col_order, ]
 
-cat("[8] enh_avg_z_by_ct_ord dim: ",
-    paste(dim(enh_avg_z_by_ct_ord), collapse = " × "), "\n", sep = "")
-
-# ---------------------------------------------------------------------
-# 9 — Build annotations for pheatmap
-# ---------------------------------------------------------------------
-cat("\n[9] Building enh_ann_col_ATAC for pheatmap...\n")
-
 enh_margin_bins <- cut(
-    enh_dominant_tbl_ord$margin,
-    breaks = quantile(enh_dominant_tbl_ord$margin, probs = seq(0, 1, 0.25), na.rm = TRUE),
-    include.lowest = TRUE,
-    labels = c("Q1 (lowest)", "Q2", "Q3", "Q4 (highest)")
+  enh_dominant_tbl_ord$margin,
+  breaks = quantile(enh_dominant_tbl_ord$margin, probs = seq(0, 1, 0.25), na.rm = TRUE),
+  include.lowest = TRUE,
+  labels = c("Q1 (lowest)", "Q2", "Q3", "Q4 (highest)")
 )
 
 enh_ann_col_ATAC <- data.frame(
-    top_ct   = factor(enh_dominant_tbl_ord$top_ct, levels = ct_levels),
-    margin   = enh_margin_bins,
-    genotype = enh_dominant_tbl_ord$genotype,
-    row.names = enh_dominant_tbl_ord$sample,
-    stringsAsFactors = FALSE
+  top_ct    = factor(enh_dominant_tbl_ord$top_ct, levels = ct_levels),
+  margin    = enh_margin_bins,
+  genotype  = enh_dominant_tbl_ord$genotype,
+  row.names = enh_dominant_tbl_ord$sample,
+  stringsAsFactors = FALSE
 )
 
-cat("[9] enh_ann_col_ATAC head:\n")
-print(utils::head(enh_ann_col_ATAC, 10))
-
-# Reuse palettes from main pipeline, or define if missing
+# Palettes (reuse if present; otherwise define)
 if (!exists("cell_type_colors")) {
-    cell_type_colors <- c(
-        HSCMPP        = "#fb8072",
-        GMP           = "#bebada",
-        pDC           = "#ffd92f",
-        EarlyLymphoid = "#f781bf",
-        ProB          = "#ff33ff",
-        PreB          = "#00e5c0",
-        B             = "#00bfff"
-    )
+  cell_type_colors <- c(
+    HSCMPP        = "#fb8072",
+    GMP           = "#bebada",
+    pDC           = "#ffd92f",
+    EarlyLymphoid = "#f781bf",
+    ProB          = "#ff33ff",
+    PreB          = "#00e5c0",
+    B             = "#00bfff"
+  )
 }
 if (!exists("margin_colors")) {
-    margin_colors <- c(
-        "Q1 (lowest)" = "#c7e9c0",
-        "Q2"          = "#a1d99b",
-        "Q3"          = "#74c476",
-        "Q4 (highest)"= "#238b45"
-    )
+  margin_colors <- c(
+    "Q1 (lowest)"  = "#c7e9c0",
+    "Q2"           = "#a1d99b",
+    "Q3"           = "#74c476",
+    "Q4 (highest)" = "#238b45"
+  )
 }
 if (!exists("genotype_colors")) {
-    genotype_colors <- c(
-        TT = "#f65e0dff",
-        TC = "#0c2e18ff",
-        CC = "#d7a419ff"
-    )
+  genotype_colors <- c(
+    TT = "#f65e0dff",
+    TC = "#0c2e18ff",
+    CC = "#d7a419ff"
+  )
 }
-
-# ---------------------------------------------------------------------
-# 10 — Final enhancer-only dominance heatmap
-# ---------------------------------------------------------------------
-cat("\n[10] Drawing enhancer-only ATAC dominance heatmap (column-scaled)...\n")
 
 enh_z_col_fun <- colorRampPalette(c("blue", "white", "red"))(201)
 
 pheatmap::pheatmap(
-    enh_avg_z_by_ct_ord,
-    color            = enh_z_col_fun,
-    cluster_rows     = FALSE,
-    cluster_cols     = FALSE,
-    show_rownames    = TRUE,
-    show_colnames    = FALSE,
-    annotation_col   = enh_ann_col_ATAC,
-    annotation_colors = list(
-        top_ct   = cell_type_colors,
-        margin   = margin_colors,
-        genotype = genotype_colors
-    ),
-    border_color = NA,
-    main = "ATAC module activity (ENHANCER PEAKS ONLY; column-scaled dominance)"
+  enh_avg_z_by_ct_ord,
+  color             = enh_z_col_fun,
+  cluster_rows      = FALSE,
+  cluster_cols      = FALSE,
+  show_rownames     = TRUE,
+  show_colnames     = FALSE,
+  annotation_col    = enh_ann_col_ATAC,
+  annotation_colors = list(
+    top_ct   = cell_type_colors,
+    margin   = margin_colors,
+    genotype = genotype_colors
+  ),
+  border_color = NA,
+  main = paste0("ATAC module activity (ENHANCERS = |distanceToTSS| > ",
+                PROMOTER_WINDOW_BP, "bp; one peak/gene = closest enhancer; column-scaled)")
 )
 
-cat("\n[ENH-COL] DONE — enhancer-only modules are now internally\n")
-cat("           standardized per sample; no column should be uniformly red.\n")
-cat("===============================================================\n\n")
+
 ```
 
 ## 15 Savics
@@ -6453,5 +6461,13 @@ cat("============================================================\n\n")
 
 
 ## What is the overlap of samples called proB cells between Ilarias and Savics? How consistent is the sample being called a 'ProB' accross all of them. prepro and
+
+
+```{r}
+
+```
+
+
+
 
 CLP from Savics overlapping with early lymphoid from Ilarias
