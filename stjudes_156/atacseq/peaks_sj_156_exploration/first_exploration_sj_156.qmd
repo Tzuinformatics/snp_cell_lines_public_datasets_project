@@ -3453,7 +3453,8 @@ ggplot(umap_df, aes(UMAP1, UMAP2)) +
 # 13 Confusion matrix
 ```{r}
 # ================================================================
-# CONFUSION MATRIX — Naives removed + Dev order + Stacked bars + Confidence
+# CONFUSION MATRIX — Naive CD5± removed + Transitional-B removed
+# Dev order updated accordingly
 # ================================================================
 suppressPackageStartupMessages({
     library(ggplot2)
@@ -3462,22 +3463,25 @@ suppressPackageStartupMessages({
     library(tidyr)
 })
 
-cat("\n=== CONFUSION MATRIX (FULL VERSION) — Naives removed ===\n")
+cat("\n=== CONFUSION MATRIX (FULL VERSION) — Naive CD5± + Transitional-B removed ===\n")
 
 # -------------------------------------------------------------
-# 0. Define developmental order
+# 0) Define developmental order (Transitional-B REMOVED)
 # -------------------------------------------------------------
-dev_order <- c("HSC", "CLP", "ProB", "PreB", "Immature-B", "Transitional-B")
+dev_order <- c("HSC", "CLP", "ProB", "PreB", "Immature-B")
 
 # -------------------------------------------------------------
-# 1. Healthy reference (remove Naives)
+# 1) Healthy reference (remove Naives + Transitional-B)
 # -------------------------------------------------------------
 healthy_ref <- umap_df %>%
     dplyr::filter(cohort == "Healthy", !is.na(cell_type)) %>%
-    dplyr::filter(!(cell_type %in% c("Naive-CD5-", "Naive-CD5--")))
+    dplyr::filter(!(cell_type %in% c("Naive-CD5-", "Naive-CD5--", "Transitional-B")))
 
-if (nrow(healthy_ref) == 0)
-    stop("No Healthy samples with valid cell_type.")
+cat("[CHECK] Healthy_ref n=", nrow(healthy_ref), "\n", sep = "")
+cat("[CHECK] Healthy_ref cell_type counts:\n")
+print(sort(table(healthy_ref$cell_type), decreasing = TRUE))
+
+if (nrow(healthy_ref) == 0L) stop("No Healthy samples with valid cell_type after filtering.")
 
 healthy_centroids <- healthy_ref %>%
     dplyr::group_by(cell_type) %>%
@@ -3487,15 +3491,14 @@ healthy_centroids <- healthy_ref %>%
         n  = dplyr::n(),
         .groups = "drop"
     ) %>%
-    dplyr::arrange(factor(cell_type, levels = dev_order))
+    dplyr::mutate(cell_type = factor(cell_type, levels = dev_order)) %>%
+    dplyr::arrange(cell_type)
 
-all_lineages <- healthy_centroids$cell_type
-
-cat("[1] Healthy centroids:\n")
+cat("\n[1] Healthy centroids (filtered):\n")
 print(healthy_centroids)
 
 # -------------------------------------------------------------
-# 2. Classify SJ156 by nearest centroid + compute confidence
+# 2) Classify SJ156 by nearest centroid + compute confidence
 # -------------------------------------------------------------
 sj_samples_umap <- umap_df %>%
     dplyr::filter(cohort == "SJ156") %>%
@@ -3504,33 +3507,30 @@ sj_samples_umap <- umap_df %>%
 centroid_mat <- as.matrix(healthy_centroids[, c("CX", "CY")])
 sj_mat       <- as.matrix(sj_samples_umap[, c("UMAP1", "UMAP2")])
 
-# 1-NN index
 nearest_idx <- FNN::knnx.index(
     data  = centroid_mat,
     query = sj_mat,
     k     = 1
 )
 
-# Compute ALL distances (for confidence ratio)
 all_dist <- FNN::knnx.dist(
     data  = centroid_mat,
     query = sj_mat,
     k     = nrow(centroid_mat)
 )
 
-# Ratio = closest_dist / second_closest_dist
-closest  <- all_dist[, 1]
+closest        <- all_dist[, 1]
 second_closest <- all_dist[, 2]
-conf_ratio <- closest / second_closest  # closer to 0 → more confident
+confidence_ratio <- closest / second_closest  # closer to 0 => more confident
 
 sj_samples_umap <- sj_samples_umap %>%
     dplyr::mutate(
-        inferred_lineage = healthy_centroids$cell_type[nearest_idx],
-        confidence_ratio = conf_ratio
+        inferred_lineage  = as.character(healthy_centroids$cell_type[nearest_idx]),
+        confidence_ratio  = confidence_ratio
     )
 
 # -------------------------------------------------------------
-# 3. Build confusion matrix (WITH dev order)
+# 3) Build confusion matrix (WITH dev order)
 # -------------------------------------------------------------
 sj_meta <- sj156_state$meta_sj %>% dplyr::select(Sample, Subtype)
 
@@ -3543,11 +3543,11 @@ conf_df <- sj_samples_umap %>%
 
 conf_mat <- table(conf_df$Subtype, conf_df$inferred_lineage)
 
-cat("\n[2] Confusion matrix with developmental ordering:\n")
+cat("\n[2] Confusion matrix with developmental ordering (filtered refs):\n")
 print(conf_mat)
 
 # -------------------------------------------------------------
-# 4. Heatmap
+# 4) Heatmap
 # -------------------------------------------------------------
 conf_df_plot <- as.data.frame(conf_mat)
 colnames(conf_df_plot) <- c("SJ_Subtype", "Inferred_Lineage", "Count")
@@ -3560,13 +3560,13 @@ ggplot(conf_df_plot,
     theme_bw(base_size = 14) +
     labs(
         title    = "Confusion Matrix: SJ156 Subtypes vs Healthy Lineages",
-        subtitle = "Nearest-centroid classifier (ComBat-corrected), Naives removed",
+        subtitle = "Nearest-centroid classifier (ComBat-corrected); Naive CD5± + Transitional-B removed",
         x = "Inferred lineage (Healthy reference)",
         y = "SJ156 subtype"
     )
 
 # -------------------------------------------------------------
-# 5. Subtype-specific stacked barplots (percentage)
+# 5) Subtype-specific stacked barplots (%)
 # -------------------------------------------------------------
 stack_df <- conf_df %>%
     dplyr::count(Subtype, inferred_lineage) %>%
@@ -3582,16 +3582,16 @@ ggplot(stack_df,
     coord_flip() +
     labs(
         title = "Subtype-specific distribution of inferred lineages",
+        subtitle = "Reference lineages exclude Naive CD5± and Transitional-B",
         y = "% of samples",
         x = "SJ156 subtype",
         fill = "Inferred lineage"
     )
 
 # -------------------------------------------------------------
-# 6. Confidence ratio histogram
+# 6) Confidence ratio histogram
 # -------------------------------------------------------------
-ggplot(conf_df,
-       aes(x = confidence_ratio)) +
+ggplot(conf_df, aes(x = confidence_ratio)) +
     geom_histogram(bins = 30, fill = "#1f78b4", color = "white", alpha = 0.8) +
     theme_bw(base_size = 14) +
     labs(
@@ -3601,8 +3601,11 @@ ggplot(conf_df,
         y = "Count"
     )
 
-```
+cat("\n[CHECK] Assigned inferred_lineage counts (SJ156):\n")
+print(conf_df %>% dplyr::count(inferred_lineage))
 
+```
+Ditch transitional B on both matrix and umap
  
 # 14 Heatmap of sj156 using ilarias markers
 
@@ -3618,17 +3621,98 @@ ggplot(conf_df,
 
 suppressPackageStartupMessages({
     library(dplyr)
-    library(tidyr)
     library(readr)
     library(tibble)
+    library(tidyr)
     library(pheatmap)
-    library(stringr)
 })
 
-cat("\n===============================================================\n")
-cat("ATAC ILARIA PIPELINE — COLUMN-SCALED DOMINANCE\n")
-cat("===============================================================\n\n")
+cat("\n[ILARIA-HEATMAP/ALL] =============================================\n")
+cat("[ILARIA-HEATMAP/ALL] Starting heatmap generation for ALL PEAKS\n")
 
+# ------------------------------------------------
+# 0. Sanity: peak-level counts and annotation
+# ------------------------------------------------
+cat("[ILARIA-HEATMAP/ALL] Checking peak-level `counts` and `anno_df`...\n")
+cat("  • counts class: ", paste(class(counts), collapse = ", "), "\n", sep = "")
+cat("  • counts dim   : ", paste(dim(counts), collapse = " x "), "\n", sep = "")
+
+if (is.null(rownames(counts)) || is.null(colnames(counts))) {
+    stop("[ILARIA-HEATMAP/ALL] ERROR: `counts` must have both rownames (features) and colnames (samples).")
+}
+
+if (!exists("anno_df")) {
+    stop("[ILARIA-HEATMAP/ALL] ERROR: `anno_df` not found. Run the annotatePeak chunk first.")
+}
+
+cat("  • anno_df dim  : ", paste(dim(anno_df), collapse = " x "), "\n", sep = "")
+cat("  • anno_df cols : ", paste(colnames(anno_df), collapse = ", "), "\n", sep = "")
+
+# anno_df must have peak_id + SYMBOL
+stopifnot(all(c("peak_id", "SYMBOL") %in% colnames(anno_df)))
+
+# ------------------------------------------------
+# 0.1 Build peak → gene (SYMBOL) mapping
+# ------------------------------------------------
+cat("\n[ILARIA-HEATMAP/ALL] Building peak → gene mapping from anno_df...\n")
+
+gene_map <- anno_df %>%
+    dplyr::select(peak_id, SYMBOL) %>%
+    filter(!is.na(SYMBOL), SYMBOL != "") %>%
+    distinct()
+
+cat("  • gene_map rows (peak_id with SYMBOL): ", nrow(gene_map), "\n", sep = "")
+cat("  • unique SYMBOLs                     : ", length(unique(gene_map$SYMBOL)), "\n", sep = "")
+
+# overlap between counts and gene_map
+peaks_in_counts <- rownames(counts)
+common_peaks    <- intersect(peaks_in_counts, gene_map$peak_id)
+
+cat("  • peaks in counts          : ", length(peaks_in_counts), "\n", sep = "")
+cat("  • peaks in gene_map        : ", length(unique(gene_map$peak_id)), "\n", sep = "")
+cat("  • common peaks (used)      : ", length(common_peaks), "\n", sep = "")
+
+if (length(common_peaks) == 0L) {
+    stop("[ILARIA-HEATMAP/ALL] ERROR: No overlap between rownames(counts) and gene_map$peak_id.")
+}
+
+# ------------------------------------------------
+# 0.2 Build gene-level ALL-PEAKS matrix (sum of peaks per SYMBOL)
+# ------------------------------------------------
+cat("\n[ILARIA-HEATMAP/ALL] Aggregating peak counts to gene-level (ALL PEAKS)...\n")
+
+# Convert counts to data frame for easier join
+counts_df <- as.data.frame(counts)
+counts_df$peak_id <- rownames(counts_df)
+
+# Restrict to common peaks and join SYMBOL
+counts_gene_df <- gene_map %>%
+    filter(peak_id %in% common_peaks) %>%
+    left_join(counts_df, by = "peak_id")
+
+cat("  • rows after join (peak x sample with SYMBOL): ",
+    nrow(counts_gene_df), "\n", sep = "")
+
+# Group by SYMBOL and sum across peaks for each gene
+counts_gene_summarised <- counts_gene_df %>%
+    dplyr::select(-peak_id) %>%
+    group_by(SYMBOL) %>%
+    summarise(across(.cols = where(is.numeric), .fns = sum), .groups = "drop")
+
+cat("  • gene-level rows (SYMBOL): ",
+    nrow(counts_gene_summarised), "\n", sep = "")
+
+# Convert back to matrix
+counts_all_gene <- counts_gene_summarised %>%
+    as.data.frame()
+
+rownames(counts_all_gene) <- counts_all_gene$SYMBOL
+counts_all_gene$SYMBOL    <- NULL
+
+counts_all_gene <- as.matrix(counts_all_gene)
+
+cat("  • counts_all_gene dim (genes x samples): ",
+    paste(dim(counts_all_gene), collapse = " x "), "\n", sep = "")
 # ---------------------------------------------------------------------
 # 1 — Load & clean Ilaria panel
 # ---------------------------------------------------------------------
@@ -3939,6 +4023,7 @@ pheatmap::pheatmap(
 cat("\n[ATAC] DONE — no column should now be uniformly red; each sample\n")
 cat("       is internally standardized across HSCMPP→B modules.\n")
 cat("===============================================================\n\n")
+
 
 ```
 
@@ -5290,27 +5375,498 @@ pheatmap::pheatmap(
 )
 ```
 
-```{r}
-pheatmap::pheatmap(
-    savics_avg_z_by_ct_prom_ord,
-    color            = savics_z_col_fun,
-    cluster_rows     = FALSE,
-    cluster_cols     = FALSE,
-    show_rownames    = TRUE,
-    show_colnames    = FALSE,
-    annotation_col   = savics_ann_col_prom,
-    annotation_colors = list(
-        top_ct   = savics_cell_type_colors,
-        margin   = margin_colors,
-        genotype = genotype_colors
-    ),
-    border_color = NA,
-    main = "ATAC module activity (Savics PROMOTER markers; liftOver + overlap; column-scaled)"
-)
-```
 
 #### Promoter only savic
 ```{r}
+# =====================================================================
+# ATAC — Savics S3 PROMOTER-ONLY dominance map WITH LIFTOVER (hg19 → hg38)
+#        and overlap to SJ156 promoter peaks
+#        (no sample should be "red for all progenitors")
+# =====================================================================
+# Requires in the environment:
+#   - counts   : matrix [peaks × samples], rownames = peak_id ("peak_1", ...)
+#   - anno_df  : data.frame with at least:
+#                seqnames, start, end, peak_id, annotation (hg38 coordinates)
+#   - meta_sj  : data.frame with columns Sample, genotype
+#   - Savics_S3.xlsx : hg19 peak markers with chr, start, stop, Defining_Progenitor
+#   - hg19ToHg38.over.chain.gz : UCSC chain file path (already in this wd)
+#   - Colors & palettes already defined elsewhere:
+#       savics_z_col_fun, savics_cell_type_colors, margin_colors, genotype_colors
+# =====================================================================
+
+suppressPackageStartupMessages({
+    library(dplyr)
+    library(tidyr)
+    library(readxl)
+    library(tibble)
+    library(pheatmap)
+    library(stringr)
+    library(GenomicRanges)
+    library(rtracklayer)
+    library(GenomeInfoDb)
+    library(R.utils)
+})
+
+cat("\n===============================================================\n")
+cat("ATAC SAVICS PIPELINE — PROMOTER-ONLY (LIFTOVER + OVERLAP + MODULES)\n")
+cat("===============================================================\n\n")
+
+# ---------------------------------------------------------------------
+# 0 — Sanity checks
+# ---------------------------------------------------------------------
+if (!exists("counts")) {
+    stop("[0] ERROR: `counts` (peak × sample matrix) not found.")
+}
+if (!exists("meta_sj")) {
+    stop("[0] ERROR: `meta_sj` (Sample + genotype) not found.")
+}
+if (!exists("anno_df")) {
+    stop("[0] ERROR: `anno_df` (peak annotation with coordinates) not found.")
+}
+if (!"annotation" %in% colnames(anno_df)) {
+    stop("[0] ERROR: `anno_df` must contain an `annotation` column (Promoter vs others).")
+}
+
+cat("[0] counts dim (peaks × samples): ",
+    paste(dim(counts), collapse = " × "), "\n", sep = "")
+cat("[0] anno_df dim (rows × cols): ",
+    paste(dim(anno_df), collapse = " × "), "\n", sep = "")
+
+# ---------------------------------------------------------------------
+# 0a — Restrict anno_df to PROMOTER peaks only
+# ---------------------------------------------------------------------
+cat("\n[0a] Subsetting anno_df to promoter-only peaks (using `annotation`)...\n")
+
+anno_prom <- anno_df %>%
+    dplyr::filter(
+        !is.na(annotation),
+        grepl("Promoter", annotation, ignore.case = TRUE)
+    )
+
+cat("[0a] anno_prom dim (promoter peaks × cols): ",
+    paste(dim(anno_prom), collapse = " × "), "\n", sep = "")
+if (nrow(anno_prom) == 0L) {
+    stop("[0a] ERROR: No promoter peaks found in anno_df$annotation.")
+}
+
+# ---------------------------------------------------------------------
+# 0b — Chain file (hg19 → hg38) — gunzip once, then import .chain
+# ---------------------------------------------------------------------
+chain_gz  <- "hg19ToHg38.over.chain.gz"
+chain_txt <- "hg19ToHg38.over.chain"
+
+if (!file.exists(chain_gz)) {
+    stop("[0b] ERROR: Chain .gz not found at: ",
+         normalizePath(chain_gz, mustWork = FALSE))
+}
+
+if (!file.exists(chain_txt)) {
+    cat("[0b] Unzipping chain file: ", chain_gz, " → ", chain_txt, "\n", sep = "")
+    R.utils::gunzip(chain_gz, destname = chain_txt,
+                    overwrite = TRUE, remove = FALSE)
+}
+
+first_line <- readLines(chain_txt, n = 1, warn = FALSE)
+if (!startsWith(first_line, "chain ")) {
+    stop("[0b] ERROR: Unzipped file does not start with 'chain'. Header:\n  ",
+         first_line)
+}
+
+hg19_to_hg38_chain <- rtracklayer::import.chain(chain_txt)
+cat("[0b] Loaded chain file: ", chain_txt, "\n", sep = "")
+
+# quick tiny sanity test
+test_hg19   <- GenomicRanges::GRanges("chr1", IRanges::IRanges(10000, 10050))
+lifted_test <- rtracklayer::liftOver(test_hg19, hg19_to_hg38_chain)
+cat("[0b] Test liftover returned ",
+    lengths(lifted_test), " hg38 ranges for chr1:10000-10050\n", sep = "")
+
+# ---------------------------------------------------------------------
+# 1 — Load Savics S3 hg19 peaks
+# ---------------------------------------------------------------------
+savics_path <- "Savics_S3.xlsx"
+
+cat("\n[1] Loading Savics peak markers (hg19) from:\n    ", savics_path, "\n", sep = "")
+savics_raw <- readxl::read_xlsx(savics_path)
+
+cat("[1] savics_raw dim (rows × cols): ",
+    paste(dim(savics_raw), collapse = " × "), "\n", sep = "")
+cat("[1] Columns:\n")
+print(colnames(savics_raw))
+
+savics_hg19_df <- savics_raw %>%
+    as.data.frame() %>%
+    dplyr::mutate(
+        chr                 = as.character(chr),
+        start               = as.integer(start),
+        stop                = as.integer(stop),
+        Defining_Progenitor = stringr::str_trim(as.character(Defining_Progenitor))
+    ) %>%
+    dplyr::distinct(chr, start, stop, Defining_Progenitor, .keep_all = TRUE)
+
+cat("\n[1] After cleaning (hg19 coord space):\n")
+cat("    • rows (peak × Defining_Progenitor string): ",
+    nrow(savics_hg19_df), "\n", sep = "")
+cat("    • unique coord triplets (chr,start,stop)  : ",
+    nrow(dplyr::distinct(savics_hg19_df, chr, start, stop)), "\n", sep = "")
+
+cat("\n[1] Example hg19 Savics rows:\n")
+print(utils::head(savics_hg19_df, 10))
+
+# how many progenitors per row?
+savics_hg19_df <- savics_hg19_df %>%
+    dplyr::mutate(
+        n_progenitors = lengths(
+            stringr::str_split(Defining_Progenitor, pattern = "\\s*,\\s*")
+        )
+    )
+
+cat("\n[1] Distribution of n_progenitors per row (Savics table):\n")
+print(
+    savics_hg19_df %>%
+        dplyr::count(n_progenitors, name = "n_rows") %>%
+        dplyr::arrange(n_progenitors)
+)
+
+# ---------------------------------------------------------------------
+# 1c — Build GRanges for Savics hg19 peaks & liftover to hg38
+# ---------------------------------------------------------------------
+cat("\n[1c] Building GRanges (hg19) and running liftOver → hg38...\n")
+
+savics_gr_hg19 <- GenomicRanges::GRanges(
+    seqnames = savics_hg19_df$chr,
+    ranges   = IRanges::IRanges(start = savics_hg19_df$start,
+                                end   = savics_hg19_df$stop)
+)
+
+savics_gr_hg38_list <- rtracklayer::liftOver(savics_gr_hg19, hg19_to_hg38_chain)
+orig_idx             <- rep(seq_along(savics_gr_hg19), lengths(savics_gr_hg38_list))
+savics_gr_hg38       <- unlist(savics_gr_hg38_list)
+
+cat("[1c] LiftOver result:\n")
+cat("    • original hg19 peaks      : ", length(savics_gr_hg19), "\n", sep = "")
+cat("    • hg38 ranges after LO     : ", length(savics_gr_hg38), "\n", sep = "")
+
+mapped_mask <- lengths(savics_gr_hg38_list) > 0
+n_mapped    <- sum(mapped_mask)
+n_unmapped  <- sum(!mapped_mask)
+
+cat("    • hg19 peaks with >=1 hg38 : ", n_mapped, "\n", sep = "")
+cat("    • hg19 peaks with 0 hg38   : ", n_unmapped, "\n", sep = "")
+
+if (n_mapped == 0L) {
+    stop("[1c] ERROR: liftover produced no hg38 mappings. Check chain/assembly.")
+}
+
+savics_hg38_df <- savics_hg19_df[orig_idx, , drop = FALSE] %>%
+    dplyr::mutate(
+        chr_hg38   = as.character(GenomeInfoDb::seqnames(savics_gr_hg38)),
+        start_hg38 = as.integer(GenomicRanges::start(savics_gr_hg38)),
+        stop_hg38  = as.integer(GenomicRanges::end(savics_gr_hg38))
+    )
+
+cat("\n[1c] savics_hg38_df dim (post-liftover, one row per hg38 interval): ",
+    paste(dim(savics_hg38_df), collapse = " × "), "\n", sep = "")
+cat("[1c] Example hg38 Savics rows:\n")
+print(utils::head(savics_hg38_df, 10))
+
+# ---------------------------------------------------------------------
+# 2 — Build SJ156 PROMOTER peak GRanges (hg38) & find overlaps
+# ---------------------------------------------------------------------
+cat("\n[2] Building SJ156 PROMOTER GRanges (hg38) from anno_prom and finding overlaps...\n")
+
+sj156_prom_gr <- GenomicRanges::GRanges(
+    seqnames = as.character(anno_prom$seqnames),
+    ranges   = IRanges::IRanges(start = as.integer(anno_prom$start),
+                                end   = as.integer(anno_prom$end)),
+    peak_id  = anno_prom$peak_id
+)
+
+savics_gr_hg38_clean <- GenomicRanges::GRanges(
+    seqnames = savics_hg38_df$chr_hg38,
+    ranges   = IRanges::IRanges(start = savics_hg38_df$start_hg38,
+                                end   = savics_hg38_df$stop_hg38)
+)
+
+hits_prom <- GenomicRanges::findOverlaps(
+    query  = savics_gr_hg38_clean,
+    subject = sj156_prom_gr,
+    ignore.strand = TRUE
+)
+
+cat("[2] Overlaps (Savics hg38 vs SJ156 PROMOTER peaks):\n")
+cat("    • number of overlaps (pairs Savics×SJ156_prom) : ",
+    length(hits_prom), "\n", sep = "")
+
+if (length(hits_prom) == 0L) {
+    stop("[2] ERROR: No overlaps between lifted Savics peaks and SJ156 PROMOTER peaks.\n       Check assemblies or promoter definition.")
+}
+
+savics_prom_overlap_df <- tibble::tibble(
+    savics_idx = S4Vectors::queryHits(hits_prom),
+    sj156_idx  = S4Vectors::subjectHits(hits_prom)
+) %>%
+    dplyr::mutate(
+        Defining_Progenitor = savics_hg38_df$Defining_Progenitor[savics_idx],
+        peak_id             = as.character(S4Vectors::mcols(sj156_prom_gr)$peak_id[sj156_idx])
+    ) %>%
+    dplyr::select(peak_id, Defining_Progenitor) %>%
+    dplyr::distinct()
+
+cat("\n[2] savics_prom_overlap_df dim (PROMOTER peak_id × progenitor pairs): ",
+    paste(dim(savics_prom_overlap_df), collapse = " × "), "\n", sep = "")
+cat("[2] Example promoter overlap-derived mappings:\n")
+print(utils::head(savics_prom_overlap_df, 10))
+
+savics_ct_levels <- c("HSC", "MPP", "LMPP", "CLP", "PreProB", "ProB", "CD19CD20")
+cat("\n[2] Progenitor levels (developmental order):\n")
+print(savics_ct_levels)
+
+# ---------------------------------------------------------------------
+# 3 — Restrict to promoter peaks that exist in counts & prepare long format
+# ---------------------------------------------------------------------
+cat("\n[3] Restricting PROMOTER mappings to peak_id present in counts...\n")
+
+peaks_in_counts_prom <- intersect(savics_prom_overlap_df$peak_id, rownames(counts))
+
+cat("[3] PROMOTER peak overlap with counts:\n")
+cat("    • unique mapped SJ156 PROMOTER peak_id (from overlaps) : ",
+    length(unique(savics_prom_overlap_df$peak_id)), "\n", sep = "")
+cat("    • peaks_in_counts_prom (overlap ∩ counts rownames)     : ",
+    length(peaks_in_counts_prom), "\n", sep = "")
+
+if (length(peaks_in_counts_prom) == 0L) {
+    stop("[3] ERROR: No overlapping PROMOTER peak_id found in counts; check peak_id consistency.")
+}
+
+savics_long_use_prom <- savics_prom_overlap_df %>%
+    dplyr::filter(peak_id %in% peaks_in_counts_prom)
+
+cat("[3] savics_long_use_prom dim (post-counts restriction): ",
+    paste(dim(savics_long_use_prom), collapse = " × "), "\n", sep = "")
+cat("[3] Example savics_long_use_prom rows:\n")
+print(utils::head(savics_long_use_prom, 10))
+
+# ---------------------------------------------------------------------
+# 4 — Subset counts to Savics PROMOTER peaks & per-peak z-scores
+# ---------------------------------------------------------------------
+cat("\n[4] Subsetting counts to Savics PROMOTER peaks and z-scoring each peak...\n")
+
+savics_counts_mat_prom <- counts[peaks_in_counts_prom, , drop = FALSE]
+
+cat("[4] savics_counts_mat_prom dim (Savics PROMOTER peaks × samples): ",
+    paste(dim(savics_counts_mat_prom), collapse = " × "), "\n", sep = "")
+
+savics_z_peak_prom <- t(scale(t(savics_counts_mat_prom)))
+savics_z_peak_prom[is.na(savics_z_peak_prom)] <- 0
+
+cat("[4] Example PROMOTER peak z-scores (5 peaks × 5 samples):\n")
+print(round(savics_z_peak_prom[1:5, 1:5, drop = FALSE], 3))
+
+col_means_z_prom <- apply(savics_z_peak_prom, 2, mean)
+col_sds_z_prom   <- apply(savics_z_peak_prom, 2, sd)
+
+cat("[4] Per-sample mean(z) across Savics PROMOTER peaks:\n")
+print(summary(col_means_z_prom))
+cat("[4] Per-sample sd(z) across Savics PROMOTER peaks:\n")
+print(summary(col_sds_z_prom))
+
+# ---------------------------------------------------------------------
+# 5 — Expand to peak×progenitor rows (PROMOTER; shared peaks duplicated)
+# ---------------------------------------------------------------------
+cat("\n[5] Building PROMOTER peak×progenitor matrix (shared peaks contribute to all modules)...\n")
+
+savics_expanded_prom <- savics_long_use_prom %>%
+    dplyr::mutate(
+        row_id = paste(peak_id, Defining_Progenitor, sep = "|")
+    ) %>%
+    dplyr::left_join(
+        savics_z_peak_prom %>%
+            as.data.frame() %>%
+            tibble::rownames_to_column("peak_id"),
+        by = "peak_id"
+    )
+
+cat("[5] savics_expanded_prom rows (PROMOTER peak×progenitor): ",
+    nrow(savics_expanded_prom), "\n", sep = "")
+
+savics_mat_expanded_prom <- savics_expanded_prom %>%
+    dplyr::select(-peak_id, -Defining_Progenitor) %>%
+    tibble::column_to_rownames("row_id") %>%
+    as.matrix()
+
+cat("[5] savics_mat_expanded_prom dim (PROMOTER peak×ct rows × samples): ",
+    paste(dim(savics_mat_expanded_prom), collapse = " × "), "\n", sep = "")
+
+savics_ct_for_row_prom <- savics_expanded_prom$Defining_Progenitor
+names(savics_ct_for_row_prom) <- rownames(savics_mat_expanded_prom)
+
+cat("[5] Alignment check — first 5 rows (PROMOTER):\n")
+print(
+    head(
+        cbind(
+            savics_ct_for_row_prom = savics_ct_for_row_prom[1:5],
+            rowname                = names(savics_ct_for_row_prom)[1:5]
+        )
+    )
+)
+
+# ---------------------------------------------------------------------
+# 6 — Raw Savics PROMOTER module matrix: savics_avg_z_by_ct_ATAC_prom_raw
+# ---------------------------------------------------------------------
+cat("\n[6] Computing raw Savics PROMOTER module activity (savics_avg_z_by_ct_ATAC_prom_raw)...\n")
+
+savics_avg_z_by_ct_ATAC_prom_raw <- do.call(
+    rbind,
+    lapply(savics_ct_levels, function(ct) {
+        idx <- which(savics_ct_for_row_prom == ct)
+        if (length(idx) == 0L) {
+            cat("[6] WARNING: no Savics PROMOTER peaks for progenitor ", ct,
+                "; filling with NA.\n", sep = "")
+            return(rep(NA_real_, ncol(savics_mat_expanded_prom)))
+        } else {
+            return(colMeans(savics_mat_expanded_prom[idx, , drop = FALSE], na.rm = TRUE))
+        }
+    })
+)
+rownames(savics_avg_z_by_ct_ATAC_prom_raw) <- savics_ct_levels
+
+cat("[6] savics_avg_z_by_ct_ATAC_prom_raw dim (7 × samples): ",
+    paste(dim(savics_avg_z_by_ct_ATAC_prom_raw), collapse = " × "), "\n", sep = "")
+cat("[6] Example raw Savics PROMOTER module scores (first 5 samples):\n")
+print(round(savics_avg_z_by_ct_ATAC_prom_raw[, 1:5, drop = FALSE], 3))
+
+cat("\n[6] Range of raw PROMOTER module scores:\n")
+print(summary(as.vector(savics_avg_z_by_ct_ATAC_prom_raw)))
+
+# ---------------------------------------------------------------------
+# 7 — Column-wise scaling (per-sample z across progenitors; PROMOTER)
+# ---------------------------------------------------------------------
+cat("\n[7] Column-wise scaling: z-score Savics PROMOTER modules WITHIN each sample...\n")
+cat("    (Per-sample mean ~ 0 and sd ~ 1 across HSC→CD19CD20,\n")
+cat("     so no column should be uniformly red.)\n\n")
+
+savics_avg_z_by_ct_ATAC_prom <- scale(savics_avg_z_by_ct_ATAC_prom_raw,
+                                      center = TRUE, scale = TRUE)
+
+col_means_mod_prom <- apply(savics_avg_z_by_ct_ATAC_prom, 2, mean)
+col_sds_mod_prom   <- apply(savics_avg_z_by_ct_ATAC_prom, 2, sd)
+
+cat("[7] Per-sample mean(z) across 7 progenitors (PROMOTER, after scaling):\n")
+print(summary(col_means_mod_prom))
+cat("[7] Per-sample sd(z) across 7 progenitors (PROMOTER, after scaling):\n")
+print(summary(col_sds_mod_prom))
+
+all_pos_prom <- apply(savics_avg_z_by_ct_ATAC_prom, 2, function(v) all(v > 0))
+cat("[7] Samples with ALL Savics PROMOTER module scores > 0 (should be 0): ",
+    sum(all_pos_prom), "\n", sep = "")
+
+cat("[7] Example scaled Savics PROMOTER module scores (first 5 samples):\n")
+print(round(savics_avg_z_by_ct_ATAC_prom[, 1:5, drop = FALSE], 3))
+
+# ---------------------------------------------------------------------
+# 8 — Dominant progenitor + margins (Tian-style; PROMOTER)
+# ---------------------------------------------------------------------
+cat("\n[8] Computing dominant progenitor and Tian-style margins (Savics PROMOTER)...\n")
+
+savics_top_idx_prom    <- apply(savics_avg_z_by_ct_ATAC_prom, 2, which.max)
+savics_second_idx_prom <- apply(savics_avg_z_by_ct_ATAC_prom, 2, function(v) order(v, decreasing = TRUE)[2])
+
+savics_dominant_tbl_prom <- tibble::tibble(
+    sample       = colnames(savics_avg_z_by_ct_ATAC_prom),
+    top_ct       = savics_ct_levels[savics_top_idx_prom],
+    top_score    = savics_avg_z_by_ct_ATAC_prom[cbind(savics_top_idx_prom, seq_along(savics_top_idx_prom))],
+    second_ct    = savics_ct_levels[savics_second_idx_prom],
+    second_score = savics_avg_z_by_ct_ATAC_prom[cbind(savics_second_idx_prom, seq_along(savics_second_idx_prom))]
+) %>%
+    dplyr::mutate(
+        margin = top_score - second_score
+    ) %>%
+    dplyr::left_join(
+        meta_sj %>% dplyr::select(Sample, genotype),
+        by = c("sample" = "Sample")
+    )
+
+cat("[8] First 10 Savics PROMOTER dominance calls:\n")
+print(utils::head(savics_dominant_tbl_prom, 10))
+
+cat("\n[8] Frequency of Savics PROMOTER top_ct assignments:\n")
+print(sort(table(savics_dominant_tbl_prom$top_ct), decreasing = TRUE))
+
+cat("\n[8] PROMOTER margin summary (larger = more confident):\n")
+print(summary(savics_dominant_tbl_prom$margin))
+
+# ---------------------------------------------------------------------
+# 9 — Order samples: top_ct → margin → top_score (PROMOTER)
+# ---------------------------------------------------------------------
+cat("\n[9] Ordering samples by (top_ct → margin → top_score) [Savics PROMOTER]...\n")
+
+savics_col_order_prom <- order(
+    factor(savics_dominant_tbl_prom$top_ct, levels = savics_ct_levels),
+    -savics_dominant_tbl_prom$margin,
+    -savics_dominant_tbl_prom$top_score
+)
+
+savics_avg_z_by_ct_prom_ord  <- savics_avg_z_by_ct_ATAC_prom[, savics_col_order_prom, drop = FALSE]
+savics_dominant_tbl_prom_ord <- savics_dominant_tbl_prom[savics_col_order_prom, ]
+
+cat("[9] savics_avg_z_by_ct_prom_ord dim: ",
+    paste(dim(savics_avg_z_by_ct_prom_ord), collapse = " × "), "\n", sep = "")
+
+# ---------------------------------------------------------------------
+# 10 — Build annotations for pheatmap (PROMOTER; heatmap step optional)
+# ---------------------------------------------------------------------
+cat("\n[10] Building savics_ann_col_prom for pheatmap (PROMOTER; heatmap optional)...\n")
+
+savics_margin_bins_prom <- cut(
+    savics_dominant_tbl_prom_ord$margin,
+    breaks = quantile(savics_dominant_tbl_prom_ord$margin, probs = seq(0, 1, 0.25), na.rm = TRUE),
+    include.lowest = TRUE,
+    labels = c("Q1 (lowest)", "Q2", "Q3", "Q4 (highest)")
+)
+
+savics_ann_col_prom <- data.frame(
+    top_ct   = factor(savics_dominant_tbl_prom_ord$top_ct, levels = savics_ct_levels),
+    margin   = savics_margin_bins_prom,
+    genotype = savics_dominant_tbl_prom_ord$genotype,
+    row.names = savics_dominant_tbl_prom_ord$sample,
+    stringsAsFactors = FALSE
+)
+
+cat("[10] savics_ann_col_prom head:\n")
+print(utils::head(savics_ann_col_prom, 10))
+
+# ---------------------------------------------------------------------
+# 11 — Optional PROMOTER-only heatmap
+#      (assumes savics_z_col_fun, savics_cell_type_colors, margin_colors,
+#       genotype_colors are already defined in the environment)
+# ---------------------------------------------------------------------
+# If you want the heatmap, uncomment this block:
+# pheatmap::pheatmap(
+#     savics_avg_z_by_ct_prom_ord,
+#     color            = savics_z_col_fun,
+#     cluster_rows     = FALSE,
+#     cluster_cols     = FALSE,
+#     show_rownames    = TRUE,
+#     show_colnames    = FALSE,
+#     annotation_col   = savics_ann_col_prom,
+#     annotation_colors = list(
+#         top_ct   = savics_cell_type_colors,
+#         margin   = margin_colors,
+#         genotype = genotype_colors
+#     ),
+#     border_color = NA,
+#     main = "ATAC module activity (Savics PROMOTER markers; liftOver + overlap; column-scaled)"
+# )
+
+cat("\n[SAVICS PROMOTER] DONE — Savics hg19 markers have been lifted to hg38,\n")
+cat("         overlapped with SJ156 PROMOTER peaks, turned into progenitor\n")
+cat("         modules on your counts, column-scaled, and scored with\n")
+cat("         Tian-style margins (PROMOTER-only).\n")
+cat("===============================================================\n\n")
+
+
+
 pheatmap::pheatmap(
     savics_avg_z_by_ct_prom_ord,
     color            = savics_z_col_fun,
@@ -5330,3 +5886,572 @@ pheatmap::pheatmap(
 ```
 
 ### Enhancer only Savic
+
+```{r}
+
+# =====================================================================
+# ATAC — Savics S3 ENHANCER-ONLY dominance map
+#        Savics peaks ∩ SJ156 *enhancer-like* peaks (non-promoter/TSS)
+# =====================================================================
+# Assumes these already exist from previous chunks:
+#   - counts, anno_df, meta_sj
+#   - savics_hg38_df (hg38-lifted Savics S3 peaks)
+#   - savics_ct_levels, colors, savics_z_col_fun, etc.
+# =====================================================================
+
+suppressPackageStartupMessages({
+    library(dplyr)
+    library(tidyr)
+    library(tibble)
+    library(GenomicRanges)
+    library(pheatmap)
+    library(stringr)
+})
+
+cat("\n=================================================================\n")
+cat("ATAC SAVICS PIPELINE — ENHANCER-LIKE ONLY (OVERLAP + COLUMN-SCALED MODULES)\n")
+cat("=================================================================\n\n")
+
+# ---------------------------------------------------------------------
+# 0 — Sanity checks
+# ---------------------------------------------------------------------
+if (!exists("counts")) {
+    stop("[0] ERROR: `counts` (peak × sample matrix) not found.")
+}
+if (!exists("meta_sj")) {
+    stop("[0] ERROR: `meta_sj` (Sample + genotype) not found.")
+}
+if (!exists("anno_df")) {
+    stop("[0] ERROR: `anno_df` (peak annotation with coordinates) not found.")
+}
+if (!"annotation" %in% colnames(anno_df)) {
+    stop("[0] ERROR: `anno_df` must contain an `annotation` column.")
+}
+if (!exists("savics_hg38_df")) {
+    stop("[0] ERROR: `savics_hg38_df` not found. Run the global Savics liftover chunk first.")
+}
+if (!exists("savics_ct_levels")) {
+    savics_ct_levels <- c("HSC", "MPP", "LMPP", "CLP", "PreProB", "ProB", "CD19CD20")
+}
+
+cat("[0] counts dim (peaks × samples): ",
+    paste(dim(counts), collapse = " × "), "\n", sep = "")
+cat("[0] anno_df dim (rows × cols): ",
+    paste(dim(anno_df), collapse = " × "), "\n", sep = "")
+
+# ---------------------------------------------------------------------
+# 0a — Define enhancer-like peaks from anno_df
+#       (HOMER rarely uses literal 'Enhancer' labels)
+#       Here: enhancer-like = NOT promoter/TSS
+# ---------------------------------------------------------------------
+cat("\n[0a] Exploring `anno_df$annotation` classes...\n")
+ann_vals <- sort(unique(anno_df$annotation))
+print(ann_vals)
+
+cat("\n[0a] Defining ENHANCER-LIKE as non-promoter / non-TSS peaks...\n")
+
+anno_enh <- anno_df %>%
+    dplyr::filter(
+        !is.na(annotation),
+        !grepl("Promoter", annotation, ignore.case = TRUE),
+        !grepl("TSS",      annotation, ignore.case = TRUE)
+    )
+
+cat("[0a] anno_enh dim (enhancer-like peaks × cols): ",
+    paste(dim(anno_enh), collapse = " × "), "\n", sep = "")
+if (nrow(anno_enh) == 0L) {
+    stop("[0a] ERROR: No enhancer-like peaks after excluding Promoter/TSS.\n",
+         "      Refine the filter in 0a to match your annotation categories.")
+}
+
+# ---------------------------------------------------------------------
+# 1 — Build SJ156 ENHANCER-LIKE GRanges (hg38) & find overlaps
+# ---------------------------------------------------------------------
+cat("\n[1] Building SJ156 ENHANCER-LIKE GRanges (hg38) and finding overlaps with Savics...\n")
+
+sj156_enh_gr <- GenomicRanges::GRanges(
+    seqnames = as.character(anno_enh$seqnames),
+    ranges   = IRanges::IRanges(start = as.integer(anno_enh$start),
+                                end   = as.integer(anno_enh$end)),
+    peak_id  = anno_enh$peak_id
+)
+
+savics_gr_hg38_clean <- GenomicRanges::GRanges(
+    seqnames = savics_hg38_df$chr_hg38,
+    ranges   = IRanges::IRanges(start = savics_hg38_df$start_hg38,
+                                end   = savics_hg38_df$stop_hg38)
+)
+
+hits_enh <- GenomicRanges::findOverlaps(
+    query  = savics_gr_hg38_clean,
+    subject = sj156_enh_gr,
+    ignore.strand = TRUE
+)
+
+cat("[1] Overlaps (Savics hg38 vs SJ156 ENHANCER-LIKE peaks):\n")
+cat("    • number of overlaps (pairs Savics×SJ156_enh_like) : ",
+    length(hits_enh), "\n", sep = "")
+
+if (length(hits_enh) == 0L) {
+    stop("[1] ERROR: No overlaps between lifted Savics peaks and SJ156 ENHANCER-LIKE peaks.\n",
+         "       Check assemblies or enhancer definition in 0a.")
+}
+
+savics_enh_overlap_df <- tibble::tibble(
+    savics_idx = S4Vectors::queryHits(hits_enh),
+    sj156_idx  = S4Vectors::subjectHits(hits_enh)
+) %>%
+    dplyr::mutate(
+        Defining_Progenitor = savics_hg38_df$Defining_Progenitor[savics_idx],
+        peak_id             = as.character(S4Vectors::mcols(sj156_enh_gr)$peak_id[sj156_idx])
+    ) %>%
+    dplyr::select(peak_id, Defining_Progenitor) %>%
+    dplyr::distinct()
+
+cat("\n[1] savics_enh_overlap_df dim (ENHANCER-LIKE peak_id × progenitor pairs): ",
+    paste(dim(savics_enh_overlap_df), collapse = " × "), "\n", sep = "")
+cat("[1] Example enhancer-like overlap-derived mappings:\n")
+print(utils::head(savics_enh_overlap_df, 10))
+
+# ---------------------------------------------------------------------
+# 2 — Restrict to ENHANCER-LIKE peaks present in counts
+# ---------------------------------------------------------------------
+cat("\n[2] Restricting ENHANCER-LIKE mappings to peak_id present in counts...\n")
+
+peaks_in_counts_enh <- intersect(savics_enh_overlap_df$peak_id, rownames(counts))
+
+cat("[2] ENHANCER-LIKE peak overlap with counts:\n")
+cat("    • unique mapped SJ156 ENHANCER-LIKE peak_id : ",
+    length(unique(savics_enh_overlap_df$peak_id)), "\n", sep = "")
+cat("    • peaks_in_counts_enh (overlap ∩ counts rownames) : ",
+    length(peaks_in_counts_enh), "\n", sep = "")
+
+if (length(peaks_in_counts_enh) == 0L) {
+    stop("[2] ERROR: No overlapping ENHANCER-LIKE peak_id found in counts.")
+}
+
+savics_long_use_enh <- savics_enh_overlap_df %>%
+    dplyr::filter(peak_id %in% peaks_in_counts_enh)
+
+cat("[2] savics_long_use_enh dim (post-counts restriction): ",
+    paste(dim(savics_long_use_enh), collapse = " × "), "\n", sep = "")
+cat("[2] Example savics_long_use_enh rows:\n")
+print(utils::head(savics_long_use_enh, 10))
+
+# ---------------------------------------------------------------------
+# 3 — Subset counts to ENHANCER-LIKE Savics peaks & z-score
+# ---------------------------------------------------------------------
+cat("\n[3] Subsetting counts to Savics ENHANCER-LIKE peaks and z-scoring...\n")
+
+savics_counts_mat_enh <- counts[peaks_in_counts_enh, , drop = FALSE]
+
+cat("[3] savics_counts_mat_enh dim (Savics ENHANCER-LIKE peaks × samples): ",
+    paste(dim(savics_counts_mat_enh), collapse = " × "), "\n", sep = "")
+
+savics_z_peak_enh <- t(scale(t(savics_counts_mat_enh)))
+savics_z_peak_enh[is.na(savics_z_peak_enh)] <- 0
+
+cat("[3] Example ENHANCER-LIKE peak z-scores (5 peaks × 5 samples):\n")
+print(round(savics_z_peak_enh[1:5, 1:5, drop = FALSE], 3))
+
+# ---------------------------------------------------------------------
+# 4 — Expand to peak×progenitor rows and compute modules (as before)
+# ---------------------------------------------------------------------
+cat("\n[4] Building ENHANCER-LIKE peak×progenitor matrix and module averages...\n")
+
+savics_expanded_enh <- savics_long_use_enh %>%
+    dplyr::mutate(
+        row_id = paste(peak_id, Defining_Progenitor, sep = "|")
+    ) %>%
+    dplyr::left_join(
+        savics_z_peak_enh %>%
+            as.data.frame() %>%
+            tibble::rownames_to_column("peak_id"),
+        by = "peak_id"
+    )
+
+cat("[4] savics_expanded_enh rows (ENHANCER-LIKE peak×progenitor): ",
+    nrow(savics_expanded_enh), "\n", sep = "")
+
+savics_mat_expanded_enh <- savics_expanded_enh %>%
+    dplyr::select(-peak_id, -Defining_Progenitor) %>%
+    tibble::column_to_rownames("row_id") %>%
+    as.matrix()
+
+cat("[4] savics_mat_expanded_enh dim (ENHANCER-LIKE peak×ct rows × samples): ",
+    paste(dim(savics_mat_expanded_enh), collapse = " × "), "\n", sep = "")
+
+savics_ct_for_row_enh <- savics_expanded_enh$Defining_Progenitor
+names(savics_ct_for_row_enh) <- rownames(savics_mat_expanded_enh)
+
+# Raw module means
+savics_avg_z_by_ct_ATAC_enh_raw <- do.call(
+    rbind,
+    lapply(savics_ct_levels, function(ct) {
+        idx <- which(savics_ct_for_row_enh == ct)
+        if (length(idx) == 0L) {
+            cat("[4] WARNING: no ENHANCER-LIKE Savics peaks for progenitor ", ct,
+                "; filling with NA.\n", sep = "")
+            return(rep(NA_real_, ncol(savics_mat_expanded_enh)))
+        } else {
+            return(colMeans(savics_mat_expanded_enh[idx, , drop = FALSE], na.rm = TRUE))
+        }
+    })
+)
+rownames(savics_avg_z_by_ct_ATAC_enh_raw) <- savics_ct_levels
+
+cat("[4] savics_avg_z_by_ct_ATAC_enh_raw dim (7 × samples): ",
+    paste(dim(savics_avg_z_by_ct_ATAC_enh_raw), collapse = " × "), "\n", sep = "")
+
+# Column-wise scaling (within-sample)
+savics_avg_z_by_ct_ATAC_enh <- scale(savics_avg_z_by_ct_ATAC_enh_raw,
+                                     center = TRUE, scale = TRUE)
+
+
+
+# ---------------------------------------------------------------------
+# 5 — Dominant progenitor, ordering, annotations and ENHANCER-LIKE heatmap
+# ---------------------------------------------------------------------
+cat("\n[5] Dominant progenitor, margins, ordering and ENHANCER-LIKE heatmap...\n")
+
+savics_top_idx_enh    <- apply(savics_avg_z_by_ct_ATAC_enh, 2, which.max)
+savics_second_idx_enh <- apply(savics_avg_z_by_ct_ATAC_enh, 2, function(v) order(v, decreasing = TRUE)[2])
+
+savics_dominant_tbl_enh <- tibble::tibble(
+    sample       = colnames(savics_avg_z_by_ct_ATAC_enh),
+    top_ct       = savics_ct_levels[savics_top_idx_enh],
+    top_score    = savics_avg_z_by_ct_ATAC_enh[cbind(savics_top_idx_enh, seq_along(savics_top_idx_enh))],
+    second_ct    = savics_ct_levels[savics_second_idx_enh],
+    second_score = savics_avg_z_by_ct_ATAC_enh[cbind(savics_second_idx_enh, seq_along(savics_second_idx_enh))]
+) %>%
+    dplyr::mutate(
+        margin = top_score - second_score
+    ) %>%
+    dplyr::left_join(
+        meta_sj %>% dplyr::select(Sample, genotype),
+        by = c("sample" = "Sample")
+    )
+
+cat("[5] Margin summary (ENHANCER-LIKE):\n")
+print(summary(savics_dominant_tbl_enh$margin))
+
+savics_col_order_enh <- order(
+    factor(savics_dominant_tbl_enh$top_ct, levels = savics_ct_levels),
+    -savics_dominant_tbl_enh$margin,
+    -savics_dominant_tbl_enh$top_score
+)
+
+savics_avg_z_by_ct_enh_ord  <- savics_avg_z_by_ct_ATAC_enh[, savics_col_order_enh, drop = FALSE]
+savics_dominant_tbl_enh_ord <- savics_dominant_tbl_enh[savics_col_order_enh, ]
+
+# Quartile bins for margins
+savics_margin_bins_enh <- cut(
+    savics_dominant_tbl_enh_ord$margin,
+    breaks = quantile(savics_dominant_tbl_enh_ord$margin, probs = seq(0, 1, 0.25), na.rm = TRUE),
+    include.lowest = TRUE,
+    labels = c("Q1 (lowest)", "Q2", "Q3", "Q4 (highest)")
+)
+
+savics_ann_col_enh <- data.frame(
+    top_ct   = savics_dominant_tbl_enh_ord$top_ct,
+    margin   = savics_margin_bins_enh,
+    genotype = savics_dominant_tbl_enh_ord$genotype,
+    row.names = savics_dominant_tbl_enh_ord$sample,
+    stringsAsFactors = FALSE
+)
+
+# Make sure annotation rows are in the same order as heatmap columns
+savics_ann_col_enh <- savics_ann_col_enh[colnames(savics_avg_z_by_ct_enh_ord), , drop = FALSE]
+
+# Convert to factors explicitly (drop unused levels)
+savics_ann_col_enh$top_ct   <- factor(savics_ann_col_enh$top_ct,   levels = savics_ct_levels)
+savics_ann_col_enh$margin   <- factor(savics_ann_col_enh$margin,
+                                      levels = c("Q1 (lowest)", "Q2", "Q3", "Q4 (highest)"))
+savics_ann_col_enh$genotype <- factor(savics_ann_col_enh$genotype)
+
+cat("[5] savics_ann_col_enh head:\n")
+print(utils::head(savics_ann_col_enh))
+
+# ---------------------------------------------------------------------
+# Colors (reuse if already defined)
+# ---------------------------------------------------------------------
+if (!exists("savics_cell_type_colors")) {
+    savics_cell_type_colors <- c(
+        HSC        = "#fb8072",
+        MPP        = "#bebada",
+        LMPP       = "#ffd92f",
+        CLP        = "#f781bf",
+        PreProB    = "#ff33ff",
+        ProB       = "#00e5c0",
+        CD19CD20   = "#00bfff"
+    )
+}
+if (!exists("margin_colors")) {
+    margin_colors <- c(
+        "Q1 (lowest)" = "#c7e9c0",
+        "Q2"          = "#a1d99b",
+        "Q3"          = "#74c476",
+        "Q4 (highest)"= "#238b45"
+    )
+}
+if (!exists("genotype_colors")) {
+    genotype_colors <- c(
+        TT = "#f65e0dff",
+        TC = "#0c2e18ff",
+        CC = "#d7a419ff"
+    )
+}
+if (!exists("savics_z_col_fun")) {
+    savics_z_col_fun <- colorRampPalette(c("blue", "white", "red"))(201)
+}
+
+# ---------------------------------------------------------------------
+# ENHANCER-LIKE Savics heatmap
+# ---------------------------------------------------------------------
+pheatmap::pheatmap(
+    savics_avg_z_by_ct_enh_ord,
+    color             = savics_z_col_fun,
+    cluster_rows      = FALSE,
+    cluster_cols      = FALSE,
+    show_rownames     = TRUE,
+    show_colnames     = FALSE,
+    annotation_col    = savics_ann_col_enh,
+    annotation_colors = list(
+        top_ct   = savics_cell_type_colors,
+        margin   = margin_colors,
+        genotype = genotype_colors
+    ),
+    border_color      = NA,
+    main              = "ATAC module activity (Savics ENHANCER-LIKE markers; column-scaled)"
+)
+
+cat("\n[SAVICS ENHANCER-LIKE] DONE.\n\n")
+
+```
+
+#### Saving SAVICS for SJ19
+
+```{r}
+# ============================================================
+# A — Save global Savics objects for reuse (ATAC + RNA-seq)
+#     Run AFTER section 1c (when savics_hg38_df exists)
+# ============================================================
+
+suppressPackageStartupMessages({
+    library(GenomicRanges)
+    library(tibble)
+})
+
+# Directory where you want to keep shared Savics objects
+savics_shared_dir <- "savics_shared_objects"  # <-- change path if you prefer
+if (!dir.exists(savics_shared_dir)) {
+    dir.create(savics_shared_dir, recursive = TRUE, showWarnings = FALSE)
+}
+
+# Ensure savics_ct_levels exists (in case not yet defined above)
+if (!exists("savics_ct_levels")) {
+    savics_ct_levels <- c("HSC", "MPP", "LMPP", "CLP", "PreProB", "ProB", "CD19CD20")
+}
+
+# GRanges with hg38 coordinates + progenitor label
+savics_gr_hg38_global <- GenomicRanges::GRanges(
+    seqnames = savics_hg38_df$chr_hg38,
+    ranges   = IRanges::IRanges(
+        start = savics_hg38_df$start_hg38,
+        end   = savics_hg38_df$stop_hg38
+    ),
+    Defining_Progenitor = savics_hg38_df$Defining_Progenitor
+)
+
+# Save as RDS
+saveRDS(
+    savics_hg38_df,
+    file = file.path(savics_shared_dir, "savics_hg38_df.rds")
+)
+
+saveRDS(
+    savics_ct_levels,
+    file = file.path(savics_shared_dir, "savics_ct_levels.rds")
+)
+
+saveRDS(
+    savics_gr_hg38_global,
+    file = file.path(savics_shared_dir, "savics_gr_hg38_global.rds")
+)
+
+cat("\n[SAVICS-SAVE] Saved global Savics objects:\n",
+    "  - savics_hg38_df        → ", file.path(savics_shared_dir, "savics_hg38_df.rds"), "\n",
+    "  - savics_ct_levels      → ", file.path(savics_shared_dir, "savics_ct_levels.rds"), "\n",
+    "  - savics_gr_hg38_global → ", file.path(savics_shared_dir, "savics_gr_hg38_global.rds"), "\n\n", sep = "")
+
+```
+
+### Counting TC
+```{r}
+# ============================================================
+# ATAC rs7090445 — TC allele imbalance stratified by cell state
+#   (NA cell states EXCLUDED + FIXED depth-weighted T fraction)
+# ============================================================
+# Requires:
+#   - ct_only           : Sample, C, T, ct_state (TT / TC / CC)
+#   - dominant_tbl_ATAC : sample, top_ct (Ilaria dominance)
+#
+# Notes:
+#   - Analysis restricted to TC samples only
+#   - Samples without a dominant cell state are EXCLUDED
+#   - Per-sample null expectation: Tfrac = 0.5
+#   - Depth-weighted allele fraction per cell state is computed as:
+#         depth_weighted_Tfrac = sum(T) / sum(T + C)
+# ============================================================
+
+suppressPackageStartupMessages({
+    library(dplyr)
+    library(tibble)
+})
+
+cat("\n============================================================\n")
+cat("ATAC rs7090445 — TC ALLELE IMBALANCE BY CELL STATE (CLEAN + WEIGHTED FIX)\n")
+cat("============================================================\n\n")
+
+# ------------------------------------------------------------
+# 0 — Sanity checks
+# ------------------------------------------------------------
+cat("[CHECK] Required columns in ct_only:\n")
+req_ct <- c("Sample","C","T","ct_state")
+cat("  • present? ", paste(req_ct %in% colnames(ct_only), collapse = ", "), "\n", sep = "")
+stopifnot(all(req_ct %in% colnames(ct_only)))
+
+cat("[CHECK] Required columns in dominant_tbl_ATAC:\n")
+req_dom <- c("sample","top_ct")
+cat("  • present? ", paste(req_dom %in% colnames(dominant_tbl_ATAC), collapse = ", "), "\n\n", sep = "")
+stopifnot(all(req_dom %in% colnames(dominant_tbl_ATAC)))
+
+# ------------------------------------------------------------
+# 1 — Restrict to TC and join dominant cell state
+# ------------------------------------------------------------
+cat("[STEP 1] Subsetting ct_only to TC and joining dominant cell state...\n")
+
+tc_df_all <- ct_only %>%
+    dplyr::filter(ct_state == "TC") %>%
+    dplyr::left_join(
+        dominant_tbl_ATAC %>%
+            dplyr::select(sample, top_ct),
+        by = c("Sample" = "sample")
+    ) %>%
+    dplyr::mutate(
+        total_reads = T + C,
+        Tfrac       = dplyr::if_else(total_reads > 0, T / total_reads, NA_real_)
+    )
+
+cat("[CHECK] Total TC samples (before excluding NA top_ct): ", nrow(tc_df_all), "\n", sep = "")
+cat("[CHECK] TC samples with missing top_ct: ", sum(is.na(tc_df_all$top_ct)), "\n", sep = "")
+
+if (sum(is.na(tc_df_all$top_ct)) > 0) {
+    cat("[INFO] TC samples excluded due to missing cell-state assignment (not in dominant_tbl_ATAC):\n")
+    print(tc_df_all %>% dplyr::filter(is.na(top_ct)) %>% dplyr::pull(Sample))
+}
+cat("\n")
+
+# ------------------------------------------------------------
+# 1.1 — EXCLUDE samples without dominant cell state
+# ------------------------------------------------------------
+tc_df <- tc_df_all %>%
+    dplyr::filter(!is.na(top_ct))
+
+cat("[CHECK] TC samples retained AFTER exclusion: ", nrow(tc_df), "\n", sep = "")
+cat("[CHECK] Cell-state distribution (TC only; valid states):\n")
+print(sort(table(tc_df$top_ct), decreasing = TRUE))
+cat("\n")
+
+cat("[QC] Total reads (T+C) per TC sample — summary:\n")
+print(summary(tc_df$total_reads))
+cat("\n")
+
+cat("[QC] Per-sample Tfrac summary in TC (null ~0.5 if no imbalance):\n")
+print(summary(tc_df$Tfrac))
+cat("\n")
+
+# ------------------------------------------------------------
+# 2 — Per–cell-type summaries (FIXED weighted fraction)
+# ------------------------------------------------------------
+cat("[STEP 2] Computing per–cell-type summaries (TC only; valid states)...\n")
+cat("         depth_weighted_Tfrac = sum(T) / sum(T + C)\n\n")
+
+tc_summary_ct <- tc_df %>%
+    dplyr::group_by(top_ct) %>%
+    dplyr::summarise(
+        n_samples            = dplyr::n(),
+        sum_T                = sum(T, na.rm = TRUE),
+        sum_C                = sum(C, na.rm = TRUE),
+        sum_total_reads      = sum(total_reads, na.rm = TRUE),
+        mean_total_reads     = mean(total_reads, na.rm = TRUE),
+        median_total_reads   = median(total_reads, na.rm = TRUE),
+        mean_Tfrac           = mean(Tfrac, na.rm = TRUE),
+        median_Tfrac         = median(Tfrac, na.rm = TRUE),
+        depth_weighted_Tfrac = dplyr::if_else(sum_total_reads > 0, sum_T / sum_total_reads, NA_real_),
+        .groups = "drop"
+    ) %>%
+    dplyr::arrange(dplyr::desc(depth_weighted_Tfrac))
+
+cat("[RESULT] Per–cell-type allele balance summary (TC only; CLEAN):\n")
+print(tc_summary_ct)
+cat("\n")
+
+cat("[RESULT] Same summary as MARKDOWN (easy to paste to client):\n")
+if (requireNamespace("knitr", quietly = TRUE)) {
+    cat(knitr::kable(tc_summary_ct, format = "markdown", digits = 4))
+    cat("\n\n")
+} else {
+    cat("  (knitr not available; printing tibble above instead.)\n\n")
+}
+
+# ------------------------------------------------------------
+# 3 — Cell-type–specific statistical tests + read-count context
+# ------------------------------------------------------------
+cat("[STEP 3] Cell-type–specific tests + read-count context...\n")
+cat("         • Wilcoxon on per-sample Tfrac: H0 median(Tfrac)=0.5 (n>=5 only)\n")
+cat("         • Binomial on aggregated reads: H0 p(T)=0.5 (informative but read-level)\n\n")
+
+tc_tests_ct <- tc_df %>%
+    dplyr::group_by(top_ct) %>%
+    dplyr::summarise(
+        n_samples            = dplyr::n(),
+        sum_T                = sum(T, na.rm = TRUE),
+        sum_C                = sum(C, na.rm = TRUE),
+        sum_total_reads      = sum(T + C, na.rm = TRUE),
+        depth_weighted_Tfrac = dplyr::if_else(sum_total_reads > 0, sum_T / sum_total_reads, NA_real_),
+        wilcox_p             = if (dplyr::n() >= 5)
+            stats::wilcox.test(Tfrac, mu = 0.5, exact = FALSE)$p.value
+        else
+            NA_real_,
+        binom_p              = if (sum_total_reads > 0)
+            stats::binom.test(x = sum_T, n = sum_total_reads, p = 0.5, alternative = "two.sided")$p.value
+        else
+            NA_real_,
+        .groups = "drop"
+    ) %>%
+    dplyr::arrange(dplyr::desc(depth_weighted_Tfrac))
+
+cat("[STATS] Tests per cell state (TC only; CLEAN):\n")
+print(tc_tests_ct)
+cat("\n")
+
+cat("[STATS] Same test table as MARKDOWN (easy to paste to client):\n")
+if (requireNamespace("knitr", quietly = TRUE)) {
+    cat(knitr::kable(tc_tests_ct, format = "markdown", digits = 6))
+    cat("\n\n")
+} else {
+    cat("  (knitr not available; printing tibble above instead.)\n\n")
+}
+
+cat("============================================================\n")
+cat("[DONE] NA cell states excluded; depth-weighted Tfrac fixed; tests include read counts.\n")
+cat("============================================================\n\n")
+
+```
+
+
+
+## What is the overlap of samples called proB cells between Ilarias and Savics? How consistent is the sample being called a 'ProB' accross all of them. prepro and
+
+CLP from Savics overlapping with early lymphoid from Ilarias
