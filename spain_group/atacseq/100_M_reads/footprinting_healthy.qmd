@@ -1,0 +1,160 @@
+```{r}
+TT_CC_bindetect <- read.delim(
+  "/Users/cojulian/Desktop/Tzu_projects/Matt/Clarissa/snp_cell_lines_public_datasets_project/spain_group/atacseq/100_M_reads/TOBIAS/ProB/TTvsCC/bindetect_results.txt"
+)
+
+```
+
+```{r}
+# ==========================================
+# Volcano plot for TOBIAS BINDetect results (ProB TT vs CC)
+# ==========================================
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+library(tidyr)
+
+cols   <- c("up" = "#ffad73", "down" = "#26b3ff", "ns" = "grey80")
+sizes  <- c("up" = 2, "down" = 2, "ns" = 1)
+alphas <- c("up" = 1, "down" = 1, "ns" = 0.5)
+
+volcano.data <- TT_CC_bindetect %>%
+  dplyr::select(name, motif_id, cluster, TT_CC_change, TT_CC_pvalue) %>%
+  drop_na() %>%
+  mutate(
+    GeneType = case_when(
+      TT_CC_change >= 0.1 & TT_CC_pvalue <= 0.05 ~ "up",    # enriched in TT
+      TT_CC_change <= -0.1 & TT_CC_pvalue <= 0.05 ~ "down", # enriched in CC
+      TRUE ~ "ns"
+    ),
+    GeneType = factor(GeneType, levels = c("up","down","ns"))
+  )
+
+top_hits <- volcano.data %>%
+  dplyr::arrange(TT_CC_pvalue) %>%
+  dplyr::slice(1:10)
+
+highlight_genes <- volcano.data %>%
+  filter(name %in% c("ARID5B","PAX5","IKZF1","SPI1"))  # adjust if needed
+
+label_data <- bind_rows(top_hits, highlight_genes) %>%
+  distinct(name, .keep_all = TRUE)
+
+ggplot(volcano.data, aes(x = TT_CC_change, y = -log10(TT_CC_pvalue),
+                         fill = GeneType, size = GeneType, alpha = GeneType)) +
+  geom_point(shape = 21, colour = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour="grey40") +
+  geom_vline(xintercept = c(-0.1,0.1), linetype = "dashed", colour="grey40") +
+  geom_text_repel(data = label_data, aes(label = name),
+                  size = 3, max.overlaps = 20) +
+  scale_fill_manual(values = cols) +
+  scale_size_manual(values = sizes) +
+  scale_alpha_manual(values = alphas) +
+  theme_minimal() +
+  labs(title = "Volcano plot: TOBIAS Healthy ProB TT vs CC",
+       x = "Binding-score change (TT − CC)",
+       y = "−log10(p-value)")
+
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+
+# ------------------------------
+# Select top 15 up and down motifs
+# ------------------------------
+top15_up <- volcano.data %>%
+  filter(GeneType == "up") %>%
+  arrange(TT_CC_pvalue) %>%
+  slice(1:15)
+
+top15_down <- volcano.data %>%
+  filter(GeneType == "down") %>%
+  arrange(TT_CC_pvalue) %>%
+  slice(1:15)
+
+label_data_15 <- bind_rows(top15_up, top15_down) %>%
+  distinct(name, .keep_all = TRUE)
+
+# ------------------------------
+# Volcano plot
+# ------------------------------
+ggplot(volcano.data,
+       aes(x = TT_CC_change,
+           y = -log10(TT_CC_pvalue),
+           fill = GeneType,
+           size = GeneType,
+           alpha = GeneType)) +
+
+  geom_point(shape = 21, colour = "black") +
+
+  geom_hline(yintercept = -log10(0.05),
+             linetype = "dashed",
+             colour = "grey40") +
+
+  geom_vline(xintercept = c(-0.1, 0.1),
+             linetype = "dashed",
+             colour = "grey40") +
+
+  geom_label_repel(
+    data = label_data_15,
+    aes(label = name, fill = GeneType),
+    color = "white",
+    fontface = "bold",
+    size = 4,
+    max.overlaps = Inf,
+    box.padding = 0.5,
+    point.padding = 0.4,
+    segment.color = "grey40",
+    segment.size = 0.4,
+    label.size = 0.4,
+    label.r = unit(0.15, "lines"),
+    show.legend = FALSE
+  ) +
+
+  scale_fill_manual(
+    values = c("up" = "#D55E00",
+               "down" = "#0072B2",
+               "ns" = "grey80")
+  ) +
+
+  scale_size_manual(values = sizes) +
+  scale_alpha_manual(values = alphas) +
+
+  theme_minimal(base_size = 16) +
+
+  labs(
+    title = "Volcano plot: Footprinting Healthy ProB TT vs CC (Top 15 up & down)",
+    x = "Binding score change (TT − CC)",
+    y = "−log10(p-value)"
+  )
+
+```
+
+
+
+
+```{r}
+library(readr)
+
+sig_TFs <- TT_CC_bindetect %>%
+  mutate(
+    Regulation = case_when(
+      TT_CC_change >= 0.1 & TT_CC_pvalue <= 0.05 ~ "up",
+      TT_CC_change <= -0.1 & TT_CC_pvalue <= 0.05 ~ "down",
+      TRUE ~ "ns"
+    )
+  )
+
+write_csv(
+  sig_TFs,
+  "/Users/cojulian/Desktop/Tzu_projects/Matt/Clarissa/snp_cell_lines_public_datasets_project/spain_group/atacseq/100_M_reads/TOBIAS/ProB/TTvsCC/TOBIAS_TT_vs_CC_all_TFs_with_regulation.csv"
+)
+
+```
+
+
+
+

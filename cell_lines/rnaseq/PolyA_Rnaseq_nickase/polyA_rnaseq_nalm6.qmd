@@ -1284,8 +1284,275 @@ nalm6_polyA_tt_vs_cc$plot
 ## Venn diagrams with Wenjians results
 
 ```{r}
+# ==============================================================
+# Venn diagrams + intersected gene export
+# NALM6 vs Wenjian (ProB) — TPM, p ≤ 0.05, |log2FC| ≥ 0.5
+# ==============================================================
+suppressPackageStartupMessages({
+    library(dplyr)
+    library(readr)
+    library(ggvenn)
+    library(cowplot)
+    library(ggplot2)
+    library(purrr)
+    library(tibble)
+})
+
+# --- Create output directory ----------------------------------
+outdir <- "venn_diag_nalm6_wenjians_Oct_15"
+if (!dir.exists(outdir)) dir.create(outdir)
+
+# --- Helper: build clean venn plot ----------------------------
+make_venn_plot <- function(nalm6_df, wenjian_df, sig_dir, title_text) {
+    ggvenn(
+        list(
+            NALM6  = nalm6_df %>% filter(significance == sig_dir) %>% pull(gene_id),
+            Wenjian = wenjian_df %>% filter(significance == sig_dir) %>% pull(gene_id)
+        ),
+        fill_color   = c("#E69F00", "#56B4E9"),
+        stroke_size  = 0.8,
+        set_name_size = 4.5
+    ) +
+        ggtitle(title_text) +
+        theme(
+            plot.title = element_text(size = 16, face = "bold", hjust = 0.5)
+        )
+}
+
+# --- Wenjian directory ----------------------------------------
+wenjian_dir <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Clarissa/snp_cell_lines_public_datasets_project/sj_expression_arid5b_Wenjian/Only_Coding_ProB_TPM_DEG_results"
+
+# --- Function to load both datasets for a given contrast -------
+load_deg_pair <- function(contrast) {
+    nalm6_path <- file.path(getwd(), "PolyA_TPM_deg_results_NALM6",
+                            paste0("PolyA_TPM_NALM6_", contrast, ".csv"))
+    wenjian_path <- file.path(wenjian_dir, paste0("ProB_", contrast, "_results.csv"))
+    
+    nalm6 <- read_csv(nalm6_path, show_col_types = FALSE) %>%
+        filter(significance %in% c("up", "down")) %>%
+        transmute(gene_id, gene_name, significance)
+    
+    wenjian <- read_csv(wenjian_path, show_col_types = FALSE) %>%
+        filter(sig %in% c("up", "down")) %>%
+        transmute(gene_id = ensembl_id,
+                  gene_name = hgnc_symbol,
+                  significance = sig)
+    
+    list(nalm6 = nalm6, wenjian = wenjian)
+}
+
+# --- Helper: compute intersections ----------------------------
+get_intersections <- function(pair, contrast) {
+    up_common <- intersect(
+        pair$nalm6 %>% filter(significance == "up") %>% pull(gene_id),
+        pair$wenjian %>% filter(significance == "up") %>% pull(gene_id)
+    )
+    down_common <- intersect(
+        pair$nalm6 %>% filter(significance == "down") %>% pull(gene_id),
+        pair$wenjian %>% filter(significance == "down") %>% pull(gene_id)
+    )
+    tibble(
+        contrast = contrast,
+        intersected_up_genes   = paste(up_common, collapse = "; "),
+        intersected_down_genes = paste(down_common, collapse = "; "),
+        n_up   = length(up_common),
+        n_down = length(down_common)
+    )
+}
+
+# ==============================================================
+# 🚀 Run all contrasts (TTvsCC, TCvsCC, TTvsTC)
+# ==============================================================
+contrasts <- c("TT_vs_CC", "TC_vs_CC", "TT_vs_TC")
+
+# Load all pairs
+pairs <- set_names(map(contrasts, load_deg_pair), contrasts)
+
+# --- Build plots and intersection tables ----------------------
+plots_list <- list()
+intersect_tbl <- map2_dfr(
+    pairs, contrasts,
+    ~{
+        p_up <- make_venn_plot(.x$nalm6, .x$wenjian, "up",
+                               paste0("Common UP genes (", .y, ", TPM, p ≤ 0.05, |log₂FC| ≥ 0.5)"))
+        p_dn <- make_venn_plot(.x$nalm6, .x$wenjian, "down",
+                               paste0("Common DOWN genes (", .y, ", TPM, p ≤ 0.05, |log₂FC| ≥ 0.5)"))
+        
+        plots_list[[.y]] <<- plot_grid(p_up, p_dn, ncol = 2, align = "hv", labels = c("A", "B"))
+        
+        get_intersections(.x, .y)
+    }
+)
+
+# --- Combine all plots vertically ------------------------------
+final_venn <- plot_grid(
+    plots_list$TT_vs_CC,
+    plots_list$TC_vs_CC,
+    plots_list$TT_vs_TC,
+    ncol = 1,
+    label_fontface = "bold", label_size = 14, align = "v"
+)
+
+# --- Save outputs ----------------------------------------------
+# Save combined figure
+pdf_path <- file.path(outdir, "Combined_Venn_TPM_p0.05_FC0.5.pdf")
+ggsave(pdf_path, final_venn, width = 12, height = 18)
+message("✅ Saved combined figure: ", pdf_path)
+
+# Save intersection table
+csv_path <- file.path(outdir, "Intersected_Genes_TPM_p0.05_FC0.5.csv")
+write_csv(intersect_tbl, csv_path)
+message("✅ Saved intersection table: ", csv_path)
+
+# --- Print preview ---------------------------------------------
+print(intersect_tbl)
+final_venn
 
 ```
 
+
+
+```{r}
+# ==============================================================
+# Venn diagrams per exclusion scenario (TT Clone1 removal)
+# Compare NALM6 vs Wenjian-style layout: TTvsCC, TCvsCC, TTvsTC
+# TPM | p ≤ 0.05 | |log2FC| ≥ 0.5
+# ==============================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(readr)
+  library(ggvenn)
+  library(cowplot)
+  library(ggplot2)
+  library(purrr)
+  library(stringr)
+})
+
+# --- Output root directory ------------------------------------
+outdir_root <- "PolyA_TPM_deg_results_NALM6_exclusion_scenarios"
+if (!dir.exists(outdir_root)) dir.create(outdir_root)
+
+# --- Helper for nice Venn plots -------------------------------
+make_venn_pair <- function(nalm6_df, contrast, sig_dir, scenario_label) {
+  ggvenn(
+    list(
+      NALM6 = nalm6_df %>% filter(significance == sig_dir) %>% pull(gene_id),
+      Wenjian = deg_wenjian_list[[contrast]] %>%
+        filter(sig %in% c("up", "down"), sig == sig_dir) %>%
+        pull(ensembl_id)
+    ),
+    fill_color = c("#E69F00", "#56B4E9"),
+    stroke_size = 0.8,
+    set_name_size = 4.5
+  ) +
+    ggtitle(paste0(
+      "Common ", toupper(sig_dir), " genes (", contrast, ", TPM, p ≤ 0.05, |log₂FC| ≥ 0.5)\n",
+      scenario_label
+    )) +
+    theme(plot.title = element_text(size = 14, face = "bold", hjust = 0.5))
+}
+
+# --- Wenjian DEG absolute paths (already existing) ------------
+wenjian_dir <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Clarissa/snp_cell_lines_public_datasets_project/sj_expression_arid5b_Wenjian/Only_Coding_ProB_TPM_DEG_results"
+
+deg_wenjian_list <- list(
+  "TT_vs_CC" = read_csv(file.path(wenjian_dir, "ProB_TT_vs_CC_results.csv"), show_col_types = FALSE),
+  "TC_vs_CC" = read_csv(file.path(wenjian_dir, "ProB_TC_vs_CC_results.csv"), show_col_types = FALSE),
+  "TT_vs_TC" = read_csv(file.path(wenjian_dir, "ProB_TT_vs_TC_results.csv"), show_col_types = FALSE)
+)
+
+# --- Helper: counts → TPM -------------------------------------
+counts_to_tpm <- function(counts, gene_length_kb) {
+  rpk <- sweep(counts, 1, gene_length_kb, "/")
+  apply(rpk, 2, function(x) x / sum(x, na.rm = TRUE) * 1e6)
+}
+
+# --- Main DEG runner ------------------------------------------
+run_deg_tpm_nalm6 <- function(count_matrix, metadata, ref_genotype, test_genotype,
+                              scenario_label, p_cutoff = 0.05, fc_cutoff = 0.5) {
+
+  scenario_dir <- file.path(outdir_root, paste0("scenario_", str_replace_all(scenario_label, " ", "_")))
+  if (!dir.exists(scenario_dir)) dir.create(scenario_dir)
+  
+  meta_data <- metadata %>%
+    filter(cell_line == "NALM6", genotype %in% c(ref_genotype, test_genotype)) %>%
+    mutate(genotype = factor(genotype, levels = c(ref_genotype, test_genotype)))
+  rownames(meta_data) <- meta_data$sample_id_full
+  filtered_counts <- count_matrix[, meta_data$sample_id_full, drop = FALSE]
+  
+  coding_genes <- gtf_df %>% filter(type == "gene", gene_biotype == "protein_coding") %>% pull(gene_id)
+  filtered_counts <- filtered_counts[rownames(filtered_counts) %in% coding_genes, ]
+  
+  gene_lengths <- gtf_df %>% filter(type == "exon") %>%
+    group_by(gene_id) %>% summarise(gene_length_kb = sum(width) / 1000, .groups = "drop")
+  lengths_vec <- setNames(gene_lengths$gene_length_kb, gene_lengths$gene_id)[rownames(filtered_counts)]
+  
+  tpm_matrix <- counts_to_tpm(filtered_counts, lengths_vec)
+  expr_log <- log2(tpm_matrix + 1)
+  
+  design <- model.matrix(~ genotype, data = meta_data)
+  colnames(design) <- c("Intercept", paste0(test_genotype, "_vs_", ref_genotype))
+  
+  fit <- eBayes(lmFit(expr_log, design), trend = TRUE)
+  coef_name <- colnames(design)[2]
+  
+  topTable(fit, coef = coef_name, number = Inf) %>%
+    rownames_to_column("gene_id") %>%
+    left_join(tx2gene_df %>% distinct(gene_id, gene_name), by = "gene_id") %>%
+    mutate(
+      significance = case_when(
+        P.Value <= p_cutoff & logFC >=  fc_cutoff  ~ "up",
+        P.Value <= p_cutoff & logFC <= -fc_cutoff  ~ "down",
+        TRUE ~ "ns"
+      )
+    )
+}
+
+# ==============================================================
+# ⚙️ Define scenarios
+# ==============================================================
+scenarios <- list(
+  "Remove TT Clone1 from Batch1" = sample_metadata %>%
+    filter(!(genotype == "TT" & clone == 1 & batch == "Batch1")),
+  "Remove TT Clone1 from Batch2" = sample_metadata %>%
+    filter(!(genotype == "TT" & clone == 1 & batch == "Batch2")),
+  "Remove TT Clone1 from Both Batches" = sample_metadata %>%
+    filter(!(genotype == "TT" & clone == 1))
+)
+
+# ==============================================================
+# 🚀 Generate Venn diagrams for each scenario
+# ==============================================================
+venn_dir <- file.path(outdir_root, "venn_figures_by_scenario")
+if (!dir.exists(venn_dir)) dir.create(venn_dir)
+
+for (scen_name in names(scenarios)) {
+  meta_scen <- scenarios[[scen_name]]
+  
+  # Run all contrasts
+  contrasts <- c("TT_vs_CC", "TC_vs_CC", "TT_vs_TC")
+  deg_results <- purrr::map(contrasts, function(cn) {
+    parts <- strsplit(cn, "_vs_")[[1]]
+    run_deg_tpm_nalm6(sf.df.data, meta_scen, parts[2], parts[1], scen_name)
+  })
+  names(deg_results) <- contrasts
+  
+  # Make 6-panel Venn (3 contrasts × up/down)
+  venn_plots <- purrr::map(contrasts, function(cn) {
+    df <- deg_results[[cn]]
+    p_up <- make_venn_pair(df, cn, "up", scen_name)
+    p_dn <- make_venn_pair(df, cn, "down", scen_name)
+    plot_grid(p_up, p_dn, ncol = 2, align = "hv", labels = c("A", "B"))
+  })
+  
+  final_fig <- plot_grid(plotlist = venn_plots, ncol = 1, align = "v")
+  
+  pdf_path <- file.path(venn_dir, paste0("Venn_", str_replace_all(scen_name, " ", "_"), ".pdf"))
+  ggsave(pdf_path, final_fig, width = 14, height = 18)
+  message("✅ Saved: ", pdf_path)
+}
+
+```
 
 

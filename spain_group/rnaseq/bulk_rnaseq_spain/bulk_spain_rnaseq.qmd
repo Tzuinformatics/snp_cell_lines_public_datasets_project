@@ -1,0 +1,923 @@
+# 0) Libraries and global packages
+
+```{r}
+suppressMessages({
+
+  ## Core data wrangling & plotting
+  library(tidyverse)          # dplyr, tidyr, ggplot2, tibble, stringr, readr, etc.
+  library(scales)
+
+  ## Genomics & annotation
+  library(rtracklayer)
+  library(GenomicRanges)
+  library(SummarizedExperiment)
+
+  ## RNA-seq analysis
+  library(edgeR)
+  library(DESeq2)
+  library(tidybulk)
+
+  ## Visualization helpers
+  library(ggrepel)
+  library(reshape2)
+})
+
+```
+
+# 1) Spain Salmon sample discovery and metadata parsing
+
+
+```{r}
+# ============================================================
+# Spain Salmon: sample discovery + metadata parsing (clean)
+# Structure: salmon_files/<DONOR>_<CELLTYPE>/quant.sf
+# Example: D198_CLP/quant.sf
+# ============================================================
+
+base_dir_spain <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Clarissa/snp_cell_lines_public_datasets_project/spain_group/rnaseq/bulk_rnaseq_spain/salmon_files"
+
+allowed_cell_types <- c(
+  "HSC", "CLP", "ProB", "PreB", "Immature_B",
+  "Transitional_B", "Naive_CD5pos", "Naive_CD5neg"
+)
+
+sample_dirs  <- list.dirs(base_dir_spain, recursive = FALSE, full.names = TRUE)
+sample_names <- basename(sample_dirs)
+
+sample_metadata_spain <- tibble::tibble(
+  sample = sample_names,
+  files  = file.path(sample_dirs, "quant.sf")
+) %>%
+  dplyr::filter(file.exists(files)) %>%
+  dplyr::mutate(
+    dataset   = "Spain_bulk",
+    donor     = stringr::str_extract(sample, "^D\\d{3}"),
+    donor_num = as.integer(stringr::str_remove(donor, "^D")),
+    cell_type = stringr::str_replace(sample, "^D\\d{3}_", ""),
+    tissue    = dplyr::case_when(
+      cell_type %in% c("HSC","CLP","ProB","PreB","Immature_B") ~ "BM",
+      cell_type %in% c("Transitional_B","Naive_CD5pos","Naive_CD5neg") ~ "PB",
+      TRUE ~ NA_character_
+    ),
+    sample_id_full = sample
+  )
+
+# ---------------------------
+# Guardrails (hard fail)
+# ---------------------------
+stopifnot(nrow(sample_metadata_spain) > 0)
+stopifnot(!any(is.na(sample_metadata_spain$donor)))
+stopifnot(!any(is.na(sample_metadata_spain$cell_type)))
+stopifnot(all(sample_metadata_spain$cell_type %in% allowed_cell_types))
+stopifnot(!anyDuplicated(sample_metadata_spain$sample_id_full))
+stopifnot(all(file.exists(sample_metadata_spain$files)))
+
+# Print quick audit
+cat("\n[Spain samples]\n")
+cat("Total samples:", nrow(sample_metadata_spain), "\n")
+cat("Donors:", dplyr::n_distinct(sample_metadata_spain$donor), "\n")
+print(sample_metadata_spain %>% dplyr::count(cell_type, sort = TRUE))
+
+# ---- Explicit donor exclusion ----
+donors_to_drop <- c("D198", "D199", "D204")
+
+sample_metadata_spain <- sample_metadata_spain %>%
+  dplyr::filter(!donor %in% donors_to_drop)
+
+```
+
+
+# 2) Analysis-ready sample metadata (human_coldata_spain)
+
+
+
+```{r}
+# ============================================================
+# human_coldata_spain: correct statistical meaning
+# donor = biological individual (blocking factor)
+# cell_type = main condition of interest
+# ============================================================
+
+human_coldata_spain <- sample_metadata_spain %>%
+  dplyr::transmute(
+    Sample   = sample_id_full,
+    files    = files,
+    dataset  = dataset,
+    donor    = factor(donor),
+    donor_num = donor_num,
+    cell_type = factor(cell_type, levels = c("HSC","CLP","ProB","PreB","Immature_B","Transitional_B","Naive_CD5neg","Naive_CD5pos")),
+    tissue   = factor(tissue)
+  ) %>%
+  tibble::column_to_rownames("Sample")   # avoids the deprecated “set rownames on tibble” warning
+
+# Guardrails
+stopifnot(all(file.exists(human_coldata_spain$files)))
+stopifnot(!anyDuplicated(rownames(human_coldata_spain)))
+stopifnot(!any(is.na(human_coldata_spain$donor)))
+stopifnot(!any(is.na(human_coldata_spain$cell_type)))
+
+print(head(human_coldata_spain, 10))
+
+```
+
+
+# 3) Donor × cell type completeness audit
+
+
+
+```{r}
+# ============================================================
+# Presence table (donor × cell_type)
+# ============================================================
+
+presence <- sample_metadata_spain %>%
+  dplyr::count(donor, cell_type) %>%
+  tidyr::pivot_wider(names_from = cell_type, values_from = n, values_fill = 0) %>%
+  dplyr::arrange(donor)
+
+print(presence, n = Inf)
+
+missing_pairs <- sample_metadata_spain %>%
+  tidyr::expand(donor, cell_type) %>%
+  dplyr::left_join(sample_metadata_spain %>% dplyr::count(donor, cell_type),
+                   by = c("donor","cell_type")) %>%
+  dplyr::mutate(n = tidyr::replace_na(n, 0L)) %>%
+  dplyr::filter(n == 0)
+
+cat("\nMissing donor×cell_type combos:", nrow(missing_pairs), "\n")
+print(missing_pairs, n = Inf)
+
+```
+
+# 4) Reference annotation and tx2gene mapping (GRCh38.113)
+
+
+```{r}
+
+# ============================================================
+# Reference annotation (GTF) and tx2gene mapping (Spain)
+# Permissive: strip transcript versions to maximize mapping
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(rtracklayer)
+})
+
+gtf_path <- "/Users/cojulian/Desktop/Tzu_projects/Matt/reference_genomes/Homo_sapiens.GRCh38.113.gtf.gz"
+stopifnot(file.exists(gtf_path))
+
+# Import GTF
+gtf <- rtracklayer::import(gtf_path)
+gtf_df <- as.data.frame(gtf)
+
+# Helper: strip version suffix (e.g., ENST... .12)
+strip_version <- function(x) stringr::str_replace(x, "\\.[0-9]+$", "")
+
+# Build transcript-to-gene mapping, with version-stripped transcript_id
+tx2gene_df <- gtf_df %>%
+  dplyr::select(transcript_id, gene_id, gene_name) %>%
+  dplyr::filter(!is.na(transcript_id), !is.na(gene_id)) %>%
+  dplyr::mutate(transcript_id = strip_version(transcript_id)) %>%   # <<< key change
+  dplyr::distinct(transcript_id, gene_id, gene_name) %>%
+  tidyr::drop_na()
+
+# Guardrail: basic sanity (no hard stop later; just ensure structure here)
+stopifnot(nrow(tx2gene_df) > 0)
+stopifnot(all(c("transcript_id","gene_id","gene_name") %in% colnames(tx2gene_df)))
+
+cat("\n[GTF / tx2gene]\n")
+cat("Rows tx2gene_df:", nrow(tx2gene_df), "\n")
+cat("Unique transcripts:", dplyr::n_distinct(tx2gene_df$transcript_id), "\n")
+cat("Unique genes      :", dplyr::n_distinct(tx2gene_df$gene_id), "\n")
+
+```
+
+
+# 5) tx2gene compatibility audit (Salmon transcript IDs vs GTF)
+
+
+```{r}
+
+# ============================================================
+# Robust tx2gene join key (handles versioned/unversioned IDs)
+# Permissive: audit only, do NOT hard-stop <90% match
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(readr)
+  library(tidyr)
+  library(stringr)
+})
+
+# Reuse the same strip_version helper
+strip_version <- function(x) stringr::str_replace(x, "\\.[0-9]+$", "")
+
+# Stable join key (already version-stripped in tx2gene_df above)
+tx2gene_join <- tx2gene_df %>%
+  dplyr::rename(tx_id = transcript_id) %>%
+  dplyr::select(tx_id, gene_id, gene_name) %>%
+  dplyr::distinct() %>%
+  tidyr::drop_na()
+
+# Probe one Spain quant.sf (audit only)
+stopifnot(exists("human_coldata_spain"))
+stopifnot(all(file.exists(human_coldata_spain$files)))
+sf_path_probe <- human_coldata_spain$files[1]
+
+sf_probe <- readr::read_tsv(sf_path_probe, show_col_types = FALSE) %>%
+  dplyr::mutate(tx_id = strip_version(.data$Name))
+
+match_rate <- mean(sf_probe$tx_id %in% tx2gene_join$tx_id)
+
+cat("\n[Spain tx2gene audit]\n")
+cat("Mapped transcript fraction (by tx_id):", round(100 * match_rate, 2), "%\n")
+
+# Optional: show counts of mapped/unmapped (no hard fail)
+mapped_n    <- sum(sf_probe$tx_id %in% tx2gene_join$tx_id)
+unmapped_n  <- sum(!sf_probe$tx_id %in% tx2gene_join$tx_id)
+total_n     <- nrow(sf_probe)
+cat("Mapped:", mapped_n, " / Unmapped:", unmapped_n, " / Total:", total_n, "\n")
+
+if (unmapped_n > 0) {
+  cat("Example unmapped tx_ids (first 10):\n")
+  print(utils::head(sf_probe$tx_id[!(sf_probe$tx_id %in% tx2gene_join$tx_id)], 10))
+}
+
+# Proceed permissively (drop unmapped via inner_join downstream)
+rm(sf_probe, match_rate, mapped_n, unmapped_n, total_n, sf_path_probe)
+
+```
+
+# 6) Salmon quant.sf to gene-level count matrix (Salmon.matrix_spain)
+
+
+```{r}
+# ============================================================
+# Salmon quant.sf → gene-level counts (Salmon.matrix_spain)
+# Robust: union gene set + fill by gene_id matching
+# ============================================================
+
+read_gene_counts <- function(sf_path, tx2gene_join) {
+  readr::read_tsv(sf_path, show_col_types = FALSE) %>%
+    dplyr::mutate(tx_id = strip_version(Name)) %>%
+    dplyr::inner_join(tx2gene_join, by = "tx_id") %>%
+    dplyr::group_by(gene_id) %>%
+    dplyr::summarise(NumReads = sum(NumReads), .groups = "drop")
+}
+
+# (Optional but smart) per-sample join coverage audit
+join_cov <- vapply(human_coldata_spain$files, function(p) {
+  sf <- readr::read_tsv(p, show_col_types = FALSE)
+  mean(strip_version(sf$Name) %in% tx2gene_join$tx_id)
+}, numeric(1))
+
+cat("\n[Per-sample tx2gene coverage]\n")
+print(summary(join_cov))
+if (any(join_cov < 0.90)) {
+  warning("Some samples have <90% tx2gene coverage. Inspect those quant.sf for reference mismatch.")
+}
+
+# 1) Union gene set across all samples
+gene_lists <- lapply(human_coldata_spain$files, function(p) read_gene_counts(p, tx2gene_join)$gene_id)
+all_genes <- sort(unique(unlist(gene_lists)))
+
+# 2) Initialize matrix
+Salmon.matrix_spain <- matrix(
+  0,
+  nrow = length(all_genes),
+  ncol = nrow(human_coldata_spain),
+  dimnames = list(all_genes, rownames(human_coldata_spain))
+)
+
+# 3) Fill by gene_id matching
+for (i in seq_along(human_coldata_spain$files)) {
+  samp <- rownames(human_coldata_spain)[i]
+  cat("Reading:", samp, "\n")
+
+  gc <- read_gene_counts(human_coldata_spain$files[i], tx2gene_join)
+
+  # Guardrail: no duplicate genes after summarise
+  stopifnot(!anyDuplicated(gc$gene_id))
+
+  Salmon.matrix_spain[gc$gene_id, samp] <- gc$NumReads
+}
+
+# 4) Guardrails
+stopifnot(all(colnames(Salmon.matrix_spain) == rownames(human_coldata_spain)))
+
+cat("\n[OK] Salmon.matrix_spain dims:", paste(dim(Salmon.matrix_spain), collapse = " x "), "\n")
+
+```
+
+
+# 7) Expression filtering (CPM-aware, cell-type aware)
+
+
+
+```{r}
+# ============================================================
+# CPM-aware filtering — keep genes expressed in ≥1 cell type
+# ============================================================
+
+y_spain <- edgeR::DGEList(counts = Salmon.matrix_spain)
+
+grp_cell <- factor(human_coldata_spain$cell_type)
+
+# Core edgeR rule (group-aware)
+keep_edgeR <- edgeR::filterByExpr(y_spain, group = grp_cell)
+
+# Explicit rule: CPM > 1 in >=2 samples within at least one cell type
+cpm_all <- edgeR::cpm(y_spain, log = FALSE)
+
+cell_levels <- levels(grp_cell)
+expr_by_cell <- sapply(cell_levels, function(ct) {
+  ct_samples <- colnames(Salmon.matrix_spain)[grp_cell == ct]
+  if (length(ct_samples) == 0) return(rep(FALSE, nrow(cpm_all)))
+  rowSums(cpm_all[, ct_samples, drop = FALSE] > 1) >= 2
+})
+
+keep_any_celltype <- rowSums(expr_by_cell) > 0
+keep_spain <- keep_edgeR & keep_any_celltype
+
+sf.df.data_spain <- Salmon.matrix_spain[keep_spain, , drop = FALSE]
+
+cat("\n[filtering summary — Spain]\n")
+cat("Genes before:", nrow(Salmon.matrix_spain), "\n")
+cat("Genes kept   :", nrow(sf.df.data_spain), "\n")
+cat("Percent kept :", round(100 * nrow(sf.df.data_spain) / nrow(Salmon.matrix_spain), 2), "%\n")
+
+```
+
+
+# 8) Quality control: library sizes and expression distributions
+
+
+
+```{r}
+# ============================================================
+# QC Suite — Spain bulk (79 samples; donor + cell_type structure)
+# ============================================================
+
+se_spain <- SummarizedExperiment::SummarizedExperiment(
+  assays  = list(counts = as.matrix(sf.df.data_spain)),
+  colData = human_coldata_spain[colnames(sf.df.data_spain), , drop = FALSE]
+)
+
+se_spain$detailed_name <- paste(
+  se_spain$donor,
+  se_spain$cell_type,
+  sep = "_"
+)
+
+# ----------------------------
+# 1) Library size plot
+# ----------------------------
+library_sizes <- colSums(SummarizedExperiment::assay(se_spain))
+
+qc_df <- data.frame(
+  Sample      = colnames(SummarizedExperiment::assay(se_spain)),
+  Donor       = as.character(se_spain$donor),
+  CellType    = as.character(se_spain$cell_type),
+  Tissue      = as.character(se_spain$tissue),
+  LibrarySize = library_sizes
+)
+
+ggplot2::ggplot(qc_df, ggplot2::aes(x = Sample, y = LibrarySize, fill = CellType)) +
+  ggplot2::geom_bar(stat = "identity", color = "black", width = 0.75) +
+  ggplot2::scale_y_continuous(labels = scales::comma) +
+  ggplot2::theme_minimal(base_size = 12) +
+  ggplot2::theme(
+    axis.text.x = ggplot2::element_text(angle = 90, hjust = 1, size = 7),
+    legend.position = "top"
+  ) +
+  ggplot2::labs(
+    title = "Library Size Distribution — Spain bulk RNA-seq (Salmon inferred counts)",
+    x = "Sample (donor_cell_type)",
+    y = "Library size (sum of gene-level NumReads)",
+    fill = "Cell type"
+  )
+
+# ----------------------------
+# 2) Log2(counts+1) density plot
+#   (per-sample is more diagnostic than per-group)
+# ----------------------------
+log_counts <- log2(SummarizedExperiment::assay(se_spain) + 1)
+
+log_counts_long <- reshape2::melt(log_counts)
+colnames(log_counts_long) <- c("Gene", "Sample", "LogExpression")
+
+log_counts_long <- log_counts_long %>%
+  dplyr::mutate(
+    CellType = se_spain$cell_type[match(Sample, colnames(log_counts))],
+    Donor    = se_spain$donor[match(Sample, colnames(log_counts))],
+    Tissue   = se_spain$tissue[match(Sample, colnames(log_counts))]
+  )
+
+ggplot2::ggplot(log_counts_long, ggplot2::aes(x = LogExpression, group = Sample)) +
+  ggplot2::geom_density(linewidth = 0.6, alpha = 0.35) +
+  ggplot2::facet_wrap(~ CellType, scales = "free_y") +
+  ggplot2::theme_minimal(base_size = 12) +
+  ggplot2::labs(
+    title = "Expression distributions by cell type — Spain bulk",
+    subtitle = "Each curve = one sample (donor-specific). Facets help spot within-cell-type outliers.",
+    x = "Log2(Counts + 1)",
+    y = "Density"
+  )
+
+```
+
+# 9) Donor SNP genotype parsing and inspection
+
+```{r}
+
+df <- data.frame(
+  stringsAsFactors = FALSE,
+  donor.group = c(
+    "1   D206    CC","2   D214    CC","3   D213    TC","4   D212    TC",
+    "5   D201    TT","6   D200    TT","7   D212    CC","8   D215    TC",
+    "9   D210    TT","10  D211    TT","11  D202    TC","12  D200    TC"
+  )
+)
+
+# Split by whitespace and keep donor + group
+snp_group <- tidyr::separate(df, donor.group, into = c("drop","donor","group"), sep = "\\s+", extra = "drop") %>%
+  dplyr::select(-drop)
+
+print(snp_group)
+
+```
+
+# 10) PCA: global structure of Spain bulk RNA-seq (cell type and tissue)
+
+
+
+
+```{r}
+# ===============================================================
+# PCA (CPM-filtered counts) — Spain bulk (Salmon inferred counts)
+# • No batch correction (single dataset)
+# • Genes restricted to those expressed in ≥1 cell type
+# ===============================================================
+
+# ---- coldata backbone ----
+spain_coldata <- human_coldata_spain %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("Sample") %>%
+  dplyr::mutate(
+    donor     = factor(donor),
+    cell_type = factor(cell_type, levels = c(
+      "HSC","CLP","ProB","PreB","Immature_B",
+      "Transitional_B","Naive_CD5neg","Naive_CD5pos"
+    )),
+    tissue    = factor(tissue, levels = c("BM","PB"))
+  )
+
+# Sanity checks
+stopifnot(nrow(spain_coldata) >= 2)
+stopifnot(all(spain_coldata$Sample %in% colnames(sf.df.data_spain)))
+
+# Expression matrix for PCA (already CPM-aware filtered upstream)
+expr_matrix <- sf.df.data_spain[, spain_coldata$Sample, drop = FALSE]
+
+# Additional cell-type expression filter:
+# keep genes with non-zero total counts in at least one cell type
+cell_levels <- levels(spain_coldata$cell_type)
+
+expr_by_cell <- sapply(cell_levels, function(ct) {
+  ct_samples <- spain_coldata$Sample[spain_coldata$cell_type == ct]
+  if (length(ct_samples) == 0) return(rep(FALSE, nrow(expr_matrix)))
+  rowSums(expr_matrix[, ct_samples, drop = FALSE]) > 0
+})
+
+keep_cell <- apply(expr_by_cell, 1, any)
+
+cat("\n[PCA pre-filter: expressed in ≥1 cell type]\n")
+cat("Genes before:", nrow(expr_matrix), "\n")
+cat("Genes kept  :", sum(keep_cell), "\n")
+
+expr_matrix_kept <- expr_matrix[keep_cell, , drop = FALSE]
+
+# ---- build tidy long format + metadata ----
+spain_expr_tidy <- expr_matrix_kept %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("gene_id") %>%
+  tidyr::pivot_longer(-gene_id, names_to = "Sample", values_to = "abundance") %>%
+  dplyr::rename(gene = gene_id) %>%
+  dplyr::left_join(
+    spain_coldata %>% dplyr::select(Sample, donor, cell_type, tissue),
+    by = "Sample"
+  )
+
+# Safe number of PCs
+n_samples <- nrow(spain_coldata)
+dims_requested <- 10L
+dims_safe <- max(2L, min(n_samples - 1L, dims_requested))
+
+# PCA via tidybulk
+pca_spain <- spain_expr_tidy %>%
+  tidybulk::tidybulk(.sample = Sample, .transcript = gene, .abundance = abundance) %>%
+  tidybulk::keep_abundant() %>%     # harmless extra guard
+  tidybulk::scale_abundance() %>%   # standardize before PCA
+  tidybulk::reduce_dimensions(method = "PCA", .dims = dims_safe)
+
+# ---- plot ----
+label_points <- FALSE  # set TRUE if you want labels (will be busy with 79 points)
+
+p <- pca_spain %>%
+  tidybulk::pivot_sample() %>%
+  ggplot2::ggplot(ggplot2::aes(
+    x = PC1, y = PC2,
+    color = cell_type,
+    shape = tissue
+  )) +
+  ggplot2::geom_point(size = 3, alpha = 0.9) +
+  ggplot2::theme_minimal(base_size = 13) +
+  ggplot2::labs(
+    title = "PCA (filtered counts) — Spain bulk RNA-seq",
+    subtitle = paste0(
+      "Color = cell type; shape = tissue; PCs computed: ", dims_safe,
+      "; genes expressed in ≥1 cell type"
+    ),
+    x = "PC1", y = "PC2",
+    color = "Cell type",
+    shape = "Tissue"
+  )
+
+if (isTRUE(label_points)) {
+  p <- p +
+    ggrepel::geom_text_repel(
+      data = pca_spain %>% tidybulk::pivot_sample() %>%
+        dplyr::mutate(label = paste0(donor, "_", cell_type)),
+      ggplot2::aes(label = label),
+      max.overlaps = 12,
+      size = 3,
+      show.legend = FALSE
+    )
+}
+
+print(p)
+
+```
+
+
+# 11) FPKM computation and gene-length normalization
+
+
+
+```{r}
+# ============================================================
+# FPKM computation — Spain bulk (DESeq2 + exon union lengths)
+# ============================================================
+
+# ----------------------------
+# 1) Build DESeq2 object (size-factor normalization only)
+# ----------------------------
+dds_spain <- DESeq2::DESeqDataSetFromMatrix(
+  countData = round(sf.df.data_spain),  # must be integers
+  colData   = human_coldata_spain[colnames(sf.df.data_spain), , drop = FALSE],
+  design    = ~ donor + cell_type
+)
+
+dds_spain <- DESeq2::estimateSizeFactors(dds_spain)
+
+# ----------------------------
+# 2) Compute exon-union gene lengths from the imported GTF
+# ----------------------------
+exons <- gtf[gtf$type == "exon"]
+
+# Guardrail: ensure gene_id exists
+stopifnot("gene_id" %in% names(S4Vectors::mcols(exons)))
+
+exons_by_gene <- split(exons, exons$gene_id)
+exonic_union  <- GenomicRanges::reduce(exons_by_gene)
+
+gene_len_bp <- vapply(exonic_union, function(gr) sum(GenomicRanges::width(gr)), integer(1))
+# names(gene_len_bp) are gene_ids
+
+# Attach gene lengths to dds (match rownames = gene_id)
+SummarizedExperiment::rowData(dds_spain)$basepairs <-
+  gene_len_bp[match(rownames(dds_spain), names(gene_len_bp))]
+
+n_missing_len <- sum(is.na(SummarizedExperiment::rowData(dds_spain)$basepairs))
+
+cat("\n[gene length check — Spain]\n")
+cat("Genes in dds           :", nrow(dds_spain), "\n")
+cat("Genes missing length   :", n_missing_len, "\n")
+
+if (n_missing_len > 0.1 * nrow(dds_spain)) {
+  warning(
+    "More than 10% of genes are missing exon-union lengths.\n",
+    "This usually means gene_id mismatch between Salmon-derived gene IDs and the GTF."
+  )
+}
+
+# ----------------------------
+# 3) Compute FPKM
+# ----------------------------
+fpkm_mat_spain <- DESeq2::fpkm(dds_spain, robust = TRUE)
+
+fpkm_df_spain <- as.data.frame(fpkm_mat_spain) %>%
+  tibble::rownames_to_column("gene_id") %>%
+  dplyr::mutate(dplyr::across(-gene_id, ~ round(.x, 3)))
+
+print(head(fpkm_df_spain, 6))
+
+# ----------------------------
+# 4) ARID5B quick plot (Spain) — by cell type + donor
+# ----------------------------
+arid5b_id <- "ENSG00000150347"
+
+arid5b_expr_spain <- fpkm_df_spain %>%
+  dplyr::filter(gene_id == arid5b_id) %>%
+  tidyr::pivot_longer(-gene_id, names_to = "Sample", values_to = "FPKM") %>%
+  dplyr::left_join(
+    human_coldata_spain %>% tibble::rownames_to_column("Sample"),
+    by = "Sample"
+  ) %>%
+  dplyr::mutate(
+    cell_type = factor(cell_type, levels = c(
+      "HSC","CLP","ProB","PreB","Immature_B",
+      "Transitional_B","Naive_CD5neg","Naive_CD5pos"
+    )),
+    tissue = factor(tissue, levels = c("BM","PB")),
+    donor  = factor(donor)
+  )
+
+if (nrow(arid5b_expr_spain) == 0) {
+  warning("ARID5B gene_id not found in fpkm_df_spain. Check gene_id and filtering.")
+} else {
+  ggplot2::ggplot(arid5b_expr_spain, ggplot2::aes(
+    x = cell_type, y = FPKM,
+    group = donor
+  )) +
+    ggplot2::geom_line(alpha = 0.35) +
+    ggplot2::geom_point(size = 2, alpha = 0.85) +
+    ggplot2::facet_wrap(~ tissue, scales = "free_x") +
+    ggplot2::scale_y_log10() +
+    ggplot2::theme_minimal(base_size = 12) +
+    ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1)) +
+    ggplot2::labs(
+      title = "ARID5B expression (FPKM) — Spain bulk",
+      subtitle = "Each line = donor; facet by tissue; log10 scale",
+      x = "Cell type",
+      y = "FPKM (log10)"
+    )
+}
+
+```
+# 12) PCA without PB
+
+```{r}
+# ===============================================================
+# Genotype-aware PCA — Spain bulk (BM only, conflicts removed)
+# • Removes PB samples (Transitional + Naive)
+# • Removes conflicting donors (D200, D212)
+# • Uses donor-level SNP genotype
+# ===============================================================
+
+# ----------------------------
+# 1) Final donor-level SNP calls (authoritative)
+# ----------------------------
+# Based on your table:
+# D200: TT + TC  -> Conflict
+# D212: TC + CC  -> Conflict
+
+snp_group_clean <- snp_group %>%
+  dplyr::filter(donor %in% unique(sample_metadata_spain$donor)) %>%
+  dplyr::group_by(donor) %>%
+  dplyr::summarise(
+    geno_values = paste(sort(unique(group)), collapse = ","),
+    geno_call = dplyr::case_when(
+      dplyr::n_distinct(group) == 1 ~ dplyr::first(group),
+      TRUE                          ~ "Conflict"
+    ),
+    .groups = "drop"
+  )
+
+cat("\n[Donor-level SNP genotype calls]\n")
+print(snp_group_clean)
+
+# Explicitly list conflicts (should be D200, D212)
+conflict_donors <- snp_group_clean %>%
+  dplyr::filter(geno_call == "Conflict") %>%
+  dplyr::pull(donor)
+
+cat("\n[Conflicting donors removed from genotype PCA]\n")
+print(conflict_donors)
+
+# ----------------------------
+# 2) Restrict to BM samples only
+# ----------------------------
+bm_samples <- human_coldata_spain %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("Sample") %>%
+  dplyr::filter(tissue == "BM")
+
+cat("\n[BM samples retained]\n")
+cat("Samples:", nrow(bm_samples), "\n")
+cat("Donors :", length(unique(bm_samples$donor)), "\n")
+
+# ----------------------------
+# 3) Remove conflicting donors
+# ----------------------------
+bm_samples_clean <- bm_samples %>%
+  dplyr::filter(!donor %in% conflict_donors) %>%
+  dplyr::left_join(snp_group_clean, by = "donor") %>%
+  dplyr::filter(geno_call %in% c("TT","TC","CC")) %>%
+  dplyr::mutate(
+    geno_call = factor(geno_call, levels = c("TT","TC","CC")),
+    cell_type = droplevels(cell_type)
+  )
+
+cat("\n[BM + clean genotype samples]\n")
+print(table(bm_samples_clean$geno_call))
+print(table(bm_samples_clean$cell_type))
+
+# ----------------------------
+# 4) Expression matrix (already filtered upstream)
+# ----------------------------
+expr_bm <- sf.df.data_spain[, bm_samples_clean$Sample, drop = FALSE]
+
+# Keep genes expressed in ≥1 cell type
+expr_by_cell <- sapply(levels(bm_samples_clean$cell_type), function(ct) {
+  ct_samples <- bm_samples_clean$Sample[bm_samples_clean$cell_type == ct]
+  if (length(ct_samples) == 0) return(rep(FALSE, nrow(expr_bm)))
+  rowSums(expr_bm[, ct_samples, drop = FALSE]) > 0
+})
+
+keep_gene <- apply(expr_by_cell, 1, any)
+expr_bm <- expr_bm[keep_gene, , drop = FALSE]
+
+cat("\n[Genes retained for PCA]\n")
+cat("Genes:", nrow(expr_bm), "\n")
+
+# ----------------------------
+# 5) PCA (tidybulk)
+# ----------------------------
+bm_expr_tidy <- expr_bm %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("gene_id") %>%
+  tidyr::pivot_longer(-gene_id, names_to = "Sample", values_to = "abundance") %>%
+  dplyr::rename(gene = gene_id) %>%
+  dplyr::left_join(
+    bm_samples_clean %>%
+      dplyr::select(Sample, donor, cell_type, geno_call),
+    by = "Sample"
+  )
+
+n_samples <- nrow(bm_samples_clean)
+dims_safe <- max(2L, min(n_samples - 1L, 8L))
+
+pca_bm <- bm_expr_tidy %>%
+  tidybulk::tidybulk(.sample = Sample, .transcript = gene, .abundance = abundance) %>%
+  tidybulk::keep_abundant() %>%
+  tidybulk::scale_abundance() %>%
+  tidybulk::reduce_dimensions(method = "PCA", .dims = dims_safe)
+
+# ----------------------------
+# 6) Plot
+# ----------------------------
+pca_bm %>%
+  tidybulk::pivot_sample() %>%
+  ggplot2::ggplot(ggplot2::aes(
+    x = PC1, y = PC2,
+    color = cell_type,
+    shape = geno_call
+  )) +
+  ggplot2::geom_point(size = 3, alpha = 0.9) +
+  ggplot2::theme_minimal(base_size = 13) +
+  ggplot2::labs(
+    title = "PCA — Spain bulk RNA-seq (BM only, clean genotypes)",
+    subtitle = "PB samples removed; conflicting donors excluded",
+    x = "PC1",
+    y = "PC2",
+    color = "Cell type",
+    shape = "Genotype"
+  )
+
+```
+
+## ARID5B without PB
+```{r}
+# ============================================================
+# 11) FPKM computation — Spain bulk (BM only, clean donors)
+# • PB samples removed
+# • Conflicting donors removed (D200, D212)
+# • Matches genotype-aware PCA universe
+# ============================================================
+
+# ----------------------------
+# 0) Define BM-only, clean sample set
+# ----------------------------
+bm_samples_fpkm <- bm_samples_clean %>%
+  dplyr::select(Sample, donor, cell_type, geno_call)
+
+stopifnot(all(bm_samples_fpkm$Sample %in% colnames(sf.df.data_spain)))
+
+# ----------------------------
+# 1) Build DESeq2 object (size-factor normalization only)
+# ----------------------------
+dds_spain_bm <- DESeq2::DESeqDataSetFromMatrix(
+  countData = round(sf.df.data_spain[, bm_samples_fpkm$Sample]),
+  colData   = bm_samples_fpkm %>%
+    tibble::column_to_rownames("Sample"),
+  design    = ~ donor + cell_type
+)
+
+dds_spain_bm <- DESeq2::estimateSizeFactors(dds_spain_bm)
+
+# ----------------------------
+# 2) Compute exon-union gene lengths
+# ----------------------------
+exons <- gtf[gtf$type == "exon"]
+
+stopifnot("gene_id" %in% names(S4Vectors::mcols(exons)))
+
+exons_by_gene <- split(exons, exons$gene_id)
+exonic_union  <- GenomicRanges::reduce(exons_by_gene)
+
+gene_len_bp <- vapply(
+  exonic_union,
+  function(gr) sum(GenomicRanges::width(gr)),
+  integer(1)
+)
+
+SummarizedExperiment::rowData(dds_spain_bm)$basepairs <-
+  gene_len_bp[match(rownames(dds_spain_bm), names(gene_len_bp))]
+
+n_missing_len <- sum(is.na(SummarizedExperiment::rowData(dds_spain_bm)$basepairs))
+
+cat("\n[gene length check — Spain BM]\n")
+cat("Genes in dds           :", nrow(dds_spain_bm), "\n")
+cat("Genes missing length   :", n_missing_len, "\n")
+
+if (n_missing_len > 0.1 * nrow(dds_spain_bm)) {
+  warning(
+    "More than 10% of genes are missing exon-union lengths.\n",
+    "Likely gene_id mismatch between Salmon-derived IDs and the GTF."
+  )
+}
+
+# ----------------------------
+# 3) Compute FPKM
+# ----------------------------
+fpkm_mat_spain_bm <- DESeq2::fpkm(dds_spain_bm, robust = TRUE)
+
+fpkm_df_spain_bm <- as.data.frame(fpkm_mat_spain_bm) %>%
+  tibble::rownames_to_column("gene_id") %>%
+  dplyr::mutate(dplyr::across(-gene_id, ~ round(.x, 3)))
+
+print(head(fpkm_df_spain_bm, 6))
+
+# ----------------------------
+# 4) ARID5B plot — BM only, clean donors
+# ----------------------------
+arid5b_id <- "ENSG00000150347"
+
+arid5b_expr_bm <- fpkm_df_spain_bm %>%
+  dplyr::filter(gene_id == arid5b_id) %>%
+  tidyr::pivot_longer(-gene_id, names_to = "Sample", values_to = "FPKM") %>%
+  dplyr::left_join(
+    bm_samples_fpkm,
+    by = "Sample"
+  ) %>%
+  dplyr::mutate(
+    cell_type = factor(cell_type, levels = c(
+      "HSC","CLP","ProB","PreB","Immature_B"
+    )),
+    donor    = factor(donor),
+    geno_call = factor(geno_call, levels = c("TT","TC","CC"))
+  )
+
+if (nrow(arid5b_expr_bm) == 0) {
+  warning("ARID5B not found in BM-only FPKM table.")
+} else {
+  ggplot2::ggplot(
+    arid5b_expr_bm,
+    ggplot2::aes(
+      x = cell_type,
+      y = FPKM,
+      group = donor,
+      color = geno_call
+    )
+  ) +
+    ggplot2::geom_line(alpha = 0.35) +
+    ggplot2::geom_point(size = 2.5, alpha = 0.9) +
+    ggplot2::scale_y_log10() +
+    ggplot2::theme_minimal(base_size = 12) +
+    ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1)) +
+    ggplot2::labs(
+      title = "ARID5B expression (FPKM) — Healthy bulk BM only",
+      subtitle = "Conflicting donors removed; color = genotype",
+      x = "Cell type (BM)",
+      y = "FPKM (log10)",
+      color = "Genotype"
+    )
+}
+
+```
+

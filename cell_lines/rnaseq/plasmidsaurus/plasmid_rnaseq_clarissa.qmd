@@ -1,0 +1,577 @@
+### 1) Sample discovery and metadata parsing (plasmidsaurus Salmon)
+
+This section locates Salmon output folders, parses genotype (TT/TC/CC) and replicate from directory names, and builds `sample_metadata` with strict guardrails to prevent silent parsing failures.
+
+
+```{r}
+# Load required libraries
+# ============================================================
+# Global package loading (single point of truth)
+# ============================================================
+suppressMessages({
+
+  ## Core data wrangling & plotting
+  library(tidyverse)          # dplyr, tidyr, ggplot2, tibble, stringr, readr, etc.
+  library(scales)
+
+  ## Genomics & annotation
+  library(rtracklayer)
+  library(GenomicRanges)
+  library(SummarizedExperiment)
+
+  ## RNA-seq analysis
+  library(edgeR)
+  library(DESeq2)
+  library(tidybulk)
+
+  ## Visualization helpers
+  library(ggrepel)
+  library(reshape2)
+})
+
+
+# Define base directory (UPDATED)
+base_dir <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Clarissa/snp_cell_lines_public_datasets_project/cell_lines/rnaseq/plasmidsaurus/salmon_files"
+
+# Get full paths and sample names
+sample_dirs  <- list.dirs(base_dir, recursive = FALSE, full.names = TRUE)
+sample_names <- basename(sample_dirs)
+
+# Construct metadata (UPDATED for Nalm6_<GENO>_rep<NUM>)
+sample_metadata <- tibble(
+    sample = sample_names,
+    path   = file.path(sample_dirs, "quant.sf")
+) %>%
+    # keep only dirs that actually contain quant.sf
+    filter(file.exists(path)) %>%
+    mutate(
+        cell_line = "NALM6",
+        genotype  = case_when(
+            str_detect(sample, "_TT_") ~ "TT",
+            str_detect(sample, "_TC_") ~ "TC",
+            str_detect(sample, "_CC_") ~ "CC",
+            TRUE ~ NA_character_
+        ),
+        replicate = str_extract(sample, "rep[0-9]+") %>%
+            str_remove("^rep") %>%
+            as.integer(),
+        # no clone info in this dataset
+        clone = NA_integer_,
+        # single batch by your statement
+        batch = "Batch1",
+        # keep a clean stable ID (don’t invent clone fields)
+        sample_id_full = sample
+    )
+
+# Hard-fail if parsing went wrong (skeptical guardrails)
+stopifnot(!any(is.na(sample_metadata$genotype)))
+stopifnot(!any(is.na(sample_metadata$replicate)))
+
+# Assign rownames
+rownames(sample_metadata) <- sample_metadata$sample_id_full
+
+# Preview
+print(sample_metadata)
+
+```
+
+
+### 2) Reference annotation (GTF) and tx2gene mapping
+
+This section imports the Ensembl GTF and constructs `tx2gene_df`, which maps transcript IDs to gene IDs and symbols for gene-level aggregation and later annotation.
+
+
+
+
+```{r}
+
+# Import GTF (UPDATED path — adjust if needed)
+gtf_path <- "/Users/cojulian/Desktop/Tzu_projects/Matt/reference_genomes/Homo_sapiens.GRCh38.113.gtf.gz"
+gtf <- import(gtf_path)
+gtf_df <- as.data.frame(gtf)
+
+# Build transcript-to-gene mapping
+tx2gene_df <- gtf_df %>%
+  select(transcript_id, gene_id, gene_name) %>%
+  distinct(transcript_id, gene_id, gene_name) %>%
+  drop_na()
+
+```
+
+
+### 3) Transcript ID compatibility audit (versioned vs unversioned IDs)
+
+This section checks whether Salmon transcript IDs match the GTF transcript IDs directly or only after stripping version suffixes. If needed, it rebuilds `tx2gene_df` to avoid massive transcript drop during joins.
+
+
+```{r}
+# ============================================================
+# Transcript ID audit (Salmon quant.sf Name vs tx2gene transcript_id)
+# Helps catch versioned vs unversioned transcript mismatches
+# ============================================================
+
+# Read a small sample of transcript IDs from the first quant.sf
+sf_probe <- read.delim(sample_metadata$path[1], stringsAsFactors = FALSE)
+
+sf_ids <- sf_probe$Name
+gtf_ids <- tx2gene_df$transcript_id
+
+# Direct match rate
+direct_match_rate <- mean(sf_ids %in% gtf_ids)
+
+# Try stripping version suffix from both (e.g., ENST0000... .12)
+strip_version <- function(x) str_replace(x, "\\.[0-9]+$", "")
+sf_ids_stripped  <- strip_version(sf_ids)
+gtf_ids_stripped <- strip_version(gtf_ids)
+
+stripped_match_rate <- mean(sf_ids_stripped %in% gtf_ids_stripped)
+
+cat("\n[tx2gene audit]\n")
+cat("Direct transcript_id match rate   :", round(100 * direct_match_rate, 2), "%\n")
+cat("Stripped-version match rate       :", round(100 * stripped_match_rate, 2), "%\n")
+
+# If stripped match is much better, rebuild a stripped tx2gene to use downstream
+if (stripped_match_rate > direct_match_rate + 0.05) {
+  cat("\n[INFO] Detected likely version mismatch. Rebuilding tx2gene_df with stripped transcript IDs.\n")
+  tx2gene_df <- tx2gene_df %>%
+    mutate(transcript_id = strip_version(transcript_id)) %>%
+    distinct(transcript_id, gene_id, gene_name) %>%
+    drop_na()
+} else {
+  cat("\n[INFO] transcript IDs look compatible; keeping original tx2gene_df.\n")
+}
+
+rm(sf_probe, sf_ids, gtf_ids, sf_ids_stripped, gtf_ids_stripped, direct_match_rate, stripped_match_rate)
+
+```
+
+### 4) Analysis-ready sample metadata (`human_coldata`)
+
+This section creates `human_coldata` (the colData backbone) with stable sample IDs and file paths, plus guardrails ensuring no missing genotypes/replicates and no file/path inconsistencies.
+
+
+```{r}
+# ============================================================
+# Align metadata for downstream analysis (human_coldata)
+# ============================================================
+
+human_coldata <- sample_metadata %>%
+  mutate(files = path) %>%
+  dplyr::select(sample_id_full, files, cell_line, genotype, replicate, clone, batch) %>%
+  dplyr::rename(Sample = sample_id_full)
+
+rownames(human_coldata) <- human_coldata$Sample
+
+# Guardrails
+stopifnot(all(file.exists(human_coldata$files)))
+stopifnot(!anyDuplicated(human_coldata$Sample))
+stopifnot(!any(is.na(human_coldata$genotype)))
+stopifnot(!any(is.na(human_coldata$replicate)))
+
+print(human_coldata)
+
+```
+
+
+### 5) Salmon quant.sf → gene-level count matrix (`Salmon.matrix`)
+
+This section reads each `quant.sf`, joins to `tx2gene_df`, sums transcript counts into gene-level counts, and builds a gene × sample matrix with strict column-order alignment checks.
+
+
+```{r}
+# ============================================================
+# Salmon quant.sf → gene-level counts (Salmon.matrix)
+# ============================================================
+
+
+read_gene_counts <- function(sf_path, tx2gene_df) {
+  read.delim(sf_path) %>%
+    dplyr::inner_join(tx2gene_df, by = c("Name" = "transcript_id")) %>%
+    dplyr::group_by(gene_id) %>%
+    dplyr::summarise(NumReads = sum(NumReads), .groups = "drop")
+}
+
+tmp <- read_gene_counts(human_coldata$files[1], tx2gene_df)
+
+sf.df <- matrix(
+  0,
+  nrow = nrow(tmp),
+  ncol = nrow(human_coldata),
+  dimnames = list(tmp$gene_id, human_coldata$Sample)
+)
+
+for (i in seq_along(human_coldata$files)) {
+  cat("Reading:", human_coldata$files[i], "\n")
+  sf.df[, i] <- read_gene_counts(human_coldata$files[i], tx2gene_df)$NumReads
+}
+
+Salmon.matrix <- sf.df
+
+stopifnot(all(colnames(Salmon.matrix) == human_coldata$Sample))
+cat("\n[OK] Salmon.matrix dims:", paste(dim(Salmon.matrix), collapse = " x "), "\n")
+
+```
+
+
+### 6) Expression filtering (CPM-aware + genotype-aware)
+
+This section filters low-information genes using edgeR’s `filterByExpr()` (group-aware) and an explicit CPM>1-in-≥1-genotype rule, producing the filtered raw-count matrix `sf.df.data` used downstream.
+
+
+```{r}
+# ============================================================
+# CPM-aware filtering — keep genes expressed in ≥1 genotype
+# ============================================================
+
+y <- DGEList(counts = Salmon.matrix)
+
+grp <- factor(
+  human_coldata$genotype[match(colnames(Salmon.matrix), human_coldata$Sample)],
+  levels = c("TT","TC","CC")
+)
+
+# Core edgeR rule (design-aware)
+keep <- filterByExpr(y, group = grp)
+
+# Extra explicit rule: gene has CPM > 1 in at least one genotype group
+cpm_all <- cpm(y, log = FALSE)
+
+geno_levels <- levels(grp)
+expr_by_geno <- sapply(geno_levels, function(g) {
+  g_samples <- colnames(Salmon.matrix)[grp == g]
+  if (length(g_samples) == 0) return(rep(FALSE, nrow(cpm_all)))
+  rowSums(cpm_all[, g_samples, drop = FALSE] > 1) > 0
+})
+
+keep_any_genotype <- rowSums(expr_by_geno) > 0
+keep_geno <- keep & keep_any_genotype
+
+sf.df.data <- Salmon.matrix[keep_geno, , drop = FALSE]
+
+cat("\n[filtering summary]\n")
+cat("Genes before:", nrow(Salmon.matrix), "\n")
+cat("Genes kept   :", nrow(sf.df.data), "\n")
+cat("Percent kept :", round(100 * nrow(sf.df.data) / nrow(Salmon.matrix), 2), "%\n")
+
+```
+
+### 7) QC plots (library size and expression distributions)
+
+This section builds a `SummarizedExperiment` and generates two QC views: library size (depth/outliers) and log2(counts+1) density distributions (global shifts or atypical samples). Single-batch: focus is sample consistency and genotype patterns.
+
+
+```{r}
+# ============================================================
+# QC Suite — plasmidsaurus (7 NALM6 samples; single batch)
+# ============================================================
+
+sf.df.se <- SummarizedExperiment(
+  assays  = list(counts = as.matrix(sf.df.data)),
+  colData = human_coldata[colnames(sf.df.data), ]
+)
+
+# Nice label for plotting
+sf.df.se$detailed_name <- paste(
+  sf.df.se$cell_line,
+  sf.df.se$genotype,
+  paste0("R", sf.df.se$replicate),
+  sep = "_"
+)
+
+# ----------------------------
+# 1) Library size plot
+# ----------------------------
+library_sizes <- colSums(assay(sf.df.se))
+
+ggplot(
+  data.frame(
+    Sample      = sf.df.se$detailed_name,
+    Genotype    = sf.df.se$genotype,
+    LibrarySize = library_sizes
+  ),
+  aes(x = Sample, y = LibrarySize, fill = Genotype)
+) +
+  geom_bar(stat = "identity", color = "black", width = 0.75) +
+  scale_y_continuous(labels = scales::comma) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, size = 10),
+    legend.position = "top"
+  ) +
+  labs(
+    title = "Library Size Distribution (plasmidsaurus NALM6)",
+    x = "Sample (cell_line_genotype_replicate)",
+    y = "Library Size (Raw Counts)",
+    fill = "Genotype"
+  )
+
+# ----------------------------
+# 2) Log2 expression density plot
+# ----------------------------
+log_counts <- log2(assay(sf.df.se) + 1)
+
+log_counts_long <- reshape2::melt(log_counts)
+colnames(log_counts_long) <- c("Gene", "Sample", "LogExpression")
+
+log_counts_long <- log_counts_long %>%
+  mutate(
+    Genotype  = sf.df.se$genotype[match(Sample, colnames(log_counts))],
+    Replicate = sf.df.se$replicate[match(Sample, colnames(log_counts))]
+  )
+
+ggplot(log_counts_long, aes(x = LogExpression, color = Genotype)) +
+  geom_density(linewidth = 1, alpha = 0.8) +
+  theme_minimal(base_size = 13) +
+  labs(
+    title = "Log2 Gene Expression Distributions (plasmidsaurus NALM6)",
+    subtitle = "Color = genotype",
+    x = "Log2(Counts + 1)",
+    y = "Density",
+    color = "Genotype"
+  )
+
+```
+
+
+### 8) PCA on filtered genes (single batch; genotype structure)
+
+This section runs PCA on genes that pass CPM-aware filtering and are non-zero in at least one genotype, without batch correction (by design). PCA evaluates global structure: genotype separation vs replicate variability.
+
+
+```{r}
+# ===============================================================
+# PCA (CPM-filtered counts) — no batch correction (single batch)
+# Genes restricted to those expressed in ≥1 genotype
+# ===============================================================
+
+
+# Subset to NALM6 and ensure consistent types/levels
+nalm6_coldata <- human_coldata %>%
+  filter(cell_line == "NALM6") %>%
+  mutate(
+    genotype   = factor(genotype, levels = c("TT", "TC", "CC")),
+    replicate  = as.integer(replicate)
+  )
+
+# Sanity checks
+stopifnot(nrow(nalm6_coldata) >= 2)
+stopifnot(all(nalm6_coldata$Sample %in% colnames(sf.df.data)))
+
+# Expression matrix for PCA (already CPM-aware filtered upstream)
+expr_matrix <- sf.df.data[, nalm6_coldata$Sample, drop = FALSE]
+
+# Additional genotype-expression filter:
+# keep genes with non-zero total counts in at least one genotype
+genos <- levels(nalm6_coldata$genotype)
+
+expr_by_geno <- sapply(genos, function(g) {
+  g_samples <- nalm6_coldata$Sample[nalm6_coldata$genotype == g]
+  if (length(g_samples) == 0) return(rep(FALSE, nrow(expr_matrix)))
+  rowSums(expr_matrix[, g_samples, drop = FALSE]) > 0
+})
+
+keep_geno <- apply(expr_by_geno, 1, any)
+
+cat("\n[PCA pre-filter: expressed in ≥1 genotype]\n")
+cat("Genes before:", nrow(expr_matrix), "\n")
+cat("Genes kept  :", sum(keep_geno), "\n")
+
+expr_matrix_kept <- expr_matrix[keep_geno, , drop = FALSE]
+
+# Tidy long format with metadata
+nalm6_expr_tidy <- expr_matrix_kept %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("gene_id") %>%
+  pivot_longer(-gene_id, names_to = "Sample", values_to = "abundance") %>%
+  rename(gene = gene_id) %>%
+  left_join(nalm6_coldata %>% dplyr::select(Sample, genotype, replicate), by = "Sample")
+
+# Safe number of PCs
+n_samples <- nrow(nalm6_coldata)
+dims_requested <- 8L
+dims_safe <- max(2L, min(n_samples - 1L, dims_requested))
+
+# PCA via tidybulk (on pre-filtered genes)
+pca_raw <- nalm6_expr_tidy %>%
+  tidybulk(.sample = Sample, .transcript = gene, .abundance = abundance) %>%
+  keep_abundant() %>%
+  scale_abundance() %>%
+  reduce_dimensions(method = "PCA", .dims = dims_safe)
+
+# Plot PCs
+pca_raw %>%
+  pivot_sample() %>%
+  ggplot(aes(
+    x = PC1, y = PC2,
+    color = genotype,
+    shape = as.factor(replicate),
+    label = Sample
+  )) +
+  geom_point(size = 3, alpha = 0.9) +
+  ggrepel::geom_text_repel(max.overlaps = 10, size = 3, show.legend = FALSE) +
+  theme_minimal() +
+  labs(
+    title = "PCA (CPM-filtered counts) — NALM6 (plasmidsaurus)",
+    subtitle = paste0(
+      "Color = genotype; shape = replicate; PCs computed: ", dims_safe,
+      "; genes expressed in ≥1 genotype"
+    ),
+    x = "PC1", y = "PC2"
+  )
+
+```
+
+
+
+### 9) Compute FPKM from filtered counts (gene lengths from exon union)
+
+This section estimates DESeq2 size factors, computes exon-union gene lengths from the GTF, and generates `fpkm_mat` and `fpkm_df`. It also includes a quick ARID5B FPKM plot as a sanity check.
+
+
+
+```{r}
+# ============================================================
+# FPKM computation from filtered counts (DESeq2 + exon union lengths)
+
+
+# ----------------------------
+# 1) Build DESeq2 object (size-factor normalization only)
+# ----------------------------
+dds <- DESeqDataSetFromMatrix(
+  countData = round(sf.df.data),   # must be integers
+  colData   = human_coldata[colnames(sf.df.data), ],
+  design    = ~ genotype
+)
+
+# estimate size factors (enough for FPKM; no need to fit full model here)
+dds <- estimateSizeFactors(dds)
+
+# ----------------------------
+# 2) Compute exon-union gene lengths from the imported GTF
+# ----------------------------
+# Keep only exons
+exons <- gtf[gtf$type == "exon"]
+
+# Split by gene_id (gene_id should exist in the GTF metadata)
+stopifnot("gene_id" %in% colnames(as.data.frame(mcols(exons))) || "gene_id" %in% names(mcols(exons)))
+
+exons_by_gene <- split(exons, exons$gene_id)
+exonic_union  <- GenomicRanges::reduce(exons_by_gene)
+
+# Sum union widths per gene
+gene_len_bp <- vapply(exonic_union, function(gr) sum(width(gr)), integer(1))
+# names(gene_len_bp) are gene_ids
+
+# Attach gene lengths to dds (match rownames = gene_id)
+rowData(dds)$basepairs <- gene_len_bp[match(rownames(dds), names(gene_len_bp))]
+
+# Guardrail: how many genes are missing lengths?
+n_missing_len <- sum(is.na(rowData(dds)$basepairs))
+cat("\n[gene length check]\n")
+cat("Genes in dds           :", nrow(dds), "\n")
+cat("Genes missing length   :", n_missing_len, "\n")
+
+# If many are missing, warn explicitly (often indicates gene_id mismatch)
+if (n_missing_len > 0.1 * nrow(dds)) {
+  warning("More than 10% of genes are missing exon-union lengths. Check that dds rownames are Ensembl gene_ids and that the GTF gene_id matches.")
+}
+
+# ----------------------------
+# 3) Compute FPKM
+# ----------------------------
+fpkm_mat <- fpkm(dds, robust = TRUE)
+
+fpkm_df <- as.data.frame(fpkm_mat) %>%
+  tibble::rownames_to_column("gene_id") %>%
+  mutate(across(-gene_id, ~ round(.x, 3)))
+
+# Preview
+print(head(fpkm_df, 6))
+
+# ----------------------------
+# 4) ARID5B quick plot (optional but useful QC)
+# ----------------------------
+# ARID5B Ensembl gene_id you’ve been using:
+arid5b_id <- "ENSG00000150347"
+
+arid5b_expr <- fpkm_df %>%
+  filter(gene_id == arid5b_id) %>%
+  pivot_longer(-gene_id, names_to = "Sample", values_to = "FPKM") %>%
+  left_join(human_coldata, by = c("Sample" = "Sample")) %>%
+  mutate(genotype = factor(genotype, levels = c("TT","TC","CC")))
+
+if (nrow(arid5b_expr) == 0) {
+  warning("ARID5B gene_id not found in fpkm_df. Check gene_id (Ensembl) and filtering steps.")
+} else {
+  ggplot(arid5b_expr, aes(x = genotype, y = FPKM)) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.3) +
+    geom_jitter(width = 0.12, size = 2.8) +
+    scale_y_log10() +
+    theme_minimal() +
+    labs(
+      title = "ARID5B expression (FPKM)",
+      subtitle = "Log10 scale; plasmidsaurus NALM6",
+      x = "Genotype",
+      y = "FPKM (log scale)"
+    )
+}
+```
+
+
+### 10) Annotate FPKM with gene symbols and export CSV
+
+This section builds a gene_id→gene_symbol map from the GTF, joins it onto `fpkm_df`, performs coverage checks, and exports a publication-ready CSV of FPKM values with gene symbols.
+
+
+
+```{r}
+# ============================================================
+# FPKM table with gene symbols + CSV export (robust, explicit)
+# ============================================================
+
+
+# ------------------------------------------------------------
+# 1. Build gene_id → gene_symbol mapping (SAFE namespace usage)
+# ------------------------------------------------------------
+gene_symbol_map <- tx2gene_df %>%
+  dplyr::select(gene_id, gene_name) %>%
+  dplyr::distinct() %>%
+  dplyr::group_by(gene_id) %>%
+  dplyr::summarise(
+    gene_symbol = dplyr::first(gene_name),  # explicit namespace avoids S4 masking
+    .groups = "drop"
+  )
+
+# ------------------------------------------------------------
+# 2. Attach gene symbols to FPKM table
+# ------------------------------------------------------------
+fpkm_df_annotated <- fpkm_df %>%
+  dplyr::left_join(gene_symbol_map, by = "gene_id") %>%
+  dplyr::relocate(gene_symbol, .after = gene_id)
+
+# ------------------------------------------------------------
+# 3. Sanity checks
+# ------------------------------------------------------------
+stopifnot("gene_symbol" %in% colnames(fpkm_df_annotated))
+cat("Genes total           :", nrow(fpkm_df_annotated), "\n")
+cat("Genes with symbol     :", sum(!is.na(fpkm_df_annotated$gene_symbol)), "\n")
+cat("Genes without symbol  :", sum(is.na(fpkm_df_annotated$gene_symbol)), "\n")
+
+# Preview
+print(head(fpkm_df_annotated, 6))
+
+# ------------------------------------------------------------
+# 4. Export CSV (publication-ready)
+# ------------------------------------------------------------
+out_csv <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Clarissa/snp_cell_lines_public_datasets_project/cell_lines/rnaseq/plasmidsaurus/fpkm_plasmidsaurus_with_gene_symbols.csv"
+
+write.csv(
+  fpkm_df_annotated,
+  file = out_csv,
+  row.names = FALSE
+)
+
+cat("\n[OK] FPKM table with gene symbols written to:\n", out_csv, "\n")
+
+```
+
