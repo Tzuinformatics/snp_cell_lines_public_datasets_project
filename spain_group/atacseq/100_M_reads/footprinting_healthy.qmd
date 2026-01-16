@@ -156,5 +156,226 @@ write_csv(
 ```
 
 
+### Statistical Inspection
+
+```{r}
+
+# ============================================================
+# DIAGNOSTIC ANALYSIS — TOBIAS BINDetect score & p-value behavior
+# Overlap-safe grid using cowplot
+# ============================================================
+
+suppressPackageStartupMessages({
+    library(dplyr)
+    library(ggplot2)
+    library(cowplot)  # use cowplot for grid assembly
+})
+
+# ----------------------------
+# 1) Prepare clean diagnostic table
+# ----------------------------
+diag_df <- TT_CC_bindetect %>%
+    dplyr::select(name, motif_id, TT_CC_change, TT_CC_pvalue) %>%
+    dplyr::filter(
+        is.finite(TT_CC_change),
+        is.finite(TT_CC_pvalue),
+        TT_CC_pvalue > 0,
+        TT_CC_pvalue <= 1
+    )
+
+# ----------------------------
+# Common baseline theme to prevent crowding/overlap
+# ----------------------------
+base_theme <- theme_minimal(base_size = 11) +
+    theme(
+        plot.title.position = "plot",
+        plot.title = element_text(face = "bold", margin = margin(b = 6)),
+        axis.title.x = element_text(margin = margin(t = 4)),
+        axis.title.y = element_text(margin = margin(r = 4)),
+        # generous margins around each plot to avoid overlap in the grid
+        plot.margin = margin(t = 8, r = 8, b = 8, l = 8)
+    )
+
+# A small helper for consistent binning
+n_bins <- 80
+
+# ----------------------------
+# 2) Distribution of binding score changes
+# ----------------------------
+p_score_dist <- ggplot(diag_df, aes(x = TT_CC_change)) +
+    geom_histogram(bins = n_bins, fill = "grey70", color = "black", boundary = 0) +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    coord_cartesian(clip = "off") +
+    base_theme +
+    labs(
+        title = "Binding score changes",
+        x = "TT − CC (score change)",
+        y = "Count"
+    )
+
+# ----------------------------
+# 3) Raw p-value distribution (null diagnostic)
+# ----------------------------
+expected_per_bin <- nrow(diag_df) / n_bins
+p_pval_dist <- ggplot(diag_df, aes(x = TT_CC_pvalue)) +
+    geom_histogram(bins = n_bins, fill = "grey70", color = "black", boundary = 0) +
+    geom_hline(yintercept = expected_per_bin, linetype = "dashed", color = "red") +
+    coord_cartesian(clip = "off") +
+    base_theme +
+    labs(
+        title = "P-value distribution (null check)",
+        x = "p-value",
+        y = "Count"
+    )
+
+# ----------------------------
+# 4) Uniformity check: empirical CDF vs theoretical uniform
+# ----------------------------
+p_ecdf <- ggplot(diag_df, aes(TT_CC_pvalue)) +
+    stat_ecdf(geom = "step", color = "black") +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+    coord_fixed(ylim = c(0, 1), xlim = c(0, 1), clip = "off") +
+    base_theme +
+    labs(
+        title = "ECDF of p-values vs Uniform(0,1)",
+        x = "p-value",
+        y = "ECDF"
+    )
+
+# ----------------------------
+# 5) Effect size vs p-value dependency
+# ----------------------------
+p_effect_vs_p <- ggplot(
+    diag_df,
+    aes(x = TT_CC_change, y = -log10(TT_CC_pvalue))
+) +
+    geom_point(alpha = 0.4, size = 1) +
+    geom_smooth(method = "loess", se = FALSE, color = "red") +
+    base_theme +
+    labs(
+        title = "Effect size vs −log10(p)",
+        x = "TT − CC (score change)",
+        y = "−log10(p-value)"
+    )
+
+# ----------------------------
+# 6) Symmetry diagnostic: signed effect vs p-value
+# ----------------------------
+p_signed <- ggplot(
+    diag_df,
+    aes(x = sign(TT_CC_change) * -log10(TT_CC_pvalue))
+) +
+    geom_density(fill = "grey70", alpha = 0.6) +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    base_theme +
+    labs(
+        title = "Signed −log10(p) symmetry",
+        x = "Signed −log10(p-value)",
+        y = "Density"
+    )
+
+# ----------------------------
+# 7) Assemble an overlap-safe grid with cowplot
+# ----------------------------
+# Align plots to share axis layouts and prevent label overflow
+aligned <- cowplot::align_plots(
+    p_score_dist, p_pval_dist, p_ecdf, p_effect_vs_p, p_signed,
+    align = "hv",
+    axis = "lrbt"
+)
+
+top_row    <- cowplot::plot_grid(aligned[[1]], aligned[[2]], ncol = 2, rel_widths = c(1, 1))
+middle_row <- cowplot::plot_grid(aligned[[3]], aligned[[4]], ncol = 2, rel_widths = c(1, 1))
+bottom_row <- aligned[[5]]
+
+final_grid <- cowplot::plot_grid(
+    top_row,
+    middle_row,
+    bottom_row,
+    ncol = 1,
+    rel_heights = c(1, 1, 0.9), # slightly reduce density panel height
+    labels = c("A", "B", "C"),  # optional row labels
+    label_size = 12
+)
+
+# If you prefer saving directly:
+# cowplot::save_plot("bindetect_diagnostics_grid.png", final_grid, base_height = 8, base_width = 10, dpi = 300)
+
+final_grid
+
+```
+
+
+### Volcano plot suggestion
+
+```{r}
+
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+
+volcano_q <- TT_CC_bindetect %>%
+    dplyr::select(name, motif_id, TT_CC_change) %>%
+    filter(is.finite(TT_CC_change)) %>%
+    mutate(
+        abs_change = abs(TT_CC_change),
+        quantile_rank = ntile(abs_change, 100),
+        Category = case_when(
+            quantile_rank >= 95 & TT_CC_change > 0 ~ "TT-enriched",
+            quantile_rank >= 95 & TT_CC_change < 0 ~ "CC-enriched",
+            TRUE ~ "Background"
+        )
+    )
+
+# TFs to label: only extreme quantile
+label_df <- volcano_q %>%
+    filter(Category != "Background") %>%
+    distinct(name, .keep_all = TRUE) %>% 
+    arrange(desc(abs_change)) %>% 
+    head(5)
+
+# Compute symmetric x-limit around 0
+x_max <- max(abs(volcano_q$TT_CC_change), na.rm = TRUE)
+
+ggplot(volcano_q,
+       aes(x = TT_CC_change,
+           y = quantile_rank,
+           color = Category)) +
+    
+    geom_point(alpha = 0.6, size = 2) +
+    
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+    
+    geom_text_repel(
+        data = label_df,
+        aes(label = name),
+        size = 4,
+        fontface = "bold",
+        max.overlaps = Inf,
+        box.padding = 0.5,
+        point.padding = 0.4,
+        segment.color = "grey40",
+        show.legend = FALSE
+    ) +
+    
+    scale_color_manual(values = c(
+        "TT-enriched" = "#D55E00",
+        "CC-enriched" = "#0072B2",
+        "Background" = "grey70"
+    )) +
+    
+    # --- Symmetric axes ---
+    scale_x_continuous(limits = c(-x_max, x_max), expand = expansion(mult = 0.02)) +
+    scale_y_continuous(limits = c(0, 100), breaks = seq(0, 100, by = 20), expand = expansion(mult = 0.02)) +
+    
+    theme_minimal(base_size = 16) +
+    
+    labs(
+        title = "Quantile-based footprinting volcano Healthy Pro-B (TT vs CC)",
+        x = "Binding score change (TT − CC)",
+        y = "Effect size percentile"
+    )
+
+```
 
 

@@ -4010,7 +4010,7 @@ pheatmap::pheatmap(
     genotype = genotype_colors
   ),
   border_color = NA,
-  main = "ATAC module activity (ALL peaks; one peak/gene = closest-to-TSS; column-scaled)"
+  main = "ATAC module activity Ilaria's markers (ALL peaks; one peak/gene = closest-to-TSS; column-scaled)"
 )
 ```
 
@@ -4481,7 +4481,7 @@ pheatmap::pheatmap(
         genotype = genotype_colors
     ),
     border_color = NA,
-    main = paste0("ATAC module activity (PROMOTERS = |distanceToTSS| ≤ ",
+    main = paste0("ATAC module activity of Ilaria's markers (PROMOTERS = |distanceToTSS| ≤ ",
                   PROMOTER_WINDOW_BP, "bp; ONE peak/gene; column-scaled)")
 )
 
@@ -4866,7 +4866,7 @@ pheatmap::pheatmap(
     genotype = genotype_colors
   ),
   border_color = NA,
-  main = paste0("ATAC module activity (ENHANCERS = |distanceToTSS| > ",
+  main = paste0("ATAC module activity of Ilaria's markers (ENHANCERS = |distanceToTSS| > ",
                 PROMOTER_WINDOW_BP, "bp; one peak/gene = closest enhancer; column-scaled)")
 )
 
@@ -5312,7 +5312,7 @@ pheatmap::pheatmap(
         low_signal = savics_low_signal_colors
     ),
     border_color      = NA,
-    main              = "ATAC module activity (Savics ALL markers; liftover + overlap; column-scaled; SINGLE-LABEL ONLY)"
+    main              = "ATAC module activity Savic's markers [ALL peaks]"
 )
 
 cat("\n[SAVICS ALL] DONE — SINGLE-LABEL ONLY used (comma-list progenitors dropped); low-signal samples flagged.\n")
@@ -5330,8 +5330,7 @@ cat("===============================================================\n\n")
 # ALL objects prefixed with `prom_`
 # =====================================================================
 
-suppressPackageStartupMessages({
-  library(dplyr)
+suppressPackageStartupMessages({  library(dplyr)
   library(tidyr)
   library(readxl)
   library(tibble)
@@ -5629,14 +5628,70 @@ pheatmap::pheatmap(
     genotype = genotype_colors
   ),
   border_color = NA,
-  main = "ATAC module activity (Savics PROMOTERS only)"
+  main = "ATAC module activity Savic's markers [PROMOTERS]"
 )
 
 cat("\n[SAVICS PROMOTERS] DONE — dplyr:: explicit, prom_ prefixed, logic preserved.\n")
 
 ```
+##### Saving for footpringint
+```{r}
+# ================================================================
+# EXPORT ProB-ONLY SAMPLE CLASSIFICATIONS (PROMOTERS, SAVICS)
+# + Adds leukemia Subtype from meta_sj (matched by sample ID)
+# ================================================================
+# Keeps: sample, top_ct, genotype, Subtype
+# Filters to top_ct == "ProB"
+# Writes CSV: only_proB_samples_savics.csv
+# ================================================================
 
-### Enhancer only Savic
+stopifnot(exists("prom_dom_tbl_ord"))
+stopifnot(exists("meta_sj"))
+
+library(dplyr)
+library(readr)
+
+# ---- Prepare subtype lookup (defensive: unique per sample) ----
+meta_subtype <- meta_sj %>%
+  dplyr::select(Sample, Subtype) %>%
+  dplyr::distinct()
+
+# ---- Build ProB-only table + join subtype ----
+only_proB_samples <- prom_dom_tbl_ord %>%
+  dplyr::select(sample, top_ct, genotype) %>%
+  dplyr::filter(top_ct == "ProB") %>%
+  dplyr::left_join(
+    meta_subtype,
+    by = c("sample" = "Sample")
+  )
+
+# ---- Guardrails ----
+# 1) No duplicated samples
+stopifnot(!anyDuplicated(only_proB_samples$sample))
+
+# 2) Report missing subtype annotations (do NOT hard-stop)
+n_missing_subtype <- sum(is.na(only_proB_samples$Subtype))
+if (n_missing_subtype > 0) {
+  warning(
+    "[WARN] ", n_missing_subtype,
+    " ProB samples have no Subtype annotation in meta_sj"
+  )
+}
+
+# ---- Write CSV ----
+readr::write_csv(
+  only_proB_samples,
+  file = "only_proB_samples_savics.csv"
+)
+
+cat("\n[EXPORT] ProB-only samples with Subtype saved to 'only_proB_samples_savics.csv'\n")
+cat("[INFO] Rows written: ", nrow(only_proB_samples), "\n", sep = "")
+cat("[INFO] Missing Subtype annotations: ", n_missing_subtype, "\n", sep = "")
+
+```
+
+
+#### Enhancer only Savic
 
 ```{r}
 # =====================================================================
@@ -5946,18 +6001,13 @@ pheatmap::pheatmap(
     genotype = genotype_colors
   ),
   border_color = NA,
-  main = "ATAC module activity (Savics ENHANCERS only)"
+  main = "ATAC module activity Savic's markers [ENHANCERS]"
 )
 
 cat("\n[SAVICS ENHANCERS] DONE — enh_ prefixed, dplyr:: explicit, logic preserved.\n")
 
 ```
 
-### Confirming TRUE proB based on reads
-
-```{r}
-
-```
 
 
 

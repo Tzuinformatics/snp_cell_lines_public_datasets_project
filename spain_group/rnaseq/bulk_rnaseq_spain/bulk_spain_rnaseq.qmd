@@ -437,17 +437,19 @@ ggplot2::ggplot(log_counts_long, ggplot2::aes(x = LogExpression, group = Sample)
 df <- data.frame(
   stringsAsFactors = FALSE,
   donor.group = c(
-    "1   D206    CC","2   D214    CC","3   D213    TC","4   D212    TC",
-    "5   D201    TT","6   D200    TT","7   D212    CC","8   D215    TC",
+    "1   D206    CC","2   D214    CC","3   D213    TC","4   D212    CC",
+    "5   D201    TT","6   D200    TC","7   D212    CC","8   D215    TC",
     "9   D210    TT","10  D211    TT","11  D202    TC","12  D200    TC"
   )
 )
 
-# Split by whitespace and keep donor + group
+# Split by whitespace and keep donor + group, then remove duplicates by donor
 snp_group <- tidyr::separate(df, donor.group, into = c("drop","donor","group"), sep = "\\s+", extra = "drop") %>%
-  dplyr::select(-drop)
+  dplyr::select(-drop) %>%
+  dplyr::distinct(donor, .keep_all = TRUE)  # keep first occurrence of each donor
 
 print(snp_group)
+
 
 ```
 
@@ -918,6 +920,71 @@ if (nrow(arid5b_expr_bm) == 0) {
       color = "Genotype"
     )
 }
+
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+## Genotype colors (paper / Prism style)
+geno_colors <- c(
+    "TT" = "#000000",  # black
+    "TC" = "#9e9e9e",  # gray
+    "CC" = "#FFFFFF"   # white
+)
+
+## Prepare plotting data (no summarising yet)
+plot_df <- arid5b_expr_bm %>%
+    filter(cell_type %in% c("HSC","CLP","ProB","PreB","Immature_B")) %>%
+    mutate(
+        cell_type = factor(
+            cell_type,
+            levels = c("HSC","CLP","ProB","PreB","Immature_B")
+        ),
+        geno_call = factor(geno_call, levels = c("TT","TC","CC"))
+    )
+
+ggplot(plot_df, aes(x = geno_call, y = FPKM, fill = geno_call)) +
+    
+    ## Mean bar (Prism-style)
+    stat_summary(
+        fun = mean,
+        geom = "col",
+        width = 0.6,
+        alpha = 0.4,
+        color = "black"
+    ) +
+    
+    ## Individual donor points
+    geom_jitter(
+        shape = 21,
+        size = 2.6,
+        color = "black",
+        width = 0.12,
+        alpha = 0.95
+    ) +
+    
+    facet_wrap(~ cell_type, nrow = 1) +
+    
+    scale_fill_manual(values = geno_colors) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+    
+    theme_classic(base_size = 13) +
+    theme(
+        legend.position = "left",
+        strip.background = element_blank(),
+        strip.text = element_text(face = "bold"),
+        axis.line = element_line(),
+        panel.grid = element_blank()
+    ) +
+    
+    labs(
+        title = "ARID5B mRNA expression by rs709045 genotype across B-cell development",
+        y = "ARID5B mRNA (FPKM)",
+        x = NULL,
+        fill = "rs709045\ngenotype"
+    )
 
 ```
 

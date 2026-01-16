@@ -52,7 +52,7 @@ print(sample_metadata)
 suppressMessages(library(rtracklayer))
 
 # Import GTF
-gtf <- import("/Users/cojulian/Desktop/Tzu_projects/Matt/reference_genomces/Homo_sapiens.GRCh38.113.gtf.gz")
+gtf <- import("/Users/cojulian/Desktop/Tzu_projects/Matt/reference_genomes/Homo_sapiens.GRCh38.113.gtf.gz")
 gtf_df <- as.data.frame(gtf)
 
 # Build transcript-to-gene mapping
@@ -1555,4 +1555,166 @@ for (scen_name in names(scenarios)) {
 
 ```
 
+
+### SAVING FOR INTEGRATION
+```{r}
+
+suppressPackageStartupMessages({
+    library(readr)
+    library(dplyr)
+    library(stringr)
+    library(tibble)
+    library(tidyr)
+    library(edgeR)
+    library(DESeq2)
+    library(rtracklayer)
+})
+
+# ------------------------------------
+# 0) Paths and metadata (yours)
+# ------------------------------------
+base_dir <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Clarissa/snp_cell_lines_public_datasets_project/cell_lines/rnaseq/PolyA_Rnaseq_nickase/polyA_sf_files"
+
+sample_dirs  <- list.dirs(base_dir, recursive = FALSE, full.names = TRUE)
+sample_names <- basename(sample_dirs)
+
+sample_metadata <- tibble(
+    sample = sample_names,
+    path   = file.path(sample_dirs, "quant.sf")
+) %>%
+    mutate(
+        cell_line = "NALM6",
+        genotype  = case_when(
+            str_detect(sample, "TT") ~ "TT",
+            str_detect(sample, "TC") ~ "TC",
+            str_detect(sample, "CC") ~ "CC",
+            TRUE ~ NA_character_
+        ),
+        clone = str_extract(sample, "Clone[0-9]+") %>% str_remove("Clone") %>% as.integer(),
+        replicate = str_extract(sample, "REP[0-9]+") %>% str_remove("REP") %>% as.integer(),
+        batch = case_when(
+            str_detect(sample, "REP1") ~ "Batch1",
+            str_detect(sample, "REP2") ~ "Batch2",
+            TRUE ~ "Unknown"
+        ),
+        sample_id_full = paste(cell_line, genotype, paste0("C", clone), paste0("R", replicate), sep = "_")
+    )
+
+rownames(sample_metadata) <- sample_metadata$sample_id_full
+
+human_coldata <- sample_metadata %>%
+    mutate(files = path) %>%
+    dplyr::select(sample_id_full, files, everything()) %>%
+    dplyr::rename(Sample = sample_id_full)
+rownames(human_coldata) <- human_coldata$Sample
+
+# ------------------------------------
+# 1) GTF: tx2gene and gene metadata
+# ------------------------------------
+# Robust path selection in case of minor typos in "genomes/genomces"
+gtf_candidates <- c(
+    "/Users/cojulian/Desktop/Tzu_projects/Matt/reference_genomes/Homo_sapiens.GRCh38.113.gtf.gz",
+    "/Users/cojulian/Desktop/Tzu_projects/Matt/reference_genomces/Homo_sapiens.GRCh38.113.gtf.gz"
+)
+gtf_path <- gtf_candidates[file.exists(gtf_candidates)][1]
+if (is.na(gtf_path)) stop("GTF not found at expected paths.")
+
+gtf    <- rtracklayer::import(gtf_path)
+gtf_df <- as.data.frame(gtf)
+
+tx2gene_df <- gtf_df %>%
+    dplyr::select(transcript_id, gene_id, gene_name) %>%
+    dplyr::distinct(transcript_id, gene_id, gene_name) %>%
+    tidyr::drop_na()
+
+gene_map <- gtf_df %>%
+    dplyr::select(gene_id, gene_name, gene_biotype) %>%
+    dplyr::distinct()
+
+# ------------------------------------
+# 2) Build gene-level count matrix
+# ------------------------------------
+# Initialize from the first file to get gene_id universe
+tmp <- read.delim(human_coldata$files[1], check.names = FALSE) %>%
+    inner_join(tx2gene_df, by = c("Name" = "transcript_id")) %>%
+    group_by(gene_id) %>%
+    summarise(NumReads = as.integer(sum(NumReads)), .groups = "drop")
+
+num.row <- nrow(tmp)
+num.col <- nrow(human_coldata)
+
+sf.df <- matrix(0L, nrow = num.row, ncol = num.col,
+                dimnames = list(tmp$gene_id, human_coldata$Sample))
+
+for (i in seq_along(human_coldata$files)) {
+    cat("Reading:", human_coldata$files[i], "\n")
+    gi <- read.delim(human_coldata$files[i], check.names = FALSE) %>%
+        inner_join(tx2gene_df, by = c("Name" = "transcript_id")) %>%
+        group_by(gene_id) %>%
+        summarise(NumReads = as.integer(sum(NumReads)), .groups = "drop")
+    # Ensure gene_id order aligns to sf.df rows
+    sf.df[, i] <- gi$NumReads[match(rownames(sf.df), gi$gene_id)]
+}
+
+Salmon.matrix <- as.matrix(sf.df)
+
+cat("RNA raw counts:", nrow(Salmon.matrix), "genes ×", ncol(Salmon.matrix), "samples\n")
+
+# ------------------------------------
+# 3) CPM-aware filtering (edgeR)
+# ------------------------------------
+y   <- DGEList(counts = Salmon.matrix)
+grp <- factor(human_coldata$genotype[match(colnames(Salmon.matrix), human_coldata$Sample)],
+              levels = c("TT","TC","CC"))
+
+keep <- filterByExpr(y, group = grp)
+sf.df.data <- Salmon.matrix[keep, , drop = FALSE]
+
+cat("[filterByExpr] kept", sum(keep), "of", nrow(Salmon.matrix), "genes\n")
+
+# ------------------------------------
+# 4) VST (DESeq2)
+# ------------------------------------
+dds_rna <- DESeqDataSetFromMatrix(
+    countData = round(sf.df.data),
+    colData   = human_coldata[colnames(sf.df.data), , drop = FALSE],
+    design    = ~ genotype + batch   # include batch in design; VST blind=TRUE ignores, but size factors benefit
+)
+dds_rna <- estimateSizeFactors(dds_rna)
+vst_rna <- assay(vst(dds_rna, blind = TRUE))   # genes × samples
+
+# ------------------------------------
+# 5) Map to gene_name and aggregate duplicates
+# ------------------------------------
+rna_df <- as.data.frame(vst_rna) %>%
+    tibble::rownames_to_column("gene_id") %>%
+    left_join(gene_map, by = "gene_id") %>%
+    mutate(gene_name = dplyr::coalesce(gene_name, gene_id)) %>%
+    select(-gene_biotype)
+
+rna_gene_vst <- rna_df %>%
+    group_by(gene_name) %>%
+    summarise(across(where(is.numeric), mean, na.rm = TRUE), .groups = "drop") %>%
+    tibble::column_to_rownames("gene_name") %>%
+    as.matrix()   # genes × samples
+
+cat("RNA gene-level VST:", nrow(rna_gene_vst), "genes ×", ncol(rna_gene_vst), "samples\n")
+
+# ------------------------------------
+# 6) Keep NALM6 TT/TC/CC and save CSV (samples × genes)
+# ------------------------------------
+# Your metadata is already all NALM6, but guard just in case:
+nalms_all <- grepl("^NALM6_(TT|TC|CC)_", colnames(rna_gene_vst))
+rna_gene_vst <- rna_gene_vst[, nalms_all, drop = FALSE]
+
+rna_for_scca <- t(rna_gene_vst)   # samples × genes
+
+
+
+
+out_csv <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Clarissa/snp_cell_lines_public_datasets_project/cell_lines/rnaseq/PolyA_Rnaseq_nickase/polyA_matrix_NALM6.csv"
+write.csv(rna_for_scca, file = out_csv, quote = FALSE)
+cat("✅ Saved RNA matrix (samples × genes) to:\n", out_csv, "\n")
+
+```
 

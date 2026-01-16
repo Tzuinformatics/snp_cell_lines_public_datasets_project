@@ -1,0 +1,225 @@
+```{r}
+# ==========================================================
+# Volcano plot for TOBIAS BINDetect results
+# ProB by Savics — TT vs CC (SJ156)
+# ==========================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(ggplot2)
+  library(ggrepel)
+  library(tidyr)
+  library(readr)
+})
+
+BINDETECT_PATH <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Clarissa/snp_cell_lines_public_datasets_project/stjudes_156/atacseq/peaks_sj_156_exploration/footprinting_sj156/proB_by_savics_TT_vs_CC/bindetect_results.txt"
+
+stopifnot(file.exists(BINDETECT_PATH))
+
+bindetect <- read.delim(BINDETECT_PATH, stringsAsFactors = FALSE)
+
+cols   <- c("up" = "#ffad73", "down" = "#26b3ff", "ns" = "grey80")
+sizes  <- c("up" = 2, "down" = 2, "ns" = 1)
+alphas <- c("up" = 1, "down" = 1, "ns" = 0.5)
+
+volcano.data <- bindetect %>%
+  dplyr::select(name, motif_id, cluster, TT_CC_change, TT_CC_pvalue) %>%
+  tidyr::drop_na() %>%
+  dplyr::mutate(
+    GeneType = dplyr::case_when(
+      TT_CC_change >=  0.1 & TT_CC_pvalue <= 0.05 ~ "up",
+      TT_CC_change <= -0.1 & TT_CC_pvalue <= 0.05 ~ "down",
+      TRUE                                      ~ "ns"
+    ),
+    GeneType = factor(GeneType, levels = c("up", "down", "ns"))
+  )
+
+# Top 10 strongest signals
+top_hits <- volcano.data %>%
+  dplyr::arrange(TT_CC_pvalue) %>%
+  dplyr::slice(1:10)
+
+# Canonical B-cell TFs
+highlight_genes <- volcano.data %>%
+  dplyr::filter(name %in% c("ARID5B", "PAX5", "IKZF1", "SPI1"))
+
+label_data <- dplyr::bind_rows(top_hits, highlight_genes) %>%
+  dplyr::distinct(name, .keep_all = TRUE)
+
+plot1 <- ggplot(
+  volcano.data,
+  aes(
+    x     = TT_CC_change,
+    y     = -log10(TT_CC_pvalue),
+    fill  = GeneType,
+    size  = GeneType,
+    alpha = GeneType
+  )
+) +
+  geom_point(shape = 21, colour = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "grey40") +
+  geom_vline(xintercept = c(-0.1, 0.1), linetype = "dashed", colour = "grey40") +
+  geom_text_repel(
+    data = label_data,
+    aes(label = name),
+    size = 3,
+    max.overlaps = 20
+  ) +
+  scale_fill_manual(values = cols) +
+  scale_size_manual(values = sizes) +
+  scale_alpha_manual(values = alphas) +
+  theme_minimal() +
+  labs(
+    title = "TOBIAS BINDetect — ProB (Savics) TT vs CC",
+    subtitle = "SJ156 · All motifs",
+    x = "Binding-score change (TT − CC)",
+    y = "−log10(p-value)"
+  )
+
+print(plot1)
+
+```
+
+
+```{r}
+# ==========================================================
+# Volcano plot — TOP 15 up & down TFs
+# ==========================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(ggplot2)
+  library(ggrepel)
+})
+
+top15_up <- volcano.data %>%
+  dplyr::filter(GeneType == "up") %>%
+  dplyr::arrange(TT_CC_pvalue) %>%
+  dplyr::slice(1:15)
+
+top15_down <- volcano.data %>%
+  dplyr::filter(GeneType == "down") %>%
+  dplyr::arrange(TT_CC_pvalue) %>%
+  dplyr::slice(1:15)
+
+label_data_15 <- dplyr::bind_rows(top15_up, top15_down) %>%
+  dplyr::distinct(name, .keep_all = TRUE)
+
+plot2 <- ggplot(
+  volcano.data,
+  aes(
+    x     = TT_CC_change,
+    y     = -log10(TT_CC_pvalue),
+    fill  = GeneType,
+    size  = GeneType,
+    alpha = GeneType
+  )
+) +
+  geom_point(shape = 21, colour = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "grey40") +
+  geom_vline(xintercept = c(-0.1, 0.1), linetype = "dashed", colour = "grey40") +
+  geom_label_repel(
+    data = label_data_15,
+    aes(label = name, fill = GeneType),
+    color          = "white",
+    fontface       = "bold",
+    size           = 4,
+    label.size     = 0.4,
+    label.r        = unit(0.15, "lines"),
+    box.padding    = 0.5,
+    point.padding  = 0.4,
+    segment.color  = "grey40",
+    segment.size   = 0.4,
+    show.legend    = FALSE
+  ) +
+  scale_fill_manual(values = c(
+    "up"   = "#D55E00",
+    "down" = "#0072B2",
+    "ns"   = "grey80"
+  )) +
+  scale_size_manual(values = sizes) +
+  scale_alpha_manual(values = alphas) +
+  theme_minimal(base_size = 16) +
+  labs(
+    title = "TOBIAS BINDetect — ProB TT vs CC",
+    subtitle = "Top 15 up- and down-regulated TFs",
+    x = "Binding-score change (TT − CC)",
+    y = "−log10(p-value)"
+  )
+
+print(plot2)
+
+```
+
+
+```{r}
+# ==========================================================
+# Focused volcano plot — CUX1 & CUX2 (RIP figure)
+# ==========================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(ggplot2)
+  library(ggrepel)
+  library(grid)
+})
+
+cux_best <- volcano.data %>%
+  dplyr::filter(name %in% c("CUX1", "CUX2")) %>%
+  dplyr::group_by(name) %>%
+  dplyr::arrange(TT_CC_pvalue) %>%
+  dplyr::slice(1) %>%
+  dplyr::ungroup()
+
+stopifnot(all(c("CUX1", "CUX2") %in% cux_best$name))
+
+plot_cux_best <- ggplot(
+  volcano.data,
+  aes(
+    x     = TT_CC_change,
+    y     = -log10(TT_CC_pvalue),
+    fill  = GeneType,
+    size  = GeneType,
+    alpha = GeneType
+  )
+) +
+  geom_point(shape = 21, colour = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "grey40") +
+  geom_vline(xintercept = c(-0.1, 0.1), linetype = "dashed", colour = "grey40") +
+  scale_fill_manual(values = c(
+    "up"   = "#D55E00",
+    "down" = "#0072B2",
+    "ns"   = "grey80"
+  )) +
+  scale_size_manual(values = sizes) +
+  scale_alpha_manual(values = alphas) +
+  theme_minimal(base_size = 16) +
+  labs(
+    title    = "TOBIAS BINDetect — ProB TT vs CC",
+    subtitle = "Highlighted motifs: CUX1 and CUX2",
+    x = "Binding-score change (TT − CC)",
+    y = "−log10(p-value)"
+  ) +
+  ggrepel::geom_label_repel(
+    data = cux_best,
+    aes(label = name),
+    fill          = "#6A1B9A",
+    color         = "white",
+    fontface      = "bold",
+    size          = 5,
+    label.size    = 0.5,
+    label.r       = unit(0.18, "lines"),
+    box.padding   = unit(0.03, "lines"),
+    point.padding = unit(0.02, "lines"),
+    min.segment.length = 0,
+    force         = 0.2,
+    force_pull    = 1.0,
+    seed          = 42,
+    max.overlaps  = Inf,
+    show.legend   = FALSE
+  )
+
+print(plot_cux_best)
+
+```
+

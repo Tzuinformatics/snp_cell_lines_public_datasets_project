@@ -1261,6 +1261,207 @@ ARID5B_by_genotype_log <- ggplot(merged, aes(x = genotype, y = ARID5B_log2p1)) +
 ARID5B_by_genotype_log
 ```
 
+#### CUX1 and CUX2 expression
+```{r}
+
+# ============================================================
+# CUX1 expression (FPKM) by genotype across B-cell development
+# Prism-style bar plot with jittered points
+# ============================================================
+
+library(dplyr)
+library(ggplot2)
+
+# Gene of interest
+gene_id <- "ENSG00000257923"  # CUX1
+
+# Genotype colors (Prism style)
+geno_colors <- c(
+    "TT" = "#000000",  # black
+    "CT" = "#9e9e9e",  # gray
+    "CC" = "#FFFFFF"   # white
+)
+
+# Prepare data: merge expression, genotype, and cell type info
+plot_df <- expression_long %>%
+    filter(gene == gene_id) %>%
+    left_join(genotypes_clean, by = "sample_id") %>%
+    left_join(dominant_tbl %>% select(sample = sample, top_ct), by = c("sample_id" = "sample")) %>%
+    filter(!is.na(genotype_label), !is.na(expression), !is.na(top_ct)) %>%
+    mutate(
+        genotype_label = factor(genotype_label, levels = c("TT","CT","CC")),
+        top_ct = factor(top_ct, levels = c("HSCMPP","EarlyLymphoid","ProB","PreB","B","GMP","pDC"))
+    )
+
+cat("Samples retained for", gene_id, ":", nrow(plot_df), "\n")
+
+# Prism-style bar plot
+cux1_barplot <- ggplot(plot_df, aes(x = genotype_label, y = expression, fill = genotype_label)) +
+    
+    # Mean bar
+    stat_summary(
+        fun = mean,
+        geom = "col",
+        width = 0.6,
+        alpha = 0.4,
+        color = "black"
+    ) +
+    
+    # Individual sample points
+    geom_jitter(
+        shape = 21,
+        size = 2.6,
+        color = "black",
+        width = 0.12,
+        alpha = 0.95
+    ) +
+    
+    facet_wrap(~ top_ct, nrow = 1) +
+    
+    scale_fill_manual(values = geno_colors) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+    
+    theme_classic(base_size = 13) +
+    theme(
+        legend.position = "left",
+        strip.background = element_blank(),
+        strip.text = element_text(face = "bold"),
+        axis.line = element_line(),
+        panel.grid = element_blank()
+    ) +
+    
+    labs(
+        title = "CUX1 expression by rs7090445 genotype across B-cell development",
+        y = "CUX1 mRNA (FPKM)",
+        x = NULL,
+        fill = "rs7090445\ngenotype"
+    )
+
+# Render plot
+cux1_barplot
+
+```
+
+
+```{r}
+
+# ============================================================
+# CUX2 expression (FPKM) by genotype across B-cell development
+# Prism-style bar plot with jittered points
+# ============================================================
+
+library(dplyr)
+library(ggplot2)
+
+# Gene of interest
+gene_id <- "ENSG00000111249"  # CUX2
+
+# Genotype colors (Prism style)
+geno_colors <- c(
+    "TT" = "#000000",  # black
+    "CT" = "#9e9e9e",  # gray
+    "CC" = "#FFFFFF"   # white
+)
+
+# Prepare data: merge expression, genotype, and cell type info
+plot_df <- expression_long %>%
+    filter(gene == gene_id) %>%
+    left_join(genotypes_clean, by = "sample_id") %>%
+    left_join(dominant_tbl %>% select(sample = sample, top_ct), by = c("sample_id" = "sample")) %>%
+    filter(!is.na(genotype_label), !is.na(expression), !is.na(top_ct)) %>%
+    mutate(
+        genotype_label = factor(genotype_label, levels = c("TT","CT","CC")),
+        top_ct = factor(top_ct, levels = c("HSCMPP","EarlyLymphoid","ProB","PreB","B","GMP","pDC"))
+    )
+
+cat("Samples retained for", gene_id, ":", nrow(plot_df), "\n")
+
+# Prism-style bar plot
+cux2_barplot <- ggplot(plot_df, aes(x = genotype_label, y = expression, fill = genotype_label)) +
+    
+    # Mean bar (Prism-style)
+    stat_summary(
+        fun = mean,
+        geom = "col",
+        width = 0.6,
+        alpha = 0.4,
+        color = "black"
+    ) +
+    
+    # Individual sample points
+    geom_jitter(
+        shape = 21,
+        size = 2.6,
+        color = "black",
+        width = 0.12,
+        alpha = 0.95
+    ) +
+    
+    facet_wrap(~ top_ct, nrow = 1) +
+    
+    scale_fill_manual(values = geno_colors) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+    
+    theme_classic(base_size = 13) +
+    theme(
+        legend.position = "left",
+        strip.background = element_blank(),
+        strip.text = element_text(face = "bold"),
+        axis.line = element_line(),
+        panel.grid = element_blank()
+    ) +
+    
+    labs(
+        title = "CUX2 expression by rs7090445 genotype across B-cell development",
+        y = "CUX2 mRNA (FPKM)",
+        x = NULL,
+        fill = "rs7090445\ngenotype"
+    )
+
+# Render plot
+cux2_barplot
+
+```
+
+##### SAVING ARID5B AND CUX1:
+
+```{r}
+
+# ============================================================
+# Export FPKM data for ARID5B and CUX1 with genotype & cell type info
+# Includes gene_symbol column
+# ============================================================
+
+library(dplyr)
+library(readr)
+
+# Correct gene mapping
+gene_map <- tibble(
+    gene = c("ENSG00000150347", "ENSG00000257923"),  # ARID5B and CUX1
+    gene_symbol = c("ARID5B", "CUX1")
+)
+
+# Prepare combined data
+export_df <- expression_long %>%
+    filter(gene %in% gene_map$gene) %>%
+    left_join(genotypes_clean, by = "sample_id") %>%
+    left_join(dominant_tbl %>% select(sample = sample, top_ct), by = c("sample_id" = "sample")) %>%
+    filter(!is.na(genotype_label), !is.na(expression), !is.na(top_ct)) %>%
+    left_join(gene_map, by = "gene") %>%
+    select(gene, gene_symbol, sample_id, expression, genotype, ancestry, genotype_label, top_ct)
+
+# Check dimensions
+cat("Rows in export_df:", nrow(export_df), "\n")
+
+# Save to CSV
+output_path <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Clarissa/snp_cell_lines_public_datasets_project/sj_expression_arid5b_Wenjian/csv_for_figures_RIP_Jan_2026/ARID5B_CUX1_FPKM_by_genotype.csv"
+write_csv(export_df, output_path)
+
+cat("CSV saved to:", output_path, "\n")
+
+```
+
+
 ## 5 — 📊 Stacked barplots of dominant lineage × genotype
 
 ### 5.1 — Per-ancestry stacked barplots

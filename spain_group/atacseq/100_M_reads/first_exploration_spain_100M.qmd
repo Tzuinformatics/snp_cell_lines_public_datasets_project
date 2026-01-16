@@ -3209,3 +3209,138 @@ cat("\n[Spain] Core state with ALL / PROM / ENH gene matrices + Spain marker pan
 
 ```
 
+# Plot for Clarissa's RIP
+
+```{r}
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# -----------------------------
+# Prepare plotting dataframe
+# -----------------------------
+
+plot_df <- snp_data_faceted %>%
+    dplyr::select(Sample, cell_type, group, C, T) %>%
+    filter(cell_type == "ProB", group != "NoCov") %>%
+    pivot_longer(
+        cols = c(C, T),
+        names_to = "Allele",
+        values_to = "Count"
+    ) %>%
+    mutate(
+        x_group = case_when(
+            group == "TT" & Allele == "T" ~ "TT",
+            group == "TC" & Allele == "C" ~ "TC_C",
+            group == "TC" & Allele == "T" ~ "TC_T",
+            group == "CC" & Allele == "C" ~ "CC",
+            TRUE ~ NA_character_
+        )
+    ) %>%
+    filter(!is.na(x_group))
+
+# -----------------------------
+# Colors
+# -----------------------------
+
+fill_colors <- c(
+    "TT"   = "#e41a1c",
+    "TC_C" = "#4daf4a",
+    "TC_T" = "#e41a1c",
+    "CC"   = "#4daf4a"
+)
+
+# -----------------------------
+# Custom x positions (control spacing)
+# -----------------------------
+# Set the desired positions for each bar. You can tweak 'tc_gap' to control
+# how close TC_C and TC_T are to each other without moving TT or CC.
+tc_center <- 2.5
+tc_gap    <- 0.8   # smaller gap -> bars closer (try 0.06–0.12)
+positions <- c(
+    TT   = 1.0,
+    TC_C = tc_center - tc_gap/2,
+    TC_T = tc_center + tc_gap/2,
+    CC   = 4.0
+)
+
+plot_df <- plot_df %>%
+    mutate(
+        x_num = dplyr::recode(x_group,
+                              TT   = positions["TT"],
+                              TC_C = positions["TC_C"],
+                              TC_T = positions["TC_T"],
+                              CC   = positions["CC"]
+        )
+    )
+
+# -----------------------------
+# Compute top position for labels
+# -----------------------------
+y_top <- max(plot_df$Count, na.rm = TRUE) * 1.08  # ~8% headroom
+
+# -----------------------------
+# Plot
+# -----------------------------
+
+ggplot(plot_df, aes(x = x_num, y = Count)) +
+    
+    ## Mean bars (fixed widths; you can reduce width a bit if you want them even closer visually)
+    stat_summary(
+        aes(fill = x_group),
+        fun = mean,
+        geom = "col",
+        width = 0.65,
+        alpha = 0.35,
+        color = "black"
+    ) +
+    
+    ## Individual samples
+    geom_jitter(
+        aes(fill = x_group),
+        width = 0.08,        # small jitter so points stay near their bar
+        size = 2.7,
+        shape = 21,
+        color = "black",
+        alpha = 0.95
+    ) +
+    
+    ## Genotype labels ABOVE columns (center TC between its two bars)
+    annotate("text", x = positions["TT"],        y = y_top, label = "TT", vjust = 0, size = 4.5, fontface = "bold") +
+    annotate("text", x = tc_center,              y = y_top, label = "TC", vjust = 0, size = 4.5, fontface = "bold") +
+    annotate("text", x = positions["CC"],        y = y_top, label = "CC", vjust = 0, size = 4.5, fontface = "bold") +
+    
+    scale_fill_manual(values = fill_colors, guide = "none") +
+    
+    # We’re using a numeric axis; define ticks & labels to match your previous discrete labels
+    scale_x_continuous(
+        breaks = c(positions["TT"], positions["TC_C"], positions["TC_T"], positions["CC"]),
+        labels = c("T", "C", "T", "C")
+    ) +
+    
+    # Add vertical headroom so labels fit; keep lower expansion tight
+    scale_y_continuous(expand = expansion(mult = c(0.02, 0.15))) +
+    
+    labs(
+        title = "Allele-specific ATAC-seq signal at rs709045 in Pro-B cells",
+        subtitle = "Heterozygous samples shown as separate C and T allele signals",
+        x = "Allele-specific reads",
+        y = "ATAC peak reads"
+    ) +
+    
+    coord_cartesian(clip = "off") +
+    
+    theme_classic(base_size = 13) +
+    theme(
+        axis.line = element_line(),
+        panel.grid = element_blank(),
+        plot.title = element_text(face = "bold", margin = margin(b = 6)),
+        plot.subtitle = element_text(margin = margin(b = 8)),
+        plot.title.position = "plot",
+        plot.margin = margin(t = 30, r = 10, b = 10, l = 10)
+    )
+
+
+```
+
