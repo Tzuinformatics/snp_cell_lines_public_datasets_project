@@ -698,7 +698,6 @@ panel_dups
 
 ### 2.1 — 🧭 Map Ensembl IDs → HGNC symbols
 
-**Goal:** Attach HGNC symbols to the expression matrix. **Inputs:** `expression` (with `ensembl_id`), `ensembl` (BioMart handle). **Outputs:** `gene_map`, `expression_with_symbol`. **QC:** Mapping rate; missing symbols; guardrails on numeric sample columns.
 
 ```{r}
 ## 2.1 — Map Ensembl IDs → HGNC symbols --------------------------------
@@ -1000,6 +999,8 @@ print(table(ct_by_row))
 
 ```
 
+Module scores are simply the average standardized expression of lineage-specific genes, transforming noisy gene-level data into stable, interpretable developmental programs.
+
 ### 3.4.1 — Diagnostics
 
 **Goal:** Quick checks of module scores. Count markers per cell type and identify the top lineage per sample.\
@@ -1136,6 +1137,10 @@ ht2 <- ComplexHeatmap::Heatmap(
 draw(ht2, heatmap_legend_side = "right", annotation_legend_side = "right")
 
 ```
+#### STATISTICAL EXPLORATION AS OF JANUARY 17, 2026
+###### Stage specific ARID
+
+
 
 ## 4 — 🧬 ARID5B per genotype
 

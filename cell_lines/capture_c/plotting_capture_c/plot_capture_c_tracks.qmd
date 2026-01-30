@@ -1,0 +1,2426 @@
+## Zoomed out
+
+```{r}
+suppressPackageStartupMessages({
+    library(plotgardener)
+    library(GenomicRanges)
+    library(data.table)
+})
+
+# ==============================================================================
+# PATHS & SAMPLES
+# ==============================================================================
+
+base_path <- "/Volumes/Analysts/Julian/Matt/Clarissa/snp_project_ARID/capture_c/Results/5_kb/arima_results"
+
+samples_cc <- c("Nalm6_CC_Clone1","Nalm6_CC_Clone2","Nalm6_CC_Clone3")
+samples_tc <- c("Nalm6_TC_Clone1","Nalm6_TC_Clone2","Nalm6_TC_Clone3")
+samples_tt <- c("Nalm6_TT_Clone1","Nalm6_TT_Clone2","Nalm6_TT_Clone3")
+
+all_samples <- list(CC = samples_cc, TC = samples_tc, TT = samples_tt)
+
+target_chrom <- "chr10"
+assembly <- "hg38"
+
+# ==============================================================================
+# ARID5B DEFINITIONS (hg38)
+# chr10:61,901,699–62,096,944
+# ==============================================================================
+
+arid5b_start <- 61901699
+arid5b_end   <- 62096944
+arid5b_tss   <- 61901699
+
+promoter_start <- arid5b_tss - 10000
+promoter_end   <- arid5b_tss
+
+cre_start  <- 61961358
+cre_end    <- 61961706
+cre_center <- (cre_start + cre_end) / 2
+
+snp_position <- 61961417
+
+# ==============================================================================
+# LOOP FILTER — promoter → gene body (rightward only)
+# ==============================================================================
+
+filter_bedpe <- function(bedpe_path, promoter_gr) {
+    
+    dt <- fread(bedpe_path, header = FALSE)
+    if (ncol(dt) < 6) return(data.frame())
+    
+    setnames(dt, 1:6, c("chr1","start1","end1","chr2","start2","end2"))
+    dt <- dt[chr1 == target_chrom & chr2 == target_chrom]
+    if (nrow(dt) == 0) return(data.frame())
+    
+    gr1 <- GRanges(dt$chr1, IRanges(dt$start1, dt$end1))
+    gr2 <- GRanges(dt$chr2, IRanges(dt$start2, dt$end2))
+    
+    promoter_hit <- countOverlaps(gr1, promoter_gr) > 0 |
+                    countOverlaps(gr2, promoter_gr) > 0
+    
+    right_only <- start(gr1) >= promoter_end |
+                  start(gr2) >= promoter_end
+    
+    dt[promoter_hit & right_only]
+}
+
+# ==============================================================================
+# PLOT — PROMOTER → GENE BODY
+# ==============================================================================
+
+plot_multi_genotype_view <- function() {
+    
+    promoter_gr <- GRanges(target_chrom, IRanges(promoter_start, promoter_end))
+    
+    pageCreate(width = 12, height = 10, default.units = "inches", showGuides = FALSE)
+    
+    plotText(
+        "ARID5B Promoter → Gene Body",
+        fontsize = 14, fontface = "bold",
+        x = 0.5, y = 0.25, just = "left",
+        default.units = "inches"
+    )
+    
+    plotText(
+        "Tracks across ARID5B; loops represent promoter interactions (rightward only)",
+        fontsize = 9, fontcolor = "grey40",
+        x = 0.5, y = 0.5, just = "left",
+        default.units = "inches"
+    )
+    
+    genotypes <- c("CC","TC","TT")
+    y_positions <- c(1, 3.5, 6)
+    
+    clone_colors <- c(
+        Clone1 = "#9370DB",  # purple
+        Clone2 = "#FF8C00",  # orange
+        Clone3 = "#20B2AA"   # teal
+    )
+    
+    for (g in seq_along(genotypes)) {
+        
+        params <- pgParams(
+            chrom = target_chrom,
+            chromstart = promoter_end,
+            chromend   = arid5b_end,
+            assembly   = assembly,
+            x = 1, width = 10,
+            default.units = "inches"
+        )
+        
+        sig <- NULL
+        for (i in 1:3) {
+            sample <- all_samples[[genotypes[g]]][i]
+            bw <- file.path(base_path, sample, "chicago/data",
+                            paste0(sample, ".bigwig"))
+            
+            if (file.exists(bw)) {
+                sig <- plotSignal(
+                    data = bw, params = params,
+                    y = y_positions[g], height = 0.8,
+                    fill = clone_colors[i],
+                    linecolor = clone_colors[i],
+                    baseline = TRUE,
+                    alpha = 0.6
+                )
+            }
+        }
+        if (!is.null(sig)) annoYaxis(sig, fontsize = 7)
+        
+        for (i in 1:3) {
+            sample <- all_samples[[genotypes[g]]][i]
+            bedpe <- file.path(base_path, sample, "chicago/data",
+                               paste0(sample, ".cis_le_2Mb.bedpe"))
+            
+            if (file.exists(bedpe)) {
+                df <- filter_bedpe(bedpe, promoter_gr)
+                if (nrow(df) > 0) {
+                    plotPairsArches(
+                        data = df, params = params,
+                        y = y_positions[g] + 1,
+                        height = 1,
+                        fill = clone_colors[i],
+                        linecolor = clone_colors[i],
+                        alpha = 0.5
+                    )
+                }
+            }
+        }
+    }
+    
+    # ==============================================================================
+    # GENE TRACK
+    # ==============================================================================
+    
+    plotGenes(
+        chrom = target_chrom,
+        chromstart = promoter_end,
+        chromend   = arid5b_end,
+        assembly = assembly,
+        x = 1, width = 10,
+        y = 8.5, height = 0.6,
+        fontsize = 8,
+        default.units = "inches"
+    )
+    
+    # ==============================================================================
+    # ANNOTATIONS
+    # ==============================================================================
+    
+    calc_x <- function(pos)
+        1 + (pos - promoter_end) / (arid5b_end - promoter_end) * 10
+    
+    # Promoter / TSS
+    plotRect(
+        calc_x(promoter_start), 8.5,
+        calc_x(promoter_end) - calc_x(promoter_start), 0.6,
+        just = c("left","top"),
+        fill = "#fdae6b", alpha = 0.35,
+        default.units = "inches"
+    )
+    
+    plotSegments(
+        calc_x(promoter_end), 1,
+        calc_x(promoter_end), 8.4,
+        lty = 2, lwd = 1.5,
+        linecolor = "#d95f02",
+        default.units = "inches"
+    )
+    
+    plotText(
+        "Promoter / TSS",
+        x = calc_x(promoter_end), y = 8.35,
+        just = "right",
+        fontsize = 9, fontface = "bold",
+        fontcolor = "#d95f02",
+        default.units = "inches"
+    )
+    
+    # CRE
+    plotRect(
+        calc_x(cre_start), 8.5,
+        calc_x(cre_end) - calc_x(cre_start), 0.6,
+        just = c("left","top"),
+        fill = "#e7298a", alpha = 0.6,
+        default.units = "inches"
+    )
+    
+    plotText(
+        "CRE",
+        x = calc_x(cre_center), y = 8.35,
+        just = "center",
+        fontsize = 9, fontface = "bold",
+        fontcolor = "#e7298a",
+        default.units = "inches"
+    )
+    
+    # SNP
+    plotSegments(
+        calc_x(snp_position), 1,
+        calc_x(snp_position), 8.4,
+        lwd = 2.5,
+        linecolor = "#d73027",
+        default.units = "inches"
+    )
+    
+    plotText(
+        "rs7090445",
+        x = calc_x(snp_position), y = 0.75,
+        just = "center",
+        fontsize = 9,
+        fontcolor = "#d73027",
+        default.units = "inches"
+    )
+    
+    # ==============================================================================
+    # CLONE LEGEND
+    # ==============================================================================
+    
+    legend_x <- 0.6
+    legend_y <- 7.7
+    
+    plotText(
+        "Clone",
+        x = legend_x, y = legend_y,
+        fontsize = 10, fontface = "bold",
+        just = c("left","top"),
+        default.units = "inches"
+    )
+    
+    for (i in 1:3) {
+        plotRect(
+            x = legend_x,
+            y = legend_y + 0.25 * i,
+            width = 0.18, height = 0.14,
+            just = c("left","top"),
+            fill = clone_colors[i],
+            linecolor = clone_colors[i],
+            default.units = "inches"
+        )
+        
+        plotText(
+            paste0("Clone ", i),
+            x = legend_x + 0.25,
+            y = legend_y + 0.32 * i,
+            fontsize = 9,
+            just = c("left","center"),
+            default.units = "inches"
+        )
+    }
+}
+
+
+svg(
+  file = "ARID5B_promoter_to_gene_body.svg",
+  width = 12,
+  height = 10
+)
+
+plot_multi_genotype_view()
+
+dev.off()
+
+
+```
+
+
+
+## Promoter to Intron 3
+
+```{r}
+suppressPackageStartupMessages({
+    library(plotgardener)
+    library(GenomicRanges)
+    library(data.table)
+})
+
+# ==============================================================================
+# PATHS & SAMPLES
+# ==============================================================================
+
+base_path <- "/Volumes/Analysts/Julian/Matt/Clarissa/snp_project_ARID/capture_c/Results/5_kb/arima_results"
+
+samples_cc <- c("Nalm6_CC_Clone1","Nalm6_CC_Clone2","Nalm6_CC_Clone3")
+samples_tc <- c("Nalm6_TC_Clone1","Nalm6_TC_Clone2","Nalm6_TC_Clone3")
+samples_tt <- c("Nalm6_TT_Clone1","Nalm6_TT_Clone2","Nalm6_TT_Clone3")
+
+all_samples <- list(CC = samples_cc, TC = samples_tc, TT = samples_tt)
+
+target_chrom <- "chr10"
+assembly <- "hg38"
+
+# ==============================================================================
+# ARID5B DEFINITIONS (hg38)
+# chr10:61,901,699–62,096,944
+# ==============================================================================
+
+arid5b_tss <- 61901699
+
+promoter_start <- arid5b_tss - 10000
+promoter_end   <- arid5b_tss
+
+# CRE (intron 3)
+cre_start  <- 61961358
+cre_end    <- 61961706
+cre_center <- (cre_start + cre_end) / 2
+
+# SNP
+snp_position <- 61961417
+
+# Intron 3 context end
+intron3_end <- 61970000
+
+# ==============================================================================
+# LOOP FILTER — strictly Promoter ↔ CRE
+# ==============================================================================
+
+filter_bedpe <- function(bedpe_path, promoter_gr) {
+    
+    dt <- fread(bedpe_path, header = FALSE)
+    if (ncol(dt) < 6) return(data.frame())
+    
+    setnames(dt, 1:6, c("chr1","start1","end1","chr2","start2","end2"))
+    dt <- dt[chr1 == target_chrom & chr2 == target_chrom]
+    if (nrow(dt) == 0) return(data.frame())
+    
+    loop_region <- GRanges(target_chrom, IRanges(promoter_end, cre_end))
+    
+    gr1 <- GRanges(dt$chr1, IRanges(dt$start1, dt$end1))
+    gr2 <- GRanges(dt$chr2, IRanges(dt$start2, dt$end2))
+    
+    promoter_hit <- countOverlaps(gr1, promoter_gr) > 0 |
+                    countOverlaps(gr2, promoter_gr) > 0
+    
+    keep <- promoter_hit &
+            countOverlaps(gr1, loop_region) > 0 &
+            countOverlaps(gr2, loop_region) > 0
+    
+    dt[keep]
+}
+
+# ==============================================================================
+# PLOT — PROMOTER → INTRON 3 (loops only to CRE)
+# ==============================================================================
+
+plot_multi_genotype_view <- function() {
+    
+    promoter_gr <- GRanges(target_chrom, IRanges(promoter_start, promoter_end))
+    
+    pageCreate(width = 12, height = 10, default.units = "inches", showGuides = FALSE)
+    
+    plotText(
+        "ARID5B Promoter → Intron 3",
+        fontsize = 14, fontface = "bold",
+        x = 0.5, y = 0.25, just = "left",
+        default.units = "inches"
+    )
+    
+    plotText(
+        "Regulatory context (tracks to intron 3; loops restricted to Promoter–CRE)",
+        fontsize = 9, fontcolor = "grey40",
+        x = 0.5, y = 0.5, just = "left",
+        default.units = "inches"
+    )
+    
+    genotypes <- c("CC","TC","TT")
+    y_positions <- c(1, 3.5, 6)
+    
+    clone_colors <- c(
+        Clone1 = "#9370DB",  # purple
+        Clone2 = "#FF8C00",  # orange
+        Clone3 = "#20B2AA"   # teal
+    )
+    
+    for (g in seq_along(genotypes)) {
+        
+        params <- pgParams(
+            chrom = target_chrom,
+            chromstart = promoter_end,
+            chromend   = intron3_end,
+            assembly   = assembly,
+            x = 1, width = 10,
+            default.units = "inches"
+        )
+        
+        sig <- NULL
+        for (i in 1:3) {
+            sample <- all_samples[[genotypes[g]]][i]
+            bw <- file.path(base_path, sample, "chicago/data",
+                            paste0(sample, ".bigwig"))
+            
+            if (file.exists(bw)) {
+                sig <- plotSignal(
+                    data = bw, params = params,
+                    y = y_positions[g], height = 0.8,
+                    fill = clone_colors[i],
+                    linecolor = clone_colors[i],
+                    baseline = TRUE,
+                    alpha = 0.6
+                )
+            }
+        }
+        if (!is.null(sig)) annoYaxis(sig, fontsize = 7)
+        
+        for (i in 1:3) {
+            sample <- all_samples[[genotypes[g]]][i]
+            bedpe <- file.path(base_path, sample, "chicago/data",
+                               paste0(sample, ".cis_le_2Mb.bedpe"))
+            
+            if (file.exists(bedpe)) {
+                df <- filter_bedpe(bedpe, promoter_gr)
+                if (nrow(df) > 0) {
+                    plotPairsArches(
+                        data = df, params = params,
+                        y = y_positions[g] + 1,
+                        height = 1,
+                        fill = clone_colors[i],
+                        linecolor = clone_colors[i],
+                        alpha = 0.5
+                    )
+                }
+            }
+        }
+    }
+    
+    # ==============================================================================
+    # GENE TRACK
+    # ==============================================================================
+    
+    plotGenes(
+        chrom = target_chrom,
+        chromstart = promoter_end,
+        chromend   = intron3_end,
+        assembly = assembly,
+        x = 1, width = 10,
+        y = 8.5, height = 0.6,
+        fontsize = 8,
+        default.units = "inches"
+    )
+    
+    # ==============================================================================
+    # ANNOTATIONS
+    # ==============================================================================
+    
+    calc_x <- function(pos)
+        1 + (pos - promoter_end) / (intron3_end - promoter_end) * 10
+    
+    # Promoter / TSS
+    plotRect(
+        calc_x(promoter_start), 8.5,
+        calc_x(promoter_end) - calc_x(promoter_start), 0.6,
+        just = c("left","top"),
+        fill = "#fdae6b", alpha = 0.35,
+        default.units = "inches"
+    )
+    
+    plotSegments(
+        calc_x(promoter_end), 1,
+        calc_x(promoter_end), 8.4,
+        lty = 2, lwd = 1.5,
+        linecolor = "#d95f02",
+        default.units = "inches"
+    )
+    
+    plotText(
+        "Promoter / TSS",
+        x = calc_x(promoter_end), y = 8.35,
+        just = "right",
+        fontsize = 9, fontface = "bold",
+        fontcolor = "#d95f02",
+        default.units = "inches"
+    )
+    
+    # CRE
+    plotRect(
+        calc_x(cre_start), 8.5,
+        calc_x(cre_end) - calc_x(cre_start), 0.6,
+        just = c("left","top"),
+        fill = "#e7298a", alpha = 0.6,
+        default.units = "inches"
+    )
+    
+    plotText(
+        "CRE",
+        x = calc_x(cre_center), y = 8.35,
+        just = "center",
+        fontsize = 9, fontface = "bold",
+        fontcolor = "#e7298a",
+        default.units = "inches"
+    )
+    
+    # SNP
+    plotSegments(
+        calc_x(snp_position), 1,
+        calc_x(snp_position), 8.4,
+        lwd = 2.5,
+        linecolor = "#d73027",
+        default.units = "inches"
+    )
+    
+    plotText(
+        "rs7090445",
+        x = calc_x(snp_position), y = 0.75,
+        just = "center",
+        fontsize = 9,
+        fontcolor = "#d73027",
+        default.units = "inches"
+    )
+    
+    # ==============================================================================
+    # CLONE LEGEND
+    # ==============================================================================
+    
+    legend_x <- 0.6
+    legend_y <- 7.7
+    
+    plotText(
+        "Clone",
+        x = legend_x, y = legend_y,
+        fontsize = 10, fontface = "bold",
+        just = c("left","top"),
+        default.units = "inches"
+    )
+    
+    for (i in 1:3) {
+        plotRect(
+            x = legend_x,
+            y = legend_y + 0.25 * i,
+            width = 0.18, height = 0.14,
+            just = c("left","top"),
+            fill = clone_colors[i],
+            linecolor = clone_colors[i],
+            default.units = "inches"
+        )
+        
+        plotText(
+            paste0("Clone ", i),
+            x = legend_x + 0.25,
+            y = legend_y + 0.32 * i,
+            fontsize = 9,
+            just = c("left","center"),
+            default.units = "inches"
+        )
+    }
+}
+
+
+svg(
+  file = "ARID5B_promoter_to_intron3.svg",
+  width = 12,
+  height = 10
+)
+
+
+plot_multi_genotype_view()
+
+dev.off()
+
+
+```
+
+## Only snp zoomed in
+
+```{r}
+suppressPackageStartupMessages({
+    library(plotgardener)
+    library(GenomicRanges)
+    library(data.table)
+})
+
+# ==============================================================================
+# PATHS & SAMPLES
+# ==============================================================================
+
+base_path <- "/Volumes/Analysts/Julian/Matt/Clarissa/snp_project_ARID/capture_c/Results/5_kb/arima_results"
+
+samples_cc <- c("Nalm6_CC_Clone1","Nalm6_CC_Clone2","Nalm6_CC_Clone3")
+samples_tc <- c("Nalm6_TC_Clone1","Nalm6_TC_Clone2","Nalm6_TC_Clone3")
+samples_tt <- c("Nalm6_TT_Clone1","Nalm6_TT_Clone2","Nalm6_TT_Clone3")
+
+all_samples <- list(CC = samples_cc, TC = samples_tc, TT = samples_tt)
+
+target_chrom <- "chr10"
+assembly <- "hg38"
+
+# ==============================================================================
+# ARID5B DEFINITIONS (hg38)
+# ==============================================================================
+
+arid5b_tss <- 61901699
+
+promoter_start <- arid5b_tss - 10000
+promoter_end   <- arid5b_tss
+
+# SNP of interest
+snp_position <- 61961417
+
+# Zoom window end (Intron 3 context)
+intron3_end <- 61970000
+
+# ==============================================================================
+# LOOP FILTER — STRICT Promoter ↔ Intron 3
+# ==============================================================================
+
+filter_bedpe <- function(bedpe_path, promoter_gr) {
+    
+    dt <- fread(bedpe_path, header = FALSE)
+    if (ncol(dt) < 6) return(data.frame())
+    
+    setnames(dt, 1:6, c("chr1","start1","end1","chr2","start2","end2"))
+    dt <- dt[chr1 == target_chrom & chr2 == target_chrom]
+    if (nrow(dt) == 0) return(data.frame())
+    
+    intron_region <- GRanges(
+        target_chrom,
+        IRanges(promoter_end, intron3_end)
+    )
+    
+    gr1 <- GRanges(dt$chr1, IRanges(dt$start1, dt$end1))
+    gr2 <- GRanges(dt$chr2, IRanges(dt$start2, dt$end2))
+    
+    promoter_hit <- countOverlaps(gr1, promoter_gr) > 0 |
+                    countOverlaps(gr2, promoter_gr) > 0
+    
+    intron_hit <- countOverlaps(gr1, intron_region) > 0 &
+                  countOverlaps(gr2, intron_region) > 0
+    
+    dt[promoter_hit & intron_hit]
+}
+
+# ==============================================================================
+# PLOT — PROMOTER → INTRON 3 (SNP-FOCUSED)
+# ==============================================================================
+
+plot_promoter_to_intron3 <- function() {
+    
+    promoter_gr <- GRanges(target_chrom, IRanges(promoter_start, promoter_end))
+    
+    pageCreate(width = 12, height = 10, default.units = "inches", showGuides = FALSE)
+    
+    # --------------------------------------------------------------------------
+    # TITLES
+    # --------------------------------------------------------------------------
+    
+    plotText(
+        "ARID5B: Promoter → Intron 3",
+        fontsize = 14, fontface = "bold",
+        x = 0.5, y = 0.25,
+        just = "left",
+        default.units = "inches"
+    )
+    
+    plotText(
+        "Zoomed regulatory window; Capture-C loops restricted to Promoter–Intron 3",
+        fontsize = 9, fontcolor = "grey40",
+        x = 0.5, y = 0.5,
+        just = "left",
+        default.units = "inches"
+    )
+    
+    genotypes <- c("TT","TC","CC")
+    genotype_names <- c(
+        "TT (homozygous protective)",
+        "TC (heterozygous)",
+        "CC (homozygous risk)"
+    )
+    
+    y_positions <- c(1, 3.8, 6.6)
+    
+    clone_colors <- c("#9370DB", "#FF8C00", "#20B2AA")
+    
+    # --------------------------------------------------------------------------
+    # GENOTYPE PANELS
+    # --------------------------------------------------------------------------
+    
+    for (g in seq_along(genotypes)) {
+        
+        geno <- genotypes[g]
+        y_base <- y_positions[g]
+        
+        params <- pgParams(
+            chrom = target_chrom,
+            chromstart = promoter_end,
+            chromend   = intron3_end,
+            assembly   = assembly,
+            x = 1, width = 10,
+            default.units = "inches"
+        )
+        
+        sig <- NULL
+        for (i in 1:3) {
+            sample <- all_samples[[geno]][i]
+            bw <- file.path(
+                base_path, sample, "chicago/data",
+                paste0(sample, ".bigwig")
+            )
+            
+            if (file.exists(bw)) {
+                sig <- plotSignal(
+                    data = bw,
+                    params = params,
+                    y = y_base,
+                    height = 0.7,
+                    fill = clone_colors[i],
+                    linecolor = clone_colors[i],
+                    baseline = TRUE,
+                    alpha = 0.6
+                )
+            }
+        }
+        
+        if (!is.null(sig)) annoYaxis(sig, fontsize = 7)
+        
+        for (i in 1:3) {
+            sample <- all_samples[[geno]][i]
+            bedpe <- file.path(
+                base_path, sample, "chicago/data",
+                paste0(sample, ".cis_le_2Mb.bedpe")
+            )
+            
+            if (file.exists(bedpe)) {
+                df <- filter_bedpe(bedpe, promoter_gr)
+                if (nrow(df) > 0) {
+                    plotPairsArches(
+                        data = df,
+                        params = params,
+                        y = y_base + 1.1,
+                        height = 0.9,
+                        fill = clone_colors[i],
+                        linecolor = clone_colors[i],
+                        alpha = 0.5
+                    )
+                }
+            }
+        }
+        
+        plotText(
+            genotype_names[g],
+            x = 0.5, y = y_base,
+            fontsize = 11, fontface = "bold",
+            just = c("left","top"),
+            default.units = "inches"
+        )
+    }
+    
+    # --------------------------------------------------------------------------
+    # GENE TRACK
+    # --------------------------------------------------------------------------
+    
+    genes <- plotGenes(
+        chrom = target_chrom,
+        chromstart = promoter_end,
+        chromend   = intron3_end,
+        assembly = assembly,
+        x = 1, width = 10,
+        y = 8.8, height = 0.6,
+        fontsize = 8,
+        default.units = "inches"
+    )
+    
+    # --------------------------------------------------------------------------
+    # GENOMIC ANNOTATIONS
+    # --------------------------------------------------------------------------
+    
+    calc_x <- function(pos) {
+        1 + (pos - promoter_end) / (intron3_end - promoter_end) * 10
+    }
+    
+    # Promoter / TSS
+    plotRect(
+        calc_x(promoter_start), 8.8,
+        calc_x(promoter_end) - calc_x(promoter_start), 0.6,
+        fill = "#fdae6b",
+        alpha = 0.35,
+        just = c("left","top"),
+        default.units = "inches"
+    )
+    
+    plotText(
+        "Promoter / TSS",
+        x = calc_x(promoter_end), y = 8.65,
+        just = "right",
+        fontsize = 9,
+        fontface = "bold",
+        fontcolor = "#d95f02",
+        default.units = "inches"
+    )
+    
+    # SNP — ultra-thin, precise
+    plotSegments(
+        calc_x(snp_position), 1,
+        calc_x(snp_position), 8.7,
+        lwd = 0.6,
+        linecolor = "#252525",
+        default.units = "inches"
+    )
+    
+    plotText(
+        "rs7090445",
+        x = calc_x(snp_position), y = 0.75,
+        just = "center",
+        fontsize = 8,
+        fontcolor = "#252525",
+        default.units = "inches"
+    )
+    
+    annoGenomeLabel(
+        plot = genes,
+        x = 1, y = 9.4, width = 10,
+        scale = "Kb",
+        fontsize = 8,
+        default.units = "inches"
+    )
+}
+
+plot_promoter_to_intron3()
+
+```
+
+
+
+# ATAC
+```{r}
+suppressPackageStartupMessages({
+    library(plotgardener)
+    library(rtracklayer)
+})
+
+# ==============================================================================
+# GENOMIC WINDOW (hg38)
+# ==============================================================================
+
+chrom_raw <- "chr10"
+start     <- 61901699
+end       <- 62096944
+assembly  <- "hg38"
+
+# ==============================================================================
+# ATAC BigWig files
+# ==============================================================================
+
+atac_dir <- "/Volumes/Analysts/Julian/Matt/Clarissa/snp_project_ARID/ATAC_data/cell_lines/bigwig_files_to_R_ATAC_clarissas"
+
+atac_files <- file.path(
+    atac_dir,
+    c(
+        "NALM6_TT_Clone1_REP1.mLb.clN.bigWig",
+        "NALM6_TT_Clone2_REP1.mLb.clN.bigWig",
+        "NALM6_TT_Clone3_REP1.mLb.clN.bigWig",
+        "NALM6_TC_Clone1_REP1.mLb.clN.bigWig",
+        "NALM6_TC_Clone2_REP1.mLb.clN.bigWig",
+        "NALM6_TC_Clone3_REP1.mLb.clN.bigWig",
+        "NALM6_CC_Clone1_REP1.mLb.clN.bigWig",
+        "NALM6_CC_Clone2_REP1.mLb.clN.bigWig",
+        "NALM6_CC_Clone3_REP1.mLb.clN.bigWig"
+    )
+)
+
+stopifnot(all(file.exists(atac_files)))
+
+# ==============================================================================
+# GROUP FILES BY GENOTYPE
+# ==============================================================================
+
+atac_by_genotype <- list(
+    TT = atac_files[1:3],
+    TC = atac_files[4:6],
+    CC = atac_files[7:9]
+)
+
+geno_colors <- c(
+    TT = "#1f78b4",  # blue
+    TC = "#33a02c",  # green
+    CC = "#e31a1c"   # red
+)
+
+# ==============================================================================
+# HARMONIZE CHROMOSOME NAMING TO BIGWIG
+# ==============================================================================
+
+bw_test <- BigWigFile(atac_files[1])
+bw_seqs <- names(seqlengths(seqinfo(bw_test)))
+
+chrom <- if (chrom_raw %in% bw_seqs) {
+    chrom_raw
+} else if (sub("^chr", "", chrom_raw) %in% bw_seqs) {
+    sub("^chr", "", chrom_raw)
+} else {
+    stop("Chromosome not found in BigWig: ", chrom_raw)
+}
+
+cat("Using chromosome:", chrom, "\n")
+
+# ==============================================================================
+# PAGE + PARAMS
+# ==============================================================================
+
+pageCreate(width = 12, height = 6, showGuides = FALSE)
+
+params <- pgParams(
+    chrom = chrom,
+    chromstart = start,
+    chromend   = end,
+    assembly   = assembly,
+    x = 1,
+    width = 10,
+    default.units = "inches"
+)
+
+# ==============================================================================
+# PLOT ATAC SIGNAL — OVERLAID BY GENOTYPE
+# ==============================================================================
+
+y_positions <- c(TT = 1, TC = 2.2, CC = 3.4)
+
+for (geno in names(atac_by_genotype)) {
+    
+    cat("Plotting genotype:", geno, "\n")
+    
+    for (bw in atac_by_genotype[[geno]]) {
+        
+        cat("  └─ overlay:", basename(bw), "\n")
+        
+        plotSignal(
+            data = bw,
+            params = params,
+            y = y_positions[geno],
+            height = 0.6,
+            fill = geno_colors[geno],
+            linecolor = geno_colors[geno],
+            baseline = TRUE,
+            alpha = 0.4,
+            scale = "fixed"
+        )
+    }
+}
+
+# ==============================================================================
+# GENOTYPE LABELS
+# ==============================================================================
+
+for (geno in names(y_positions)) {
+    plotText(
+        geno,
+        x = 0.7,
+        y = y_positions[geno] + 0.3,
+        fontsize = 10,
+        fontface = "bold",
+        just = "right",
+        default.units = "inches"
+    )
+}
+
+# ==============================================================================
+# TITLE
+# ==============================================================================
+
+plotText(
+    "ARID5B — ATAC accessibility (NALM6 clones, overlaid by genotype)",
+    x = 0.5,
+    y = 0.25,
+    fontsize = 14,
+    fontface = "bold",
+    just = "left",
+    default.units = "inches"
+)
+
+```
+
+
+## zoomed out integration loops and atac
+```{r}
+suppressPackageStartupMessages({
+    library(plotgardener)
+    library(GenomicRanges)
+    library(data.table)
+    library(rtracklayer)
+})
+
+# ==============================================================================
+# PATHS & SAMPLES
+# ==============================================================================
+
+captureC_base <- "/Volumes/Analysts/Julian/Matt/Clarissa/snp_project_ARID/capture_c/Results/5_kb/arima_results"
+atac_dir <- "/Volumes/Analysts/Julian/Matt/Clarissa/snp_project_ARID/ATAC_data/cell_lines/bigwig_files_to_R_ATAC_clarissas"
+
+samples_cc <- c("Nalm6_CC_Clone1", "Nalm6_CC_Clone2", "Nalm6_CC_Clone3")
+samples_tc <- c("Nalm6_TC_Clone1", "Nalm6_TC_Clone2", "Nalm6_TC_Clone3")
+samples_tt <- c("Nalm6_TT_Clone1", "Nalm6_TT_Clone2", "Nalm6_TT_Clone3")
+
+all_samples <- list(CC = samples_cc, TC = samples_tc, TT = samples_tt)
+
+target_chrom <- "chr10"
+assembly <- "hg38"
+
+# ==============================================================================
+# ARID5B DEFINITIONS (hg38)
+# ==============================================================================
+
+arid5b_start <- 61901699
+arid5b_end   <- 62096944
+arid5b_tss   <- 61901699
+
+promoter_start <- arid5b_tss - 10000
+promoter_end   <- arid5b_tss
+
+snp_position <- 61961417
+
+# ==============================================================================
+# ATAC FILES (BY GENOTYPE)
+# ==============================================================================
+
+atac_files <- list(
+    TT = file.path(atac_dir, paste0(samples_tt, "_REP1.mLb.clN.bigWig")),
+    TC = file.path(atac_dir, paste0(samples_tc, "_REP1.mLb.clN.bigWig")),
+    CC = file.path(atac_dir, paste0(samples_cc, "_REP1.mLb.clN.bigWig"))
+)
+
+stopifnot(all(file.exists(unlist(atac_files))))
+
+# ==============================================================================
+# CHROMOSOME NAMING HARMONIZATION
+# ==============================================================================
+
+bw_test <- BigWigFile(atac_files$TT[1])
+bw_seqs <- names(seqlengths(seqinfo(bw_test)))
+
+atac_chrom <- if (target_chrom %in% bw_seqs) {
+    target_chrom
+} else if (sub("^chr", "", target_chrom) %in% bw_seqs) {
+    sub("^chr", "", target_chrom)
+} else {
+    stop("Chromosome not found in BigWig: ", target_chrom)
+}
+
+# ==============================================================================
+# LOOP FILTER — PROMOTER → GENE BODY (RIGHTWARD ONLY)
+# ==============================================================================
+
+filter_bedpe <- function(bedpe_path, promoter_gr) {
+    
+    dt <- fread(bedpe_path, header = FALSE)
+    if (ncol(dt) < 6) return(data.frame())
+    
+    setnames(dt, 1:6, c("chr1","start1","end1","chr2","start2","end2"))
+    dt <- dt[chr1 == target_chrom & chr2 == target_chrom]
+    if (nrow(dt) == 0) return(data.frame())
+    
+    gr1 <- GRanges(dt$chr1, IRanges(dt$start1, dt$end1))
+    gr2 <- GRanges(dt$chr2, IRanges(dt$start2, dt$end2))
+    
+    promoter_hit <- countOverlaps(gr1, promoter_gr) > 0 |
+        countOverlaps(gr2, promoter_gr) > 0
+    
+    right_only <- start(gr1) >= promoter_end |
+        start(gr2) >= promoter_end
+    
+    dt[promoter_hit & right_only]
+}
+
+# ==============================================================================
+# COMBINED PLOT — ATAC + CAPTURE-C (SNP-FOCUSED)
+# ==============================================================================
+
+plot_combined_view <- function() {
+    
+    promoter_gr <- GRanges(target_chrom, IRanges(promoter_start, promoter_end))
+    
+    pageCreate(width = 12, height = 13, default.units = "inches", showGuides = FALSE)
+    
+    plotText(
+        "ARID5B: ATAC-seq Accessibility + Capture-C Promoter Interactions",
+        fontsize = 14, fontface = "bold",
+        x = 0.5, y = 0.25, just = "left",
+        default.units = "inches"
+    )
+    
+    plotText(
+        "Promoter → Gene Body | Promoter-anchored Capture-C loops",
+        fontsize = 9, fontcolor = "grey40",
+        x = 0.5, y = 0.5, just = "left",
+        default.units = "inches"
+    )
+    
+    genotypes <- c("TT", "TC", "CC")
+    genotype_names <- c(
+        "TT (homozygous protective)",
+        "TC (heterozygous)",
+        "CC (homozygous risk)"
+    )
+    
+    y_positions <- c(1, 4.5, 8)
+    
+    clone_colors <- c("#9370DB", "#FF8C00", "#20B2AA")
+    atac_color <- "#2b8cbe"
+    
+    for (g in seq_along(genotypes)) {
+        
+        geno <- genotypes[g]
+        y_base <- y_positions[g]
+        
+        atac_params <- pgParams(
+            chrom = atac_chrom,
+            chromstart = promoter_end,
+            chromend   = arid5b_end,
+            assembly   = assembly,
+            x = 1, width = 10,
+            default.units = "inches"
+        )
+        
+        for (i in 1:3) {
+            plotSignal(
+                data = atac_files[[geno]][i],
+                params = atac_params,
+                y = y_base,
+                height = 0.6,
+                fill = atac_color,
+                linecolor = atac_color,
+                baseline = TRUE,
+                alpha = 0.35
+            )
+        }
+        
+        captureC_params <- pgParams(
+            chrom = target_chrom,
+            chromstart = promoter_end,
+            chromend   = arid5b_end,
+            assembly   = assembly,
+            x = 1, width = 10,
+            default.units = "inches"
+        )
+        
+        for (i in 1:3) {
+            sample <- all_samples[[geno]][i]
+            bw <- file.path(
+                captureC_base, sample, "chicago/data",
+                paste0(sample, ".bigwig")
+            )
+            
+            plotSignal(
+                data = bw,
+                params = captureC_params,
+                y = y_base + 0.7,
+                height = 0.7,
+                fill = clone_colors[i],
+                linecolor = clone_colors[i],
+                baseline = TRUE,
+                alpha = 0.6
+            )
+        }
+        
+        for (i in 1:3) {
+            sample <- all_samples[[geno]][i]
+            bedpe <- file.path(
+                captureC_base, sample, "chicago/data",
+                paste0(sample, ".cis_le_2Mb.bedpe")
+            )
+            
+            df <- filter_bedpe(bedpe, promoter_gr)
+            if (nrow(df) > 0) {
+                plotPairsArches(
+                    data = df,
+                    params = captureC_params,
+                    y = y_base + 1.5,
+                    height = 0.9,
+                    fill = clone_colors[i],
+                    linecolor = clone_colors[i],
+                    alpha = 0.5
+                )
+            }
+        }
+        
+        plotText(
+            genotype_names[g],
+            x = 0.5, y = y_base,
+            fontsize = 11, fontface = "bold",
+            just = c("left", "top"),
+            default.units = "inches"
+        )
+    }
+    
+    genes <- plotGenes(
+        chrom = target_chrom,
+        chromstart = promoter_end,
+        chromend   = arid5b_end,
+        assembly = assembly,
+        x = 1, width = 10,
+        y = 11, height = 0.6,
+        fontsize = 8,
+        default.units = "inches"
+    )
+    
+    calc_x <- function(pos) {
+        1 + (pos - promoter_end) / (arid5b_end - promoter_end) * 10
+    }
+    
+    # Promoter / TSS
+    plotRect(
+        calc_x(promoter_start), 11,
+        calc_x(promoter_end) - calc_x(promoter_start), 0.6,
+        fill = "#fdae6b", alpha = 0.35,
+        just = c("left", "top"),
+        default.units = "inches"
+    )
+    
+    plotText(
+        "Promoter / TSS",
+        x = calc_x(promoter_end), y = 10.85,
+        just = "right",
+        fontsize = 9, fontface = "bold",
+        fontcolor = "#d95f02",
+        default.units = "inches"
+    )
+    
+    # SNP — VERY THIN, PRECISE
+    plotSegments(
+        calc_x(snp_position), 1,
+        calc_x(snp_position), 10.9,
+        lwd = 0.6,                 # <<< key change
+        linecolor = "#252525",     # neutral, precise
+        default.units = "inches"
+    )
+    
+    plotText(
+        "rs7090445",
+        x = calc_x(snp_position), y = 0.75,
+        just = "center",
+        fontsize = 8,
+        fontcolor = "#252525",
+        default.units = "inches"
+    )
+    
+    annoGenomeLabel(
+        plot = genes,
+        x = 1, y = 11.7, width = 10,
+        scale = "Kb", fontsize = 8,
+        default.units = "inches"
+    )
+}
+
+plot_combined_view()
+
+```
+
+
+## zoomed in integration loops and atac
+```{r}
+suppressPackageStartupMessages({
+    library(plotgardener)
+    library(GenomicRanges)
+    library(data.table)
+    library(rtracklayer)
+})
+
+# ==============================================================================
+# PATHS & SAMPLES
+# ==============================================================================
+
+captureC_base <- "/Volumes/Analysts/Julian/Matt/Clarissa/snp_project_ARID/capture_c/Results/5_kb/arima_results"
+atac_dir <- "/Volumes/Analysts/Julian/Matt/Clarissa/snp_project_ARID/ATAC_data/cell_lines/bigwig_files_to_R_ATAC_clarissas"
+
+samples_tt <- c("Nalm6_TT_Clone1","Nalm6_TT_Clone2","Nalm6_TT_Clone3")
+samples_tc <- c("Nalm6_TC_Clone1","Nalm6_TC_Clone2","Nalm6_TC_Clone3")
+samples_cc <- c("Nalm6_CC_Clone1","Nalm6_CC_Clone2","Nalm6_CC_Clone3")
+
+all_samples <- list(TT = samples_tt, TC = samples_tc, CC = samples_cc)
+
+target_chrom <- "chr10"
+assembly <- "hg38"
+
+# ==============================================================================
+# ARID5B DEFINITIONS (hg38)
+# ==============================================================================
+
+arid5b_tss <- 61901699
+
+promoter_start <- arid5b_tss - 10000
+promoter_end   <- arid5b_tss
+
+snp_position <- 61961417
+intron3_end  <- 61970000
+
+# ==============================================================================
+# ATAC FILES (BY GENOTYPE)
+# ==============================================================================
+
+atac_files <- list(
+    TT = file.path(atac_dir, paste0(samples_tt, "_REP1.mLb.clN.bigWig")),
+    TC = file.path(atac_dir, paste0(samples_tc, "_REP1.mLb.clN.bigWig")),
+    CC = file.path(atac_dir, paste0(samples_cc, "_REP1.mLb.clN.bigWig"))
+)
+
+stopifnot(all(file.exists(unlist(atac_files))))
+
+# ==============================================================================
+# CHROMOSOME NAMING (ATAC uses "10", Capture-C uses "chr10")
+# ==============================================================================
+
+bw_test <- BigWigFile(atac_files$TT[1])
+bw_seqs <- names(seqlengths(seqinfo(bw_test)))
+
+atac_chrom <- if (target_chrom %in% bw_seqs) {
+    target_chrom
+} else if (sub("^chr","",target_chrom) %in% bw_seqs) {
+    sub("^chr","",target_chrom)
+} else {
+    stop("Chromosome not found in ATAC BigWig")
+}
+
+# ==============================================================================
+# LOOP FILTER — STRICT Promoter ↔ Intron 3
+# ==============================================================================
+
+filter_bedpe <- function(bedpe_path, promoter_gr) {
+    
+    dt <- fread(bedpe_path, header = FALSE)
+    if (ncol(dt) < 6) return(data.frame())
+    
+    setnames(dt, 1:6, c("chr1","start1","end1","chr2","start2","end2"))
+    dt <- dt[chr1 == target_chrom & chr2 == target_chrom]
+    if (nrow(dt) == 0) return(data.frame())
+    
+    intron_region <- GRanges(
+        target_chrom,
+        IRanges(promoter_end, intron3_end)
+    )
+    
+    gr1 <- GRanges(dt$chr1, IRanges(dt$start1, dt$end1))
+    gr2 <- GRanges(dt$chr2, IRanges(dt$start2, dt$end2))
+    
+    promoter_hit <- countOverlaps(gr1, promoter_gr) > 0 |
+        countOverlaps(gr2, promoter_gr) > 0
+    
+    intron_hit <- countOverlaps(gr1, intron_region) > 0 &
+        countOverlaps(gr2, intron_region) > 0
+    
+    dt[promoter_hit & intron_hit]
+}
+
+# ==============================================================================
+# PLOT — PROMOTER → INTRON 3 (ATAC + CAPTURE-C, SNP-FOCUSED)
+# ==============================================================================
+
+plot_promoter_to_intron3 <- function() {
+    
+    promoter_gr <- GRanges(target_chrom, IRanges(promoter_start, promoter_end))
+    
+    pageCreate(width = 12, height = 11, default.units = "inches", showGuides = FALSE)
+    
+    # --------------------------------------------------------------------------
+    # TITLES
+    # --------------------------------------------------------------------------
+    
+    plotText(
+        "ARID5B: Promoter → Intron 3 (ATAC + Capture-C)",
+        fontsize = 14, fontface = "bold",
+        x = 0.5, y = 0.25,
+        just = "left",
+        default.units = "inches"
+    )
+    
+    plotText(
+        "Zoomed SNP-centered window; ATAC accessibility and promoter-anchored Capture-C loops",
+        fontsize = 9, fontcolor = "grey40",
+        x = 0.5, y = 0.5,
+        just = "left",
+        default.units = "inches"
+    )
+    
+    genotypes <- c("TT","TC","CC")
+    genotype_names <- c(
+        "TT (homozygous protective)",
+        "TC (heterozygous)",
+        "CC (homozygous risk)"
+    )
+    
+    y_positions <- c(1, 4.2, 7.4)
+    
+    clone_colors <- c("#9370DB", "#FF8C00", "#20B2AA")
+    atac_color <- "#2b8cbe"
+    
+    # --------------------------------------------------------------------------
+    # GENOTYPE PANELS
+    # --------------------------------------------------------------------------
+    
+    for (g in seq_along(genotypes)) {
+        
+        geno <- genotypes[g]
+        y_base <- y_positions[g]
+        
+        # ---------------- ATAC-seq (overlaid clones) ----------------
+        
+        atac_params <- pgParams(
+            chrom = atac_chrom,
+            chromstart = promoter_end,
+            chromend   = intron3_end,
+            assembly   = assembly,
+            x = 1, width = 10,
+            default.units = "inches"
+        )
+        
+        for (bw in atac_files[[geno]]) {
+            plotSignal(
+                data = bw,
+                params = atac_params,
+                y = y_base,
+                height = 0.6,
+                fill = atac_color,
+                linecolor = atac_color,
+                baseline = TRUE,
+                alpha = 0.35
+            )
+        }
+        
+        # ---------------- Capture-C signal ----------------
+        
+        capture_params <- pgParams(
+            chrom = target_chrom,
+            chromstart = promoter_end,
+            chromend   = intron3_end,
+            assembly   = assembly,
+            x = 1, width = 10,
+            default.units = "inches"
+        )
+        
+        for (i in 1:3) {
+            sample <- all_samples[[geno]][i]
+            bw <- file.path(
+                captureC_base, sample, "chicago/data",
+                paste0(sample, ".bigwig")
+            )
+            
+            plotSignal(
+                data = bw,
+                params = capture_params,
+                y = y_base + 0.7,
+                height = 0.7,
+                fill = clone_colors[i],
+                linecolor = clone_colors[i],
+                baseline = TRUE,
+                alpha = 0.6
+            )
+        }
+        
+        # ---------------- Capture-C loops ----------------
+        
+        for (i in 1:3) {
+            sample <- all_samples[[geno]][i]
+            bedpe <- file.path(
+                captureC_base, sample, "chicago/data",
+                paste0(sample, ".cis_le_2Mb.bedpe")
+            )
+            
+            df <- filter_bedpe(bedpe, promoter_gr)
+            if (nrow(df) > 0) {
+                plotPairsArches(
+                    data = df,
+                    params = capture_params,
+                    y = y_base + 1.5,
+                    height = 0.9,
+                    fill = clone_colors[i],
+                    linecolor = clone_colors[i],
+                    alpha = 0.5
+                )
+            }
+        }
+        
+        plotText(
+            genotype_names[g],
+            x = 0.5, y = y_base,
+            fontsize = 11, fontface = "bold",
+            just = c("left","top"),
+            default.units = "inches"
+        )
+    }
+    
+    # --------------------------------------------------------------------------
+    # GENE TRACK + SNP
+    # --------------------------------------------------------------------------
+    
+    genes <- plotGenes(
+        chrom = target_chrom,
+        chromstart = promoter_end,
+        chromend   = intron3_end,
+        assembly = assembly,
+        x = 1, width = 10,
+        y = 9.6, height = 0.6,
+        fontsize = 8,
+        default.units = "inches"
+    )
+    
+    calc_x <- function(pos) {
+        1 + (pos - promoter_end) / (intron3_end - promoter_end) * 10
+    }
+    
+    # Promoter
+    plotRect(
+        calc_x(promoter_start), 9.6,
+        calc_x(promoter_end) - calc_x(promoter_start), 0.6,
+        fill = "#fdae6b",
+        alpha = 0.35,
+        just = c("left","top"),
+        default.units = "inches"
+    )
+    
+    # SNP — ultra-thin
+    plotSegments(
+        calc_x(snp_position), 1,
+        calc_x(snp_position), 9.5,
+        lwd = 0.6,
+        linecolor = "#252525",
+        default.units = "inches"
+    )
+    
+    plotText(
+        "rs7090445",
+        x = calc_x(snp_position), y = 0.75,
+        fontsize = 8,
+        just = "center",
+        fontcolor = "#252525",
+        default.units = "inches"
+    )
+    
+    annoGenomeLabel(
+        plot = genes,
+        x = 1, y = 10.2, width = 10,
+        scale = "Kb",
+        fontsize = 8,
+        default.units = "inches"
+    )
+}
+
+plot_promoter_to_intron3()
+```
+
+
+## All of them zoomed out
+
+```{r}
+suppressPackageStartupMessages({
+    library(plotgardener)
+    library(GenomicRanges)
+    library(data.table)
+    library(rtracklayer)
+})
+
+# ==============================================================================
+# PATHS & SAMPLES
+# ==============================================================================
+
+captureC_base <- "/Volumes/Analysts/Julian/Matt/Clarissa/snp_project_ARID/capture_c/Results/5_kb/arima_results"
+atac_dir <- "/Volumes/Analysts/Julian/Matt/Clarissa/snp_project_ARID/ATAC_data/cell_lines/bigwig_files_to_R_ATAC_clarissas"
+cutrun_dir <- "/Volumes/homes/Clarissa/snp_project/clarissas_cell_lines/cut_and_run/nf_Cut_and_Run_Results/04_reporting/igv"
+
+samples_tt <- c("Nalm6_TT_Clone1", "Nalm6_TT_Clone2", "Nalm6_TT_Clone3")
+samples_tc <- c("Nalm6_TC_Clone1", "Nalm6_TC_Clone2", "Nalm6_TC_Clone3")
+samples_cc <- c("Nalm6_CC_Clone1", "Nalm6_CC_Clone2", "Nalm6_CC_Clone3")
+
+all_samples <- list(TT = samples_tt, TC = samples_tc, CC = samples_cc)
+
+target_chrom <- "chr10"
+assembly <- "hg38"
+
+# ==============================================================================
+# ARID5B DEFINITIONS (hg38)
+# ==============================================================================
+
+arid5b_start <- 61901699
+arid5b_end   <- 62096944
+arid5b_tss   <- 61901699
+
+promoter_start <- arid5b_tss - 10000
+promoter_end   <- arid5b_tss
+
+snp_position <- 61961417
+
+# ==============================================================================
+# DATA FILES (BY GENOTYPE)
+# ==============================================================================
+
+atac_files <- list(
+    TT = file.path(atac_dir, paste0(samples_tt, "_REP1.mLb.clN.bigWig")),
+    TC = file.path(atac_dir, paste0(samples_tc, "_REP1.mLb.clN.bigWig")),
+    CC = file.path(atac_dir, paste0(samples_cc, "_REP1.mLb.clN.bigWig"))
+)
+
+h3k36me3_files <- list(
+    TT = file.path(cutrun_dir, paste0("H3K36me3_TT_R", 1:3, ".bigWig")),
+    TC = file.path(cutrun_dir, paste0("H3K36me3_TC_R", 1:3, ".bigWig")),
+    CC = file.path(cutrun_dir, paste0("H3K36me3_CC_R", 1:3, ".bigWig"))
+)
+
+# Verify files exist
+stopifnot(all(file.exists(unlist(atac_files))))
+stopifnot(all(file.exists(unlist(h3k36me3_files))))
+
+# ==============================================================================
+# CHROMOSOME NAMING HARMONIZATION
+# ==============================================================================
+
+bw_test <- BigWigFile(atac_files$TT[1])
+bw_seqs <- names(seqlengths(seqinfo(bw_test)))
+
+atac_chrom <- if (target_chrom %in% bw_seqs) {
+    target_chrom
+} else if (sub("^chr", "", target_chrom) %in% bw_seqs) {
+    sub("^chr", "", target_chrom)
+} else {
+    stop("Chromosome not found in BigWig")
+}
+
+# ==============================================================================
+# LOOP FILTER — PROMOTER → GENE BODY (RIGHTWARD ONLY)
+# ==============================================================================
+
+filter_bedpe <- function(bedpe_path, promoter_gr) {
+    
+    dt <- fread(bedpe_path, header = FALSE)
+    if (ncol(dt) < 6) return(data.frame())
+    
+    setnames(dt, 1:6, c("chr1","start1","end1","chr2","start2","end2"))
+    dt <- dt[chr1 == target_chrom & chr2 == target_chrom]
+    if (nrow(dt) == 0) return(data.frame())
+    
+    gr1 <- GRanges(dt$chr1, IRanges(dt$start1, dt$end1))
+    gr2 <- GRanges(dt$chr2, IRanges(dt$start2, dt$end2))
+    
+    promoter_hit <- countOverlaps(gr1, promoter_gr) > 0 |
+                    countOverlaps(gr2, promoter_gr) > 0
+    
+    right_only <- start(gr1) >= promoter_end |
+                  start(gr2) >= promoter_end
+    
+    dt[promoter_hit & right_only]
+}
+
+# ==============================================================================
+# PLOT — ALL 3 GENOTYPES: ATAC + H3K36me3 + CAPTURE-C
+# ==============================================================================
+
+plot_all_genotypes_multiomic <- function() {
+    
+    promoter_gr <- GRanges(target_chrom, IRanges(promoter_start, promoter_end))
+    
+    pageCreate(width = 12, height = 18, default.units = "inches", showGuides = FALSE)
+    
+    # --------------------------------------------------------------------------
+    # TITLE
+    # --------------------------------------------------------------------------
+    
+    plotText(
+        "ARID5B Multi-Omic Integration: ATAC-seq + H3K36me3 + Capture-C",
+        fontsize = 14, fontface = "bold",
+        x = 0.5, y = 0.25, just = "left",
+        default.units = "inches"
+    )
+    
+    plotText(
+        "Chromatin accessibility, active transcription, and promoter interactions across genotypes",
+        fontsize = 9, fontcolor = "grey40",
+        x = 0.5, y = 0.5, just = "left",
+        default.units = "inches"
+    )
+    
+    # --------------------------------------------------------------------------
+    # COLORS
+    # --------------------------------------------------------------------------
+    
+    clone_colors <- c("#9370DB", "#FF8C00", "#20B2AA")  # Purple, Orange, Teal
+    atac_color <- "#2b8cbe"        # Blue
+    h3k36me3_color <- "#e7298a"    # Pink
+    
+    # --------------------------------------------------------------------------
+    # GENOTYPE DEFINITIONS
+    # --------------------------------------------------------------------------
+    
+    genotypes <- c("TT", "TC", "CC")
+    genotype_names <- c(
+        "TT (homozygous protective)",
+        "TC (heterozygous)",
+        "CC (homozygous risk)"
+    )
+    
+    # Y-positions for each genotype (5.5 inch spacing)
+    y_base_positions <- c(1, 6.5, 12)
+    
+    # --------------------------------------------------------------------------
+    # LOOP THROUGH GENOTYPES
+    # --------------------------------------------------------------------------
+    
+    for (g in seq_along(genotypes)) {
+        
+        geno <- genotypes[g]
+        y_base <- y_base_positions[g]
+        
+        cat(sprintf("\n=== %s Genotype ===\n", geno))
+        
+        # Define track positions relative to y_base
+        y_atac <- y_base
+        y_h3k <- y_base + 1
+        y_capture_signal <- y_base + 2.2
+        y_capture_arches <- y_base + 3.2
+        
+        # ----------------------------------------------------------------------
+        # 1. ATAC-SEQ (ALL 3 CLONES OVERLAID)
+        # ----------------------------------------------------------------------
+        
+        atac_params <- pgParams(
+            chrom = atac_chrom,
+            chromstart = promoter_end,
+            chromend   = arid5b_end,
+            assembly   = assembly,
+            x = 1, width = 10,
+            default.units = "inches"
+        )
+        
+        for (i in 1:3) {
+            plotSignal(
+                data = atac_files[[geno]][i],
+                params = atac_params,
+                y = y_atac,
+                height = 0.6,
+                fill = atac_color,
+                linecolor = atac_color,
+                baseline = TRUE,
+                alpha = 0.35
+            )
+        }
+        
+        plotText(
+            "ATAC-seq",
+            x = 0.5, y = y_atac + 0.3,
+            fontsize = 10, fontface = "bold",
+            just = c("right", "center"),
+            default.units = "inches"
+        )
+        
+        # ----------------------------------------------------------------------
+        # 2. H3K36me3 CUT&RUN (ALL 3 REPLICATES OVERLAID)
+        # ----------------------------------------------------------------------
+        
+        cutrun_params <- pgParams(
+            chrom = target_chrom,
+            chromstart = promoter_end,
+            chromend   = arid5b_end,
+            assembly   = assembly,
+            x = 1, width = 10,
+            default.units = "inches"
+        )
+        
+        for (i in 1:3) {
+            plotSignal(
+                data = h3k36me3_files[[geno]][i],
+                params = cutrun_params,
+                y = y_h3k,
+                height = 0.6,
+                fill = h3k36me3_color,
+                linecolor = h3k36me3_color,
+                baseline = TRUE,
+                alpha = 0.45,
+                scale = "fixed"
+            )
+        }
+        
+        plotText(
+            "H3K36me3",
+            x = 0.5, y = y_h3k + 0.3,
+            fontsize = 10, fontface = "bold",
+            just = c("right", "center"),
+            default.units = "inches"
+        )
+        
+        # ----------------------------------------------------------------------
+        # 3. CAPTURE-C SIGNAL (3 CLONES, COLORED BY CLONE)
+        # ----------------------------------------------------------------------
+        
+        sig <- NULL
+        for (i in 1:3) {
+            sample <- all_samples[[geno]][i]
+            bw <- file.path(captureC_base, sample, "chicago/data",
+                           paste0(sample, ".bigwig"))
+            
+            if (file.exists(bw)) {
+                sig <- plotSignal(
+                    data = bw,
+                    params = cutrun_params,
+                    y = y_capture_signal,
+                    height = 0.7,
+                    fill = clone_colors[i],
+                    linecolor = clone_colors[i],
+                    baseline = TRUE,
+                    alpha = 0.6
+                )
+            }
+        }
+        
+        if (!is.null(sig)) annoYaxis(sig, fontsize = 7)
+        
+        plotText(
+            "Capture-C\nsignal",
+            x = 0.5, y = y_capture_signal + 0.35,
+            fontsize = 10, fontface = "bold",
+            just = c("right", "center"),
+            default.units = "inches"
+        )
+        
+        # ----------------------------------------------------------------------
+        # 4. CAPTURE-C LOOPS (ARCHES, COLORED BY CLONE)
+        # ----------------------------------------------------------------------
+        
+        for (i in 1:3) {
+            sample <- all_samples[[geno]][i]
+            bedpe <- file.path(captureC_base, sample, "chicago/data",
+                              paste0(sample, ".cis_le_2Mb.bedpe"))
+            
+            if (file.exists(bedpe)) {
+                df <- filter_bedpe(bedpe, promoter_gr)
+                
+                if (nrow(df) > 0) {
+                    plotPairsArches(
+                        data = df,
+                        params = cutrun_params,
+                        y = y_capture_arches,
+                        height = 0.9,
+                        fill = clone_colors[i],
+                        linecolor = clone_colors[i],
+                        alpha = 0.5
+                    )
+                }
+            }
+        }
+        
+        # ----------------------------------------------------------------------
+        # GENOTYPE LABEL
+        # ----------------------------------------------------------------------
+        
+        plotText(
+            genotype_names[g],
+            x = 0.5, y = y_base,
+            fontsize = 11, fontface = "bold",
+            fontcolor = "grey20",
+            just = c("left", "top"),
+            default.units = "inches"
+        )
+    }
+    
+    # --------------------------------------------------------------------------
+    # GENE TRACK (BOTTOM)
+    # --------------------------------------------------------------------------
+    
+    genes <- plotGenes(
+        chrom = target_chrom,
+        chromstart = promoter_end,
+        chromend   = arid5b_end,
+        assembly = assembly,
+        x = 1, width = 10,
+        y = 16, height = 0.6,
+        fontsize = 8,
+        default.units = "inches"
+    )
+    
+    # --------------------------------------------------------------------------
+    # GENOMIC ANNOTATIONS
+    # --------------------------------------------------------------------------
+    
+    calc_x <- function(pos) {
+        1 + (pos - promoter_end) / (arid5b_end - promoter_end) * 10
+    }
+    
+    # Promoter / TSS
+    plotRect(
+        calc_x(promoter_start), 16,
+        calc_x(promoter_end) - calc_x(promoter_start), 0.6,
+        fill = "#fdae6b", alpha = 0.35,
+        just = c("left", "top"),
+        default.units = "inches"
+    )
+    
+    plotText(
+        "Promoter / TSS",
+        x = calc_x(promoter_end), y = 15.85,
+        just = "right",
+        fontsize = 9, fontface = "bold",
+        fontcolor = "#d95f02",
+        default.units = "inches"
+    )
+    
+    # SNP — RED ARROW AT TOP
+    snp_x <- calc_x(snp_position)
+    
+    # Draw downward-pointing triangle/arrow
+    plotPolygon(
+        x = c(snp_x - 0.08, snp_x + 0.08, snp_x),
+        y = c(0.8, 0.8, 0.95),
+        fill = "#d73027",
+        linecolor = "#d73027",
+        default.units = "inches"
+    )
+    
+    plotText(
+        "rs7090445",
+        x = snp_x, y = 0.65,
+        just = "center",
+        fontsize = 8,
+        fontface = "bold",
+        fontcolor = "#d73027",
+        default.units = "inches"
+    )
+    
+    # Genome label
+    annoGenomeLabel(
+        plot = genes,
+        x = 1, y = 16.7, width = 10,
+        scale = "Kb", fontsize = 8,
+        default.units = "inches"
+    )
+    
+    # --------------------------------------------------------------------------
+    # LEGEND
+    # --------------------------------------------------------------------------
+    
+    legend_x <- 0.5
+    legend_y <- 15.5
+    
+    plotText(
+        "Clones:",
+        x = legend_x, y = legend_y,
+        fontsize = 9, fontface = "bold",
+        just = c("left", "top"),
+        default.units = "inches"
+    )
+    
+    for (i in 1:3) {
+        plotRect(
+            x = legend_x,
+            y = legend_y + 0.2 * i,
+            width = 0.15, height = 0.12,
+            just = c("left", "top"),
+            fill = clone_colors[i],
+            linecolor = clone_colors[i],
+            default.units = "inches"
+        )
+        
+        plotText(
+            paste0("Clone ", i),
+            x = legend_x + 0.2,
+            y = legend_y + 0.2 * i + 0.06,
+            fontsize = 8,
+            just = c("left", "center"),
+            default.units = "inches"
+        )
+    }
+}
+
+# ==============================================================================
+# PLOT (NO SAVING)
+# ==============================================================================
+
+cat("\n========================================\n")
+cat("Generating multi-omic view for all genotypes...\n")
+cat("========================================\n")
+
+plot_all_genotypes_multiomic()
+
+cat("\n========================================\n")
+cat("PLOT DISPLAYED (not saved)\n")
+cat("========================================\n\n")
+```
+
+## All of them zoomed in
+```{r}
+suppressPackageStartupMessages({
+    library(plotgardener)
+    library(GenomicRanges)
+    library(data.table)
+    library(rtracklayer)
+})
+
+# ==============================================================================
+# PATHS & SAMPLES
+# ==============================================================================
+
+captureC_base <- "/Volumes/Analysts/Julian/Matt/Clarissa/snp_project_ARID/capture_c/Results/5_kb/arima_results"
+atac_dir <- "/Volumes/Analysts/Julian/Matt/Clarissa/snp_project_ARID/ATAC_data/cell_lines/bigwig_files_to_R_ATAC_clarissas"
+cutrun_dir <- "/Volumes/homes/Clarissa/snp_project/clarissas_cell_lines/cut_and_run/nf_Cut_and_Run_Results/04_reporting/igv"
+
+samples_tt <- c("Nalm6_TT_Clone1", "Nalm6_TT_Clone2", "Nalm6_TT_Clone3")
+samples_tc <- c("Nalm6_TC_Clone1", "Nalm6_TC_Clone2", "Nalm6_TC_Clone3")
+samples_cc <- c("Nalm6_CC_Clone1", "Nalm6_CC_Clone2", "Nalm6_CC_Clone3")
+
+all_samples <- list(TT = samples_tt, TC = samples_tc, CC = samples_cc)
+
+target_chrom <- "chr10"
+assembly <- "hg38"
+
+# ==============================================================================
+# ARID5B DEFINITIONS (hg38) - ZOOMED IN
+# ==============================================================================
+
+arid5b_tss <- 61901699
+
+promoter_start <- arid5b_tss - 10000
+promoter_end   <- arid5b_tss
+
+snp_position <- 61961417
+intron3_end  <- 61970000
+
+# ==============================================================================
+# DATA FILES (BY GENOTYPE)
+# ==============================================================================
+
+atac_files <- list(
+    TT = file.path(atac_dir, paste0(samples_tt, "_REP1.mLb.clN.bigWig")),
+    TC = file.path(atac_dir, paste0(samples_tc, "_REP1.mLb.clN.bigWig")),
+    CC = file.path(atac_dir, paste0(samples_cc, "_REP1.mLb.clN.bigWig"))
+)
+
+h3k36me3_files <- list(
+    TT = file.path(cutrun_dir, paste0("H3K36me3_TT_R", 1:3, ".bigWig")),
+    TC = file.path(cutrun_dir, paste0("H3K36me3_TC_R", 1:3, ".bigWig")),
+    CC = file.path(cutrun_dir, paste0("H3K36me3_CC_R", 1:3, ".bigWig"))
+)
+
+# Verify files exist
+stopifnot(all(file.exists(unlist(atac_files))))
+stopifnot(all(file.exists(unlist(h3k36me3_files))))
+
+# ==============================================================================
+# CHROMOSOME NAMING HARMONIZATION
+# ==============================================================================
+
+bw_test <- BigWigFile(atac_files$TT[1])
+bw_seqs <- names(seqlengths(seqinfo(bw_test)))
+
+atac_chrom <- if (target_chrom %in% bw_seqs) {
+    target_chrom
+} else if (sub("^chr", "", target_chrom) %in% bw_seqs) {
+    sub("^chr", "", target_chrom)
+} else {
+    stop("Chromosome not found in BigWig")
+}
+
+# ==============================================================================
+# LOOP FILTER — PROMOTER → INTRON 3 (STRICT)
+# ==============================================================================
+
+filter_bedpe <- function(bedpe_path, promoter_gr) {
+    
+    dt <- fread(bedpe_path, header = FALSE)
+    if (ncol(dt) < 6) return(data.frame())
+    
+    setnames(dt, 1:6, c("chr1","start1","end1","chr2","start2","end2"))
+    dt <- dt[chr1 == target_chrom & chr2 == target_chrom]
+    if (nrow(dt) == 0) return(data.frame())
+    
+    # Define intron 3 region
+    intron_region <- GRanges(
+        target_chrom,
+        IRanges(promoter_end, intron3_end)
+    )
+    
+    gr1 <- GRanges(dt$chr1, IRanges(dt$start1, dt$end1))
+    gr2 <- GRanges(dt$chr2, IRanges(dt$start2, dt$end2))
+    
+    promoter_hit <- countOverlaps(gr1, promoter_gr) > 0 |
+                    countOverlaps(gr2, promoter_gr) > 0
+    
+    intron_hit <- countOverlaps(gr1, intron_region) > 0 &
+                  countOverlaps(gr2, intron_region) > 0
+    
+    dt[promoter_hit & intron_hit]
+}
+
+# ==============================================================================
+# PLOT — ALL 3 GENOTYPES (ZOOMED): ATAC + H3K36me3 + CAPTURE-C
+# ==============================================================================
+
+plot_all_genotypes_zoomed <- function() {
+    
+    promoter_gr <- GRanges(target_chrom, IRanges(promoter_start, promoter_end))
+    
+    pageCreate(width = 12, height = 18, default.units = "inches", showGuides = FALSE)
+    
+    # --------------------------------------------------------------------------
+    # TITLE
+    # --------------------------------------------------------------------------
+    
+    plotText(
+        "ARID5B Promoter → Intron 3: ATAC-seq + H3K36me3 + Capture-C",
+        fontsize = 14, fontface = "bold",
+        x = 0.5, y = 0.25, just = "left",
+        default.units = "inches"
+    )
+    
+    plotText(
+        "Zoomed SNP-centered window | Multi-omic integration across genotypes",
+        fontsize = 9, fontcolor = "grey40",
+        x = 0.5, y = 0.5, just = "left",
+        default.units = "inches"
+    )
+    
+    # --------------------------------------------------------------------------
+    # COLORS
+    # --------------------------------------------------------------------------
+    
+    clone_colors <- c("#9370DB", "#FF8C00", "#20B2AA")  # Purple, Orange, Teal
+    atac_color <- "#2b8cbe"        # Blue
+    h3k36me3_color <- "#e7298a"    # Pink
+    
+    # --------------------------------------------------------------------------
+    # GENOTYPE DEFINITIONS
+    # --------------------------------------------------------------------------
+    
+    genotypes <- c("TT", "TC", "CC")
+    genotype_names <- c(
+        "TT (homozygous protective)",
+        "TC (heterozygous)",
+        "CC (homozygous risk)"
+    )
+    
+    # Y-positions for each genotype (5.5 inch spacing)
+    y_base_positions <- c(1, 6.5, 12)
+    
+    # --------------------------------------------------------------------------
+    # LOOP THROUGH GENOTYPES
+    # --------------------------------------------------------------------------
+    
+    for (g in seq_along(genotypes)) {
+        
+        geno <- genotypes[g]
+        y_base <- y_base_positions[g]
+        
+        cat(sprintf("\n=== %s Genotype ===\n", geno))
+        
+        # Define track positions relative to y_base
+        y_atac <- y_base
+        y_h3k <- y_base + 1
+        y_capture_signal <- y_base + 2.2
+        y_capture_arches <- y_base + 3.2
+        
+        # ----------------------------------------------------------------------
+        # 1. ATAC-SEQ (ALL 3 CLONES OVERLAID)
+        # ----------------------------------------------------------------------
+        
+        atac_params <- pgParams(
+            chrom = atac_chrom,
+            chromstart = promoter_end,
+            chromend   = intron3_end,
+            assembly   = assembly,
+            x = 1, width = 10,
+            default.units = "inches"
+        )
+        
+        for (i in 1:3) {
+            plotSignal(
+                data = atac_files[[geno]][i],
+                params = atac_params,
+                y = y_atac,
+                height = 0.6,
+                fill = atac_color,
+                linecolor = atac_color,
+                baseline = TRUE,
+                alpha = 0.35
+            )
+        }
+        
+        plotText(
+            "ATAC-seq",
+            x = 0.5, y = y_atac + 0.3,
+            fontsize = 10, fontface = "bold",
+            just = c("right", "center"),
+            default.units = "inches"
+        )
+        
+        # ----------------------------------------------------------------------
+        # 2. H3K36me3 CUT&RUN (ALL 3 REPLICATES OVERLAID)
+        # ----------------------------------------------------------------------
+        
+        cutrun_params <- pgParams(
+            chrom = target_chrom,
+            chromstart = promoter_end,
+            chromend   = intron3_end,
+            assembly   = assembly,
+            x = 1, width = 10,
+            default.units = "inches"
+        )
+        
+        for (i in 1:3) {
+            plotSignal(
+                data = h3k36me3_files[[geno]][i],
+                params = cutrun_params,
+                y = y_h3k,
+                height = 0.6,
+                fill = h3k36me3_color,
+                linecolor = h3k36me3_color,
+                baseline = TRUE,
+                alpha = 0.45,
+                scale = "fixed"
+            )
+        }
+        
+        plotText(
+            "H3K36me3",
+            x = 0.5, y = y_h3k + 0.3,
+            fontsize = 10, fontface = "bold",
+            just = c("right", "center"),
+            default.units = "inches"
+        )
+        
+        # ----------------------------------------------------------------------
+        # 3. CAPTURE-C SIGNAL (3 CLONES, COLORED BY CLONE)
+        # ----------------------------------------------------------------------
+        
+        sig <- NULL
+        for (i in 1:3) {
+            sample <- all_samples[[geno]][i]
+            bw <- file.path(captureC_base, sample, "chicago/data",
+                           paste0(sample, ".bigwig"))
+            
+            if (file.exists(bw)) {
+                sig <- plotSignal(
+                    data = bw,
+                    params = cutrun_params,
+                    y = y_capture_signal,
+                    height = 0.7,
+                    fill = clone_colors[i],
+                    linecolor = clone_colors[i],
+                    baseline = TRUE,
+                    alpha = 0.6
+                )
+            }
+        }
+        
+        if (!is.null(sig)) annoYaxis(sig, fontsize = 7)
+        
+        plotText(
+            "Capture-C\nsignal",
+            x = 0.5, y = y_capture_signal + 0.35,
+            fontsize = 10, fontface = "bold",
+            just = c("right", "center"),
+            default.units = "inches"
+        )
+        
+        # ----------------------------------------------------------------------
+        # 4. CAPTURE-C LOOPS (ARCHES, COLORED BY CLONE)
+        # ----------------------------------------------------------------------
+        
+        for (i in 1:3) {
+            sample <- all_samples[[geno]][i]
+            bedpe <- file.path(captureC_base, sample, "chicago/data",
+                              paste0(sample, ".cis_le_2Mb.bedpe"))
+            
+            if (file.exists(bedpe)) {
+                df <- filter_bedpe(bedpe, promoter_gr)
+                
+                if (nrow(df) > 0) {
+                    plotPairsArches(
+                        data = df,
+                        params = cutrun_params,
+                        y = y_capture_arches,
+                        height = 0.9,
+                        fill = clone_colors[i],
+                        linecolor = clone_colors[i],
+                        alpha = 0.5
+                    )
+                }
+            }
+        }
+        
+        # ----------------------------------------------------------------------
+        # GENOTYPE LABEL
+        # ----------------------------------------------------------------------
+        
+        plotText(
+            genotype_names[g],
+            x = 0.5, y = y_base,
+            fontsize = 11, fontface = "bold",
+            fontcolor = "grey20",
+            just = c("left", "top"),
+            default.units = "inches"
+        )
+    }
+    
+    # --------------------------------------------------------------------------
+    # GENE TRACK (BOTTOM)
+    # --------------------------------------------------------------------------
+    
+    genes <- plotGenes(
+        chrom = target_chrom,
+        chromstart = promoter_end,
+        chromend   = intron3_end,
+        assembly = assembly,
+        x = 1, width = 10,
+        y = 16, height = 0.6,
+        fontsize = 8,
+        default.units = "inches"
+    )
+    
+    # --------------------------------------------------------------------------
+    # GENOMIC ANNOTATIONS
+    # --------------------------------------------------------------------------
+    
+    calc_x <- function(pos) {
+        1 + (pos - promoter_end) / (intron3_end - promoter_end) * 10
+    }
+    
+    # Promoter / TSS
+    plotRect(
+        calc_x(promoter_start), 16,
+        calc_x(promoter_end) - calc_x(promoter_start), 0.6,
+        fill = "#fdae6b", alpha = 0.35,
+        just = c("left", "top"),
+        default.units = "inches"
+    )
+    
+    plotText(
+        "Promoter / TSS",
+        x = calc_x(promoter_end), y = 15.85,
+        just = "right",
+        fontsize = 9, fontface = "bold",
+        fontcolor = "#d95f02",
+        default.units = "inches"
+    )
+    
+    # SNP — RED ARROW AT TOP
+    snp_x <- calc_x(snp_position)
+    
+    # Draw downward-pointing triangle/arrow
+    plotPolygon(
+        x = c(snp_x - 0.08, snp_x + 0.08, snp_x),
+        y = c(0.8, 0.8, 0.95),
+        fill = "#d73027",
+        linecolor = "#d73027",
+        default.units = "inches"
+    )
+    
+    plotText(
+        "rs7090445",
+        x = snp_x, y = 0.65,
+        just = "center",
+        fontsize = 8,
+        fontface = "bold",
+        fontcolor = "#d73027",
+        default.units = "inches"
+    )
+    
+    # Genome label
+    annoGenomeLabel(
+        plot = genes,
+        x = 1, y = 16.7, width = 10,
+        scale = "Kb", fontsize = 8,
+        default.units = "inches"
+    )
+    
+    # --------------------------------------------------------------------------
+    # LEGEND
+    # --------------------------------------------------------------------------
+    
+    legend_x <- 0.5
+    legend_y <- 15.5
+    
+    plotText(
+        "Clones:",
+        x = legend_x, y = legend_y,
+        fontsize = 9, fontface = "bold",
+        just = c("left", "top"),
+        default.units = "inches"
+    )
+    
+    for (i in 1:3) {
+        plotRect(
+            x = legend_x,
+            y = legend_y + 0.2 * i,
+            width = 0.15, height = 0.12,
+            just = c("left", "top"),
+            fill = clone_colors[i],
+            linecolor = clone_colors[i],
+            default.units = "inches"
+        )
+        
+        plotText(
+            paste0("Clone ", i),
+            x = legend_x + 0.2,
+            y = legend_y + 0.2 * i + 0.06,
+            fontsize = 8,
+            just = c("left", "center"),
+            default.units = "inches"
+        )
+    }
+}
+
+# ==============================================================================
+# PLOT (NO SAVING)
+# ==============================================================================
+
+cat("\n========================================\n")
+cat("Generating ZOOMED multi-omic view for all genotypes...\n")
+cat("========================================\n")
+
+plot_all_genotypes_zoomed()
+
+cat("\n========================================\n")
+cat("PLOT DISPLAYED (not saved)\n")
+cat("========================================\n\n")
+```
+
